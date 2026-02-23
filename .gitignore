@@ -1,0 +1,22 @@
+build/*
+bin/*
+*.o
+*.d
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+*.ncu.log
+*.details.txt
+
+# Generated logs, data, and outputs
+*.log
+*.nwk
+*.tre
+*.aln
+*.fa
+build/
+data/*
+MLIPPER
+!data/aln.fasta
+!data/query.fasta
+!data/ref.tre

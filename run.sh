@@ -1,0 +1,1 @@
+./MLIPPER  --tree-alignment ./data/aln.fasta   --query-alignment ./data/query.fasta   --tree ./data/ref.tre   --states 4   --subst-model GTR   --ncat 4   --alpha 0.3   --pinv 0.0   --freqs 0.25,0.25,0.25,0.25   --rates 1.0,1.0,1.0,1.0,1.0,1.0   --rate-weights 0.25,0.25,0.25,0.25
