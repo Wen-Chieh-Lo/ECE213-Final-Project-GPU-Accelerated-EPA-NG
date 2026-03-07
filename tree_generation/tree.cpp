@@ -14,6 +14,7 @@
 
 #include "tree.hpp"
 #include "parse_file.hpp"
+#include "seq_preproc.cpp"
 
 static std::string read_file_to_string(const std::string& path) {
     std::ifstream ifs(path);
@@ -136,7 +137,7 @@ static std::vector<double> build_mixture_weights(const parse::ModelConfig& model
 static std::vector<double> build_gamma_rate_categories(double alpha, int rate_cats) {
     std::vector<double> rates(rate_cats, 1.0);
     if (rate_cats <= 1 || alpha <= 0.0) return rates;
-    std::vector<float> gamma_tmp(rate_cats);
+    std::vector<double> gamma_tmp(rate_cats);
     int status = pll_compute_gamma_cats(static_cast<float>(alpha), rate_cats, gamma_tmp.data(), PLL_GAMMA_RATES_MEAN);
     if (status != PLL_SUCCESS) {
         throw std::runtime_error("pll_compute_gamma_cats failed.");
@@ -313,10 +314,10 @@ int main(int argc, char** argv) {
         return app.exit(e);
     }
 
-    const auto& alignment = inputs.tree_alignment;
+    auto& alignment = inputs.tree_alignment;
 
-    const auto& msa_names = alignment.names;
-    const auto& rows = alignment.sequences;
+    auto& msa_names = alignment.names;
+    auto& rows = alignment.sequences;
     size_t sites = alignment.sites;
     const std::string& newick = inputs.tree;
     const auto& model = inputs.config.model;
@@ -336,6 +337,11 @@ int main(int argc, char** argv) {
     for(auto & q : placement_queries) {
         printf("  Query '%s'\n", q.msa_name.c_str());
     }
+
+    // sequence preprocessing
+    remove_sparse_columns(rows, placement_queries, sites, 0.7);
+    remove_repetitive_columns(rows, placement_queries, sites);
+
     // const auto start_gpu = std::chrono::steady_clock::now();
     auto res = BuildAllToGPU(
         msa_names,
