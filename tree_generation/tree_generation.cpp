@@ -43,13 +43,13 @@ static PlacementQueryBatch make_query_batch(
         throw std::runtime_error("rate_multipliers size mismatch for queries.");
     }
     const size_t qcount = batch.count;
-    batch.branch_lengths.assign(qcount, 0.5);
+    batch.branch_lengths.assign(qcount, fp_t(0.5));
     batch.query_chars.resize(qcount * sites, 4);
     printf("Preparing %zu placement queries on GPU (sites=%zu)\n", qcount, sites);
     for (size_t qi = 0; qi < qcount; ++qi) {
         const auto& q = placement_queries[qi];
         printf("Q size: %zu\n", q.msa.size());
-        if (q.pendant > 0.0) batch.branch_lengths[qi] = q.pendant;
+        if (q.pendant > fp_t(0)) batch.branch_lengths[qi] = q.pendant;
         if (q.msa.size() != sites) {
             throw std::runtime_error("Query sequence length mismatch.");
         }
@@ -147,7 +147,7 @@ TreeBuildResult build_tree_from_newick_with_pll(
             dst.branch_length_to_parent = nd->length; // Number after the colon in Newick
         } else {
             dst.parent = -1; // root
-            dst.branch_length_to_parent = 0.0;
+            dst.branch_length_to_parent = fp_t(0);
             out.root_id = i;
         }
 

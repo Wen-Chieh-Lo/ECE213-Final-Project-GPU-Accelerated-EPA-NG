@@ -34,31 +34,33 @@ __device__ __forceinline__ unsigned int combined_scaler_shift_at(
 template<int RC>
 __device__ __forceinline__ void compute_root_loglikelihood_states4(
     const DeviceTree& D,
-    const double* clv_site,
-    const double* freqs, const double* rate_weights,
+    const fp_t* clv_site,
+    const fp_t* freqs, const fp_t* rate_weights,
     unsigned int site_idx,
     const unsigned* pattern_w,
     const int* invar_indices,
     double invar_proportion,
-    double * total_likelihood)
+    fp_t* total_likelihood)
 {
-    const double pi0 = freqs[0];
-    const double pi1 = freqs[1];
-    const double pi2 = freqs[2];
-    const double pi3 = freqs[3];
+    const double pi0 = static_cast<double>(freqs[0]);
+    const double pi1 = static_cast<double>(freqs[1]);
+    const double pi2 = static_cast<double>(freqs[2]);
+    const double pi3 = static_cast<double>(freqs[3]);
 
     double sum_rate = 0.0;
     #pragma unroll
     for (int r = 0; r < RC; ++r) {
-        const double4 a = reinterpret_cast<const double4*>(clv_site)[r];
-        double val = fma(a.x, pi0, fma(a.y, pi1, fma(a.z, pi2, a.w * pi3)));
+        const fp4_t a = reinterpret_cast<const fp4_t*>(clv_site)[r];
+        double val = fma(static_cast<double>(a.x), pi0,
+                     fma(static_cast<double>(a.y), pi1,
+                     fma(static_cast<double>(a.z), pi2, static_cast<double>(a.w) * pi3)));
         if (D.d_site_scaler) {
             unsigned int shift = D.per_rate_scaling
                 ? D.d_site_scaler[(size_t)site_idx * (size_t)RC + r]
                 : D.d_site_scaler[site_idx];
             if (shift) val = ldexp(val, -static_cast<int>(shift));
         }
-        sum_rate = fma(rate_weights[r], val, sum_rate);
+        sum_rate = fma(static_cast<double>(rate_weights[r]), val, sum_rate);
     }
 
     double site_sum = (1.0 - invar_proportion) * sum_rate;
@@ -66,41 +68,42 @@ __device__ __forceinline__ void compute_root_loglikelihood_states4(
         int inv_idx = invar_indices[site_idx];
         if (inv_idx >= 0) site_sum += invar_proportion * freqs[inv_idx];
     }
-    const double eps = 1e-300;
-    double loglk = log(site_sum > eps ? site_sum : eps);
+    double loglk = log(site_sum > 1e-300 ? site_sum : 1e-300);
     if (pattern_w) loglk *= static_cast<double>(pattern_w[site_idx]);
-    total_likelihood[site_idx] = loglk;
+    total_likelihood[site_idx] = static_cast<fp_t>(loglk);
 }
 
 template<int RC>
 __device__ __forceinline__ void compute_root_loglikelihood_states5(
     const DeviceTree& D,
-    const double* clv_site,
-    const double* freqs, const double* rate_weights,
+    const fp_t* clv_site,
+    const fp_t* freqs, const fp_t* rate_weights,
     unsigned int site_idx,
     const unsigned* pattern_w,
     const int* invar_indices,
     double invar_proportion,
-    double * total_likelihood)
+    fp_t* total_likelihood)
 {
-    const double pi0 = freqs[0];
-    const double pi1 = freqs[1];
-    const double pi2 = freqs[2];
-    const double pi3 = freqs[3];
-    const double pi4 = freqs[4];
+    const double pi0 = static_cast<double>(freqs[0]);
+    const double pi1 = static_cast<double>(freqs[1]);
+    const double pi2 = static_cast<double>(freqs[2]);
+    const double pi3 = static_cast<double>(freqs[3]);
+    const double pi4 = static_cast<double>(freqs[4]);
 
     double sum_rate = 0.0;
     #pragma unroll
     for (int r = 0; r < RC; ++r) {
-        const double* cr = clv_site + (size_t)r * 5;
-        double val = cr[0]*pi0 + cr[1]*pi1 + cr[2]*pi2 + cr[3]*pi3 + cr[4]*pi4;
+        const fp_t* cr = clv_site + (size_t)r * 5;
+        double val = static_cast<double>(cr[0])*pi0 + static_cast<double>(cr[1])*pi1
+                   + static_cast<double>(cr[2])*pi2 + static_cast<double>(cr[3])*pi3
+                   + static_cast<double>(cr[4])*pi4;
         if (D.d_site_scaler) {
             unsigned int shift = D.per_rate_scaling
                 ? D.d_site_scaler[(size_t)site_idx * (size_t)RC + r]
                 : D.d_site_scaler[site_idx];
             if (shift) val = ldexp(val, -static_cast<int>(shift));
         }
-        sum_rate = fma(rate_weights[r], val, sum_rate);
+        sum_rate = fma(static_cast<double>(rate_weights[r]), val, sum_rate);
     }
 
     double site_sum = (1.0 - invar_proportion) * sum_rate;
@@ -108,27 +111,26 @@ __device__ __forceinline__ void compute_root_loglikelihood_states5(
         int inv_idx = invar_indices[site_idx];
         if (inv_idx >= 0) site_sum += invar_proportion * freqs[inv_idx];
     }
-    const double eps = 1e-300;
-    double loglk = log(site_sum > eps ? site_sum : eps);
+    double loglk = log(site_sum > 1e-300 ? site_sum : 1e-300);
     if (pattern_w) loglk *= static_cast<double>(pattern_w[site_idx]);
-    total_likelihood[site_idx] = loglk;
+    total_likelihood[site_idx] = static_cast<fp_t>(loglk);
 }
 
 // Generic device root log-likelihood for any state/rate counts (fallback).
 __device__ __forceinline__ void compute_root_loglikelihood_generic(
     const DeviceTree& D,
-    const double* clv_site,
-    const double* freqs, const double* rate_weights,
+    const fp_t* clv_site,
+    const fp_t* freqs, const fp_t* rate_weights,
     unsigned int site_idx, const unsigned* pattern_w,
     const int* invar_indices, double invar_proportion,
-    double * total_likelihood)
+    fp_t* total_likelihood)
 {
     double sum_rate = 0.0;
     for (unsigned int r = 0; r < (unsigned)D.rate_cats; ++r) {
-        const double* cr = clv_site + (size_t)r * (size_t)D.states;
+        const fp_t* cr = clv_site + (size_t)r * (size_t)D.states;
         double val = 0.0;
         for (unsigned int s = 0; s < (unsigned)D.states; ++s) {
-            val = fma(cr[s], freqs[s], val);
+            val = fma(static_cast<double>(cr[s]), static_cast<double>(freqs[s]), val);
         }
         if (D.d_site_scaler) {
             unsigned int shift = D.per_rate_scaling
@@ -136,40 +138,39 @@ __device__ __forceinline__ void compute_root_loglikelihood_generic(
                 : D.d_site_scaler[site_idx];
             if (shift) val = ldexp(val, -static_cast<int>(shift));
         }
-        sum_rate = fma(rate_weights[r], val, sum_rate);
+        sum_rate = fma(static_cast<double>(rate_weights[r]), val, sum_rate);
     }
     double site_sum = (1.0 - invar_proportion) * sum_rate;
     if (invar_indices) {
         int inv_idx = invar_indices[site_idx];
         if (inv_idx >= 0) site_sum += invar_proportion * freqs[inv_idx];
     }
-    const double eps = 1e-300;
-    double loglk = log(site_sum > eps ? site_sum : eps);
+    double loglk = log(site_sum > 1e-300 ? site_sum : 1e-300);
     if (pattern_w) loglk *= static_cast<double>(pattern_w[site_idx]);
-    total_likelihood[site_idx] = loglk;
+    total_likelihood[site_idx] = static_cast<fp_t>(loglk);
 }
 
 // Device helper that allows explicit site index (usable from arbitrary kernels).
 __device__ void compute_root_loglikelihood_at_site(
     const DeviceTree& D,
     const NodeOpInfo& op,
-    const double* freqs,
-    const double* rate_weights,
+    const fp_t* freqs,
+    const fp_t* rate_weights,
     const unsigned* pattern_w,
     const int* invar_indices,
     double invar_proportion,
     unsigned int site_idx)
 {
     if (site_idx >= D.sites) return;
-    double *placement_clv = D.d_placement_clv;
+    fp_t* placement_clv = D.d_placement_clv;
     const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
     const bool target_is_right = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
     const int target_id  = target_is_left ? op.left_id  : (target_is_right ? op.right_id : op.parent_id);
 
     const size_t per_node = (size_t)D.sites * (size_t)D.rate_cats * (size_t)D.states;
-    const double* clv_pool = D.d_clv_mid;
+    const fp_t* clv_pool = D.d_clv_mid;
     if (!clv_pool || target_id < 0 || target_id >= D.N || !placement_clv) return;
-    const double* clv_site = clv_pool + (size_t)target_id * per_node + (size_t)site_idx * (size_t)D.rate_cats * (size_t)D.states;
+    const fp_t* clv_site = clv_pool + (size_t)target_id * per_node + (size_t)site_idx * (size_t)D.rate_cats * (size_t)D.states;
     if (D.states == 4) {
         switch (D.rate_cats) {
             case 1:  compute_root_loglikelihood_states4<1>(D, clv_site, freqs, rate_weights, site_idx, pattern_w, invar_indices, invar_proportion, placement_clv); break;
@@ -234,7 +235,7 @@ double compute_root_loglikelihood_total(
         CUDA_CHECK(cudaMemcpyAsync(
             D.d_clv_mid,
             D.d_clv_up + (size_t)root_id * per_node,
-            sizeof(double) * per_node,
+            sizeof(fp_t) * per_node,
             cudaMemcpyDeviceToDevice,
             stream));
         // std::vector<double> zero_buf(per_node, 0.0);
@@ -265,12 +266,12 @@ double compute_root_loglikelihood_total(
     
     CUDA_CHECK(cudaGetLastError());
     
-    std::vector<double> host_lk(D.sites, 0.0);
+    std::vector<fp_t> host_lk(D.sites, fp_t(0));
     if (D.sites > 0) {
         CUDA_CHECK(cudaMemcpyAsync(
             host_lk.data(),
             D.d_placement_clv,
-            sizeof(double) * D.sites,
+            sizeof(fp_t) * D.sites,
             cudaMemcpyDeviceToHost,
             stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -282,7 +283,7 @@ double compute_root_loglikelihood_total(
     // }
 
     double total = 0.0;
-    for (double v : host_lk) total += v;
+    for (fp_t v : host_lk) total += static_cast<double>(v);
     return total;
 }
 
@@ -291,12 +292,12 @@ template<int RATE_CATS>
 __global__ void CombinedPlacementLoglikPerOpKernelStates4(
     DeviceTree D,
     const NodeOpInfo* __restrict__ d_ops,
-    const double* __restrict__ d_pendant_pmats,
-    const double* __restrict__ d_distal_pmats,
-    const double* __restrict__ d_proximal_pmats,
+    const fp_t* __restrict__ d_pendant_pmats,
+    const fp_t* __restrict__ d_distal_pmats,
+    const fp_t* __restrict__ d_proximal_pmats,
     size_t per_query,
     size_t per_node_pmat,
-    double* __restrict__ d_out)
+    fp_t* __restrict__ d_out)
 {
     const int op_idx = (int)blockIdx.y;
     if (!d_ops || op_idx < 0 || op_idx >= D.N) return;
@@ -306,9 +307,9 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
     const int target_id = target_is_left ? op.left_id : (target_is_right ? op.right_id : op.parent_id);
     if (target_id < 0 || target_id >= D.N) return;
 
-    const double* pendant_pmat = d_pendant_pmats ? d_pendant_pmats + (size_t)op_idx * per_query : nullptr;
-    const double* distal_pmat  = d_distal_pmats ? d_distal_pmats + (size_t)target_id * per_node_pmat : nullptr;
-    const double* prox_pmat    = d_proximal_pmats ? d_proximal_pmats + (size_t)target_id * per_node_pmat : nullptr;
+    const fp_t* pendant_pmat = d_pendant_pmats ? d_pendant_pmats + (size_t)op_idx * per_query : nullptr;
+    const fp_t* distal_pmat  = d_distal_pmats ? d_distal_pmats + (size_t)target_id * per_node_pmat : nullptr;
+    const fp_t* prox_pmat    = d_proximal_pmats ? d_proximal_pmats + (size_t)target_id * per_node_pmat : nullptr;
     if (!pendant_pmat || !distal_pmat || !prox_pmat) return;
 
     if (!D.d_query_clv || !D.d_clv_mid_base || !D.d_clv_up || !D.d_rate_weights || !D.d_frequencies) return;
@@ -317,77 +318,77 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
 
     double local_sum = 0.0;
     for (unsigned int site = threadIdx.x; site < D.sites; site += blockDim.x) {
-        const double* query_clv = D.d_query_clv + (size_t)site * per_site;
-        const double* distal_clv = D.d_clv_mid_base + (size_t)target_id * per_node + (size_t)site * per_site;
-        const double* prox_clv = D.d_clv_up + (size_t)target_id * per_node + (size_t)site * per_site;
+        const fp_t* query_clv = D.d_query_clv + (size_t)site * per_site;
+        const fp_t* distal_clv = D.d_clv_mid_base + (size_t)target_id * per_node + (size_t)site * per_site;
+        const fp_t* prox_clv = D.d_clv_up + (size_t)target_id * per_node + (size_t)site * per_site;
 
-        double rate_vals[RATE_CATS];
+        fp_t rate_vals[RATE_CATS];
         unsigned int rate_shifts[RATE_CATS];
         unsigned int site_min_shift = 0u;
         bool have_positive = false;
         #pragma unroll
         for (int rc = 0; rc < RATE_CATS; ++rc) {
-            const double4 q = reinterpret_cast<const double4*>(query_clv  + (size_t)rc * 4)[0];
-            const double4 d = reinterpret_cast<const double4*>(distal_clv + (size_t)rc * 4)[0];
-            const double4 p = reinterpret_cast<const double4*>(prox_clv   + (size_t)rc * 4)[0];
+            const fp4_t q = reinterpret_cast<const fp4_t*>(query_clv  + (size_t)rc * 4)[0];
+            const fp4_t d = reinterpret_cast<const fp4_t*>(distal_clv + (size_t)rc * 4)[0];
+            const fp4_t p = reinterpret_cast<const fp4_t*>(prox_clv   + (size_t)rc * 4)[0];
             const unsigned int distal_shift =
                 combined_scaler_shift_at(D.d_site_scaler_mid_base, D, target_id, site, rc);
             const unsigned int prox_shift =
                 combined_scaler_shift_at(D.d_site_scaler_up, D, target_id, site, rc);
 
-            const double4* p_pendant = reinterpret_cast<const double4*>(pendant_pmat + (size_t)rc * 16);
-            const double4* p_distal  = reinterpret_cast<const double4*>(distal_pmat  + (size_t)rc * 16);
-            const double4* p_prox    = reinterpret_cast<const double4*>(prox_pmat    + (size_t)rc * 16);
+            const fp4_t* p_pendant = reinterpret_cast<const fp4_t*>(pendant_pmat + (size_t)rc * 16);
+            const fp4_t* p_distal  = reinterpret_cast<const fp4_t*>(distal_pmat  + (size_t)rc * 16);
+            const fp4_t* p_prox    = reinterpret_cast<const fp4_t*>(prox_pmat    + (size_t)rc * 16);
 
-            const double acc_pend0 = p_pendant[0].x * q.x + p_pendant[0].y * q.y + p_pendant[0].z * q.z + p_pendant[0].w * q.w;
-            const double acc_pend1 = p_pendant[1].x * q.x + p_pendant[1].y * q.y + p_pendant[1].z * q.z + p_pendant[1].w * q.w;
-            const double acc_pend2 = p_pendant[2].x * q.x + p_pendant[2].y * q.y + p_pendant[2].z * q.z + p_pendant[2].w * q.w;
-            const double acc_pend3 = p_pendant[3].x * q.x + p_pendant[3].y * q.y + p_pendant[3].z * q.z + p_pendant[3].w * q.w;
+            const fp_t acc_pend0 = fp_dot4(p_pendant[0], q);
+            const fp_t acc_pend1 = fp_dot4(p_pendant[1], q);
+            const fp_t acc_pend2 = fp_dot4(p_pendant[2], q);
+            const fp_t acc_pend3 = fp_dot4(p_pendant[3], q);
 
-            const double acc_dist0 = p_distal[0].x * d.x + p_distal[0].y * d.y + p_distal[0].z * d.z + p_distal[0].w * d.w;
-            const double acc_dist1 = p_distal[1].x * d.x + p_distal[1].y * d.y + p_distal[1].z * d.z + p_distal[1].w * d.w;
-            const double acc_dist2 = p_distal[2].x * d.x + p_distal[2].y * d.y + p_distal[2].z * d.z + p_distal[2].w * d.w;
-            const double acc_dist3 = p_distal[3].x * d.x + p_distal[3].y * d.y + p_distal[3].z * d.z + p_distal[3].w * d.w;
+            const fp_t acc_dist0 = fp_dot4(p_distal[0], d);
+            const fp_t acc_dist1 = fp_dot4(p_distal[1], d);
+            const fp_t acc_dist2 = fp_dot4(p_distal[2], d);
+            const fp_t acc_dist3 = fp_dot4(p_distal[3], d);
 
-            const double acc_prox0 = p_prox[0].x * p.x + p_prox[0].y * p.y + p_prox[0].z * p.z + p_prox[0].w * p.w;
-            const double acc_prox1 = p_prox[1].x * p.x + p_prox[1].y * p.y + p_prox[1].z * p.z + p_prox[1].w * p.w;
-            const double acc_prox2 = p_prox[2].x * p.x + p_prox[2].y * p.y + p_prox[2].z * p.z + p_prox[2].w * p.w;
-            const double acc_prox3 = p_prox[3].x * p.x + p_prox[3].y * p.y + p_prox[3].z * p.z + p_prox[3].w * p.w;
+            const fp_t acc_prox0 = fp_dot4(p_prox[0], p);
+            const fp_t acc_prox1 = fp_dot4(p_prox[1], p);
+            const fp_t acc_prox2 = fp_dot4(p_prox[2], p);
+            const fp_t acc_prox3 = fp_dot4(p_prox[3], p);
 
-            const double* freqs = D.d_frequencies;
-            const double v0 = acc_pend0 * acc_dist0 * acc_prox0 * freqs[0];
-            const double v1 = acc_pend1 * acc_dist1 * acc_prox1 * freqs[1];
-            const double v2 = acc_pend2 * acc_dist2 * acc_prox2 * freqs[2];
-            const double v3 = acc_pend3 * acc_dist3 * acc_prox3 * freqs[3];
+            const fp_t* freqs = D.d_frequencies;
+            const fp_t v0 = acc_pend0 * acc_dist0 * acc_prox0 * freqs[0];
+            const fp_t v1 = acc_pend1 * acc_dist1 * acc_prox1 * freqs[1];
+            const fp_t v2 = acc_pend2 * acc_dist2 * acc_prox2 * freqs[2];
+            const fp_t v3 = acc_pend3 * acc_dist3 * acc_prox3 * freqs[3];
 
-            double val = 0.0;
-            if (v0 > 0.0) val += v0;
-            if (v1 > 0.0) val += v1;
-            if (v2 > 0.0) val += v2;
-            if (v3 > 0.0) val += v3;
+            fp_t val = fp_t(0);
+            if (v0 > fp_t(0)) val += v0;
+            if (v1 > fp_t(0)) val += v1;
+            if (v2 > fp_t(0)) val += v2;
+            if (v3 > fp_t(0)) val += v3;
             const int total_shift = (int)distal_shift + (int)prox_shift;
             rate_vals[rc] = val;
             rate_shifts[rc] = (unsigned int)((total_shift > 0) ? total_shift : 0);
-            if (val > 0.0) {
+            if (val > fp_t(0)) {
                 if (!have_positive || rate_shifts[rc] < site_min_shift) {
                     site_min_shift = rate_shifts[rc];
                 }
                 have_positive = true;
             }
         }
-        double site_lk = 0.0;
+        fp_t site_lk = fp_t(0);
         #pragma unroll
         for (int rc = 0; rc < RATE_CATS; ++rc) {
-            const double rate_w = D.d_rate_weights[rc];
-            double val = rate_vals[rc];
-            if (val > 0.0) {
+            const fp_t rate_w = D.d_rate_weights[rc];
+            fp_t val = rate_vals[rc];
+            if (val > fp_t(0)) {
                 const int diff = (int)rate_shifts[rc] - (int)site_min_shift;
-                if (diff > 0) val = ldexp(val, -diff);
+                if (diff > 0) val = fp_ldexp(val, -diff);
                 site_lk += rate_w * val;
             }
         }
-        const double eps = 1e-300;
-        local_sum += log(site_lk > eps ? site_lk : eps) - (double)site_min_shift * kLn2;
+        local_sum += static_cast<double>(fp_log(site_lk > FP_EPS ? site_lk : FP_EPS))
+                   - static_cast<double>(site_min_shift) * kLn2;
     }
 
     // Block reduction (warp then block) to avoid atomics.
@@ -405,7 +406,7 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
         for (int offset = 16; offset > 0; offset >>= 1) {
             block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
         }
-        if (lane == 0) d_out[op_idx] = block_sum;
+        if (lane == 0) d_out[op_idx] = static_cast<fp_t>(block_sum);
     }
 }
 
@@ -413,12 +414,12 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
 __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
     DeviceTree D,
     const NodeOpInfo* __restrict__ d_ops,
-    const double* __restrict__ d_pendant_pmats,
-    const double* __restrict__ d_distal_pmats,
-    const double* __restrict__ d_proximal_pmats,
+    const fp_t* __restrict__ d_pendant_pmats,
+    const fp_t* __restrict__ d_distal_pmats,
+    const fp_t* __restrict__ d_proximal_pmats,
     size_t per_query,
     size_t per_node_pmat,
-    double* __restrict__ d_out)
+    fp_t* __restrict__ d_out)
 {
     const int op_idx = (int)blockIdx.y;
     if (!d_ops || op_idx < 0 || op_idx >= D.N) return;
@@ -428,9 +429,9 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
     const int target_id = target_is_left ? op.left_id : (target_is_right ? op.right_id : op.parent_id);
     if (target_id < 0 || target_id >= D.N) return;
 
-    const double* pendant_pmat = d_pendant_pmats ? d_pendant_pmats + (size_t)op_idx * per_query : nullptr;
-    const double* distal_pmat  = d_distal_pmats ? d_distal_pmats + (size_t)target_id * per_node_pmat : nullptr;
-    const double* prox_pmat    = d_proximal_pmats ? d_proximal_pmats + (size_t)target_id * per_node_pmat : nullptr;
+    const fp_t* pendant_pmat = d_pendant_pmats ? d_pendant_pmats + (size_t)op_idx * per_query : nullptr;
+    const fp_t* distal_pmat  = d_distal_pmats ? d_distal_pmats + (size_t)target_id * per_node_pmat : nullptr;
+    const fp_t* prox_pmat    = d_proximal_pmats ? d_proximal_pmats + (size_t)target_id * per_node_pmat : nullptr;
     if (!pendant_pmat || !distal_pmat || !prox_pmat) return;
 
     if (!D.d_query_clv || !D.d_clv_mid_base || !D.d_clv_up || !D.d_rate_weights || !D.d_frequencies) return;
@@ -439,11 +440,11 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
 
     double local_sum = 0.0;
     for (unsigned int site = threadIdx.x; site < D.sites; site += blockDim.x) {
-        const double* query_clv = D.d_query_clv + (size_t)site * per_site;
-        const double* distal_clv = D.d_clv_mid_base + (size_t)target_id * per_node + (size_t)site * per_site;
-        const double* prox_clv = D.d_clv_up + (size_t)target_id * per_node + (size_t)site * per_site;
+        const fp_t* query_clv = D.d_query_clv + (size_t)site * per_site;
+        const fp_t* distal_clv = D.d_clv_mid_base + (size_t)target_id * per_node + (size_t)site * per_site;
+        const fp_t* prox_clv = D.d_clv_up + (size_t)target_id * per_node + (size_t)site * per_site;
 
-        double rate_vals[64];
+        fp_t rate_vals[64];
         unsigned int rate_shifts[64];
         unsigned int site_min_shift = 0u;
         bool have_positive = false;
@@ -452,54 +453,54 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
                 combined_scaler_shift_at(D.d_site_scaler_mid_base, D, target_id, site, rc);
             const unsigned int prox_shift =
                 combined_scaler_shift_at(D.d_site_scaler_up, D, target_id, site, rc);
-            const double* p_pendant = pendant_pmat + (size_t)rc * D.states * D.states;
-            const double* p_distal  = distal_pmat  + (size_t)rc * D.states * D.states;
-            const double* p_prox    = prox_pmat    + (size_t)rc * D.states * D.states;
+            const fp_t* p_pendant = pendant_pmat + (size_t)rc * D.states * D.states;
+            const fp_t* p_distal  = distal_pmat  + (size_t)rc * D.states * D.states;
+            const fp_t* p_prox    = prox_pmat    + (size_t)rc * D.states * D.states;
 
-            double pend_vec[64];
-            double distal_vec[64];
-            double prox_vec[64];
+            fp_t pend_vec[64];
+            fp_t distal_vec[64];
+            fp_t prox_vec[64];
             for (int s = 0; s < D.states; ++s) {
-                double acc_pend = 0.0, acc_dist = 0.0, acc_prox = 0.0;
-                const double* qrow = query_clv + (size_t)rc * D.states;
-                const double* drow = distal_clv + (size_t)rc * D.states;
-                const double* prow = prox_clv   + (size_t)rc * D.states;
+                fp_t acc_pend = fp_t(0), acc_dist = fp_t(0), acc_prox = fp_t(0);
+                const fp_t* qrow = query_clv + (size_t)rc * D.states;
+                const fp_t* drow = distal_clv + (size_t)rc * D.states;
+                const fp_t* prow = prox_clv   + (size_t)rc * D.states;
                 for (int k = 0; k < D.states; ++k) {
-                    acc_pend += p_pendant[(size_t)s * D.states + k] * qrow[k];
-                    acc_dist += p_distal[(size_t)s * D.states + k]  * drow[k];
-                    acc_prox += p_prox[(size_t)s * D.states + k]    * prow[k];
+                    acc_pend = fp_fma(p_pendant[(size_t)s * D.states + k], qrow[k], acc_pend);
+                    acc_dist = fp_fma(p_distal[(size_t)s * D.states + k], drow[k], acc_dist);
+                    acc_prox = fp_fma(p_prox[(size_t)s * D.states + k], prow[k], acc_prox);
                 }
                 pend_vec[s] = acc_pend;
                 distal_vec[s] = acc_dist;
                 prox_vec[s] = acc_prox;
             }
-            double rate_sum = 0.0;
+            fp_t rate_sum = fp_t(0);
             for (int s = 0; s < D.states; ++s) {
-                double val = pend_vec[s] * distal_vec[s] * prox_vec[s] * D.d_frequencies[s];
-                if (val > 0.0) rate_sum += val;
+                fp_t val = pend_vec[s] * distal_vec[s] * prox_vec[s] * D.d_frequencies[s];
+                if (val > fp_t(0)) rate_sum += val;
             }
             const int total_shift = (int)distal_shift + (int)prox_shift;
             rate_vals[rc] = rate_sum;
             rate_shifts[rc] = (unsigned int)((total_shift > 0) ? total_shift : 0);
-            if (rate_sum > 0.0) {
+            if (rate_sum > fp_t(0)) {
                 if (!have_positive || rate_shifts[rc] < site_min_shift) {
                     site_min_shift = rate_shifts[rc];
                 }
                 have_positive = true;
             }
         }
-        double site_lk = 0.0;
+        fp_t site_lk = fp_t(0);
         for (int rc = 0; rc < D.rate_cats; ++rc) {
-            const double rate_w = D.d_rate_weights[rc];
-            double rate_sum = rate_vals[rc];
-            if (rate_sum > 0.0) {
+            const fp_t rate_w = D.d_rate_weights[rc];
+            fp_t rate_sum = rate_vals[rc];
+            if (rate_sum > fp_t(0)) {
                 const int diff = (int)rate_shifts[rc] - (int)site_min_shift;
-                if (diff > 0) rate_sum = ldexp(rate_sum, -diff);
+                if (diff > 0) rate_sum = fp_ldexp(rate_sum, -diff);
                 site_lk += rate_w * rate_sum;
             }
         }
-        const double eps = 1e-300;
-        local_sum += log(site_lk > eps ? site_lk : eps) - (double)site_min_shift * kLn2;
+        local_sum += static_cast<double>(fp_log(site_lk > FP_EPS ? site_lk : FP_EPS))
+                   - static_cast<double>(site_min_shift) * kLn2;
     }
 
     __shared__ double warp_sum[32];
@@ -516,7 +517,7 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
         for (int offset = 16; offset > 0; offset >>= 1) {
             block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
         }
-        if (lane == 0) d_out[op_idx] = block_sum;
+        if (lane == 0) d_out[op_idx] = static_cast<fp_t>(block_sum);
     }
 }
 
@@ -524,10 +525,10 @@ void compute_combined_loglik_per_op(
     const DeviceTree& D,
     const NodeOpInfo* d_ops,
     int num_ops,
-    const double* d_pendant_pmats,
-    const double* d_distal_pmats,
-    const double* d_proximal_pmats,
-    double * d_likelihoods,
+    const fp_t* d_pendant_pmats,
+    const fp_t* d_distal_pmats,
+    const fp_t* d_proximal_pmats,
+    fp_t* d_likelihoods,
     cudaStream_t stream)
 {
     if (!d_ops || !d_pendant_pmats || !d_distal_pmats || !d_proximal_pmats) {
@@ -551,10 +552,10 @@ void compute_combined_loglik_per_op_device(
     const DeviceTree& D,
     const NodeOpInfo* d_ops,
     int num_ops,
-    const double* d_pendant_pmats,
-    const double* d_distal_pmats,
-    const double* d_proximal_pmats,
-    double* d_out,
+    const fp_t* d_pendant_pmats,
+    const fp_t* d_distal_pmats,
+    const fp_t* d_proximal_pmats,
+    fp_t* d_out,
     cudaStream_t stream)
 {
     if (num_ops <= 0) return;

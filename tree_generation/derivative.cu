@@ -15,8 +15,8 @@
 static __device__ __forceinline__ void build_diagtable_for_branch(
     const DeviceTree& D,
     const NodeOpInfo& op,
-    double branch_length,
-    double* diag_out)
+    fp_t branch_length,
+    fp_t* diag_out)
 {
     if (!diag_out || !D.d_lambdas) return;
     const unsigned int total = (unsigned int)(D.rate_cats * D.states);
@@ -24,8 +24,8 @@ static __device__ __forceinline__ void build_diagtable_for_branch(
     if (idx >= total) return;
     const int rc = idx / D.states;
     const int st = idx - rc * D.states;
-    const double lambda = D.d_lambdas[(size_t)rc * D.states + st];
-    const double e = exp(lambda * branch_length);
+    const fp_t lambda = D.d_lambdas[(size_t)rc * D.states + st];
+    const fp_t e = fp_exp(lambda * branch_length);
     // Debug: print lambda for each state/rate category to verify values.
     // printf("[diagtable] op(p=%d l=%d r=%d) idx=%u rc=%d st=%d lambda=%e branch=%f exp=%e\n",
     //        op.parent_id, op.left_id, op.right_id, idx, rc, st, lambda, branch_length, e);
@@ -33,18 +33,18 @@ static __device__ __forceinline__ void build_diagtable_for_branch(
     diag_out[base + 0] = e;
     diag_out[base + 1] = lambda * e;
     diag_out[base + 2] = lambda * lambda * e;
-    diag_out[base + 3] = 0.0;
+    diag_out[base + 3] = fp_t(0);
 }
 
 template<int RATE_CATS>
 __device__ void LikelihoodSumtableUpdateKernel(
     DeviceTree D,
-    const double* __restrict__ left_clv_base,
-    const double* __restrict__ right_clv_base,
+    const fp_t* __restrict__ left_clv_base,
+    const fp_t* __restrict__ right_clv_base,
     const unsigned* __restrict__ left_scaler_base,
     const unsigned* __restrict__ right_scaler_base,
     unsigned int site_idx,
-    double *sumtable);
+    fp_t* sumtable);
 
 static __device__ __forceinline__
 unsigned int scaler_shift_at_site(
@@ -64,79 +64,78 @@ static __device__ __forceinline__
 void core_site_likelihood_derivatives_site(
     const DeviceTree D,
     const int*    __restrict__ invariant_site, // [n_sites], per-site invariant index (or -1)
-    const double* __restrict__ invar_proportion,     // [rate_cats] (may be nullptr -> treated as invar_scalar)
-    double invar_scalar,
-    const double* __restrict__ sumtable,      // base of sumtable: [sites * rate_cats * states]
-    const double* __restrict__ lambdas,     // [rate_cats * states * 4]
-    const double* __restrict__ pattern_weights,// [sites] or nullptr
+    const fp_t* __restrict__ invar_proportion,     // [rate_cats] (may be nullptr -> treated as invar_scalar)
+    fp_t invar_scalar,
+    const fp_t* __restrict__ sumtable,      // base of sumtable: [sites * rate_cats * states]
+    const fp_t* __restrict__ lambdas,     // [rate_cats * states * 4]
+    const fp_t* __restrict__ pattern_weights,// [sites] or nullptr
     size_t site,
-    double* placement_clv, // optional: write per-site log-likelihood
+    fp_t* placement_clv, // optional: write per-site log-likelihood
     double& d1_out,
     double& d2_out)
 {
-    double site_lk0 = 0.0;
-    double site_lk1 = 0.0;
-    double site_lk2 = 0.0;
+    fp_t site_lk0 = fp_t(0);
+    fp_t site_lk1 = fp_t(0);
+    fp_t site_lk2 = fp_t(0);
 
     const int inv = invariant_site ? invariant_site[site] : -1;
     const size_t site_stride = (size_t)D.rate_cats * (size_t)D.states;
 
     // Loop over rate categories
     for (int i = 0; i < D.rate_cats; ++i) {
-        const double* sum  = sumtable + site * site_stride + (size_t)i * D.states; // [states]
-        const double* diag = lambdas + ((size_t)i * D.states) * 4;              // [states * 4]
-        const double* t_freqs = D.d_frequencies;                                   // [states]
+        const fp_t* sum  = sumtable + site * site_stride + (size_t)i * D.states; // [states]
+        const fp_t* diag = lambdas + ((size_t)i * D.states) * 4;              // [states * 4]
+        const fp_t* t_freqs = D.d_frequencies;                                   // [states]
 
-        double cat0 = 0.0;
-        double cat1 = 0.0;
-        double cat2 = 0.0;
+        fp_t cat0 = fp_t(0);
+        fp_t cat1 = fp_t(0);
+        fp_t cat2 = fp_t(0);
 
         // Loop over states (NOT padded)
         for (int j = 0; j < D.states; ++j) {
-            const double s = sum[j];
-            cat0 += s * diag[0];
-            cat1 += s * diag[1];
-            cat2 += s * diag[2];
+            const fp_t s = sum[j];
+            cat0 = fp_fma(s, diag[0], cat0);
+            cat1 = fp_fma(s, diag[1], cat1);
+            cat2 = fp_fma(s, diag[2], cat2);
             diag += 4;
         }
 
         // account for invariant sites
-        const double pinv = invar_proportion ? invar_proportion[i] : invar_scalar;
-        if (pinv > 0.0) {
-            const double inv_site_lk = (inv < 0) ? 0.0 : (t_freqs[inv] * pinv);
-            const double non_pinv = (1.0 - pinv);
+        const fp_t pinv = invar_proportion ? invar_proportion[i] : invar_scalar;
+        if (pinv > fp_t(0)) {
+            const fp_t inv_site_lk = (inv < 0) ? fp_t(0) : (t_freqs[inv] * pinv);
+            const fp_t non_pinv = fp_t(1) - pinv;
             cat0 = cat0 * non_pinv + inv_site_lk;
             cat1 = cat1 * non_pinv;
             cat2 = cat2 * non_pinv;
         }
 
         // Use rate weights if available (fallback to 1.0).
-        const double w = D.d_rate_weights ? D.d_rate_weights[i] : 1.0;
+        const fp_t w = D.d_rate_weights ? D.d_rate_weights[i] : fp_t(1);
         site_lk0 += cat0 * w;
         site_lk1 += cat1 * w;
         site_lk2 += cat2 * w;
     }
 
-    const double inv_lk0 = (site_lk0 != 0.0) ? (1.0 / site_lk0) : 0.0;
-    const double d1 = -site_lk1 * inv_lk0;
-    const double d2 = d1 * d1 - (site_lk2 * inv_lk0);
+    const fp_t inv_lk0 = (site_lk0 != fp_t(0)) ? (fp_t(1) / site_lk0) : fp_t(0);
+    const fp_t d1 = -site_lk1 * inv_lk0;
+    const fp_t d2 = d1 * d1 - (site_lk2 * inv_lk0);
     
-    const double weight = pattern_weights ? pattern_weights[site] : 1.0;
-    d1_out = weight * d1;
-    d2_out = weight * d2;
+    const fp_t weight = pattern_weights ? pattern_weights[site] : fp_t(1);
+    d1_out = static_cast<double>(weight * d1);
+    d2_out = static_cast<double>(weight * d2);
     if (placement_clv) {
-        const double eps = 1e-300;
-        placement_clv[site] = log(site_lk0 > eps ? site_lk0 : eps) * weight;
+        placement_clv[site] = fp_log(site_lk0 > FP_EPS ? site_lk0 : FP_EPS) * weight;
     }
 }
 
 template<int RATE_CATS>
 __device__ void LikelihoodSumtableUpdateKernel(
         DeviceTree D,
-        const double* __restrict__ left_clv_base,
-        const double* __restrict__ right_clv_base,
+        const fp_t* __restrict__ left_clv_base,
+        const fp_t* __restrict__ right_clv_base,
         unsigned int site_idx,
-        double *sumtable);
+        fp_t* sumtable);
 
 
 __global__ void LikelihoodDerivativeKernel(
@@ -144,16 +143,16 @@ __global__ void LikelihoodDerivativeKernel(
     const NodeOpInfo* ops,
     int op_idx,
     const int*    __restrict__ invariant_site,   // [sites] or nullptr
-    const double* __restrict__ invar_proportion, // [rate_cats] or nullptr
-    double invar_scalar,                         // used when invar_proportion == nullptr
-    double* __restrict__ sumtable,               // [sites * rate_cats * states] (built in-kernel)
-    const double* __restrict__ pattern_weights,  // [sites] or nullptr
+    const fp_t* __restrict__ invar_proportion, // [rate_cats] or nullptr
+    fp_t invar_scalar,                         // used when invar_proportion == nullptr
+    fp_t* __restrict__ sumtable,                 // [sites * rate_cats * states] (built in-kernel)
+    const fp_t* __restrict__ pattern_weights,  // [sites] or nullptr
     int max_iter,                                // number of Newton updates
-    double* new_branch_length,                   // output updated branch length (Newton step; can be per-node array)
+    fp_t* new_branch_length,                     // output updated branch length (Newton step; can be per-node array)
     bool proximal_mode,                          // whether this call targets proximal branch optimization
     size_t sumtable_stride,                      // stride between per-op sumtable slices
-    double* placement_clv_base,                  // optional per-op placement CLV buffer
-    const double* prev_branch_lengths,           // optional per-node initial branch lengths
+    fp_t* placement_clv_base,                    // optional per-op placement CLV buffer
+    const fp_t* prev_branch_lengths,             // optional per-node initial branch lengths
     const int* active_ops)                       // optional per-op active mask (1=run, 0=skip)
 {
     
@@ -175,10 +174,10 @@ __global__ void LikelihoodDerivativeKernel(
     const size_t scaler_span = D.per_rate_scaling
         ? (D.sites * (size_t)D.rate_cats)
         : D.sites;
-    const double* left_base = proximal_mode
+    const fp_t* left_base = proximal_mode
         ? (D.d_clv_up ? D.d_clv_up + (size_t)target_id * clv_span : nullptr)
         : D.d_query_clv;
-    const double* right_base = D.d_clv_mid
+    const fp_t* right_base = D.d_clv_mid
         ? D.d_clv_mid + (size_t)target_id * clv_span
         : nullptr;
     const unsigned* left_scaler_base = proximal_mode
@@ -190,8 +189,8 @@ __global__ void LikelihoodDerivativeKernel(
 
     if (!left_base || !right_base) return;
 
-    double* sumtable_op = sumtable ? sumtable + (size_t)op_global * sumtable_stride : nullptr;
-    double* placement_clv = placement_clv_base
+    fp_t* sumtable_op = sumtable ? sumtable + (size_t)op_global * sumtable_stride : nullptr;
+    fp_t* placement_clv = placement_clv_base
         ? placement_clv_base + (size_t)op_global * D.sites
         : nullptr;
 
@@ -204,11 +203,11 @@ __global__ void LikelihoodDerivativeKernel(
     double init_branch = OPT_BRANCH_LEN_MIN;
     if (prev_branch_lengths) {
         // Use per-node lengths directly (target side).
-        init_branch = prev_branch_lengths[target_id];
+        init_branch = static_cast<double>(prev_branch_lengths[target_id]);
     } else {
         // Fallback: use half of the current branch length for both pendant/proximal.
         if(proximal_mode) {
-            init_branch = 0.5 * D.d_blen[target_id];
+            init_branch = 0.5 * static_cast<double>(D.d_blen[target_id]);
         } else{
             init_branch = DEFAULT_BRANCH_LENGTH;
         }
@@ -220,10 +219,10 @@ __global__ void LikelihoodDerivativeKernel(
         bracket_low_shared = OPT_BRANCH_LEN_MIN;
         
         if(proximal_mode){
-            dxmax_shared = (D.d_blen[target_id] - OPT_BRANCH_XTOL) / static_cast<double>(max_iter);
+            dxmax_shared = (static_cast<double>(D.d_blen[target_id]) - OPT_BRANCH_XTOL) / static_cast<double>(max_iter);
             // Proximal split can slide across the full target edge; clamping to half
             // the branch length prevents valid optima on the parent-side half.
-            bracket_high_shared = D.d_blen[target_id] - OPT_BRANCH_LEN_MIN/10;
+            bracket_high_shared = static_cast<double>(D.d_blen[target_id]) - OPT_BRANCH_LEN_MIN/10;
         }
         else{
             dxmax_shared = OPT_BRANCH_LEN_MAX / static_cast<double>(max_iter);
@@ -235,7 +234,7 @@ __global__ void LikelihoodDerivativeKernel(
     __syncthreads();
 
     // Each block handles a single placement op; no cross-block reduction needed.
-    extern __shared__ double diag_shared[]; // [rate_cats * states * 4]
+    extern __shared__ fp_t diag_shared[]; // [rate_cats * states * 4]
     __shared__ double warp_df[32];
     __shared__ double warp_ddf[32];
     double df_local  = 0.0;
@@ -283,7 +282,7 @@ __global__ void LikelihoodDerivativeKernel(
     for (int iter = 0; iter < max_iter; ++iter) {
         if (stop_updates) break;
         // Refresh diag table for current branch length (shared for the block).
-        double branch = branch_shared;
+        const fp_t branch = static_cast<fp_t>(branch_shared);
         build_diagtable_for_branch(D, op, branch, diag_shared);
         __syncthreads();
 
@@ -383,7 +382,7 @@ __global__ void LikelihoodDerivativeKernel(
     }
 
     if (threadIdx.x == 0) {
-        new_branch_length[target_id] = branch_shared;
+        new_branch_length[target_id] = static_cast<fp_t>(branch_shared);
     }
 
 }
@@ -391,12 +390,12 @@ __global__ void LikelihoodDerivativeKernel(
 template<int RATE_CATS>
 __device__ void LikelihoodSumtableUpdateKernel(
         DeviceTree D,
-        const double* __restrict__ left_clv_base,
-        const double* __restrict__ right_clv_base,
+        const fp_t* __restrict__ left_clv_base,
+        const fp_t* __restrict__ right_clv_base,
         const unsigned* __restrict__ left_scaler_base,
         const unsigned* __restrict__ right_scaler_base,
         unsigned int site_idx,
-        double *sumtable
+        fp_t* sumtable
     ){
         // Generic sumtable builder: multiplies a left/right CLV pair for a given site.
         if (!sumtable || !left_clv_base || !right_clv_base) return;
@@ -405,9 +404,9 @@ __device__ void LikelihoodSumtableUpdateKernel(
         const size_t span     = (size_t)D.rate_cats * (size_t)D.states;
         const size_t site_off = (size_t)site_idx * span;
 
-        const double* left_clv  = left_clv_base  + site_off;
-        const double* right_clv = right_clv_base + site_off;
-        double* sumtable_ptr = sumtable + site_off;
+        const fp_t* left_clv  = left_clv_base  + site_off;
+        const fp_t* right_clv = right_clv_base + site_off;
+        fp_t* sumtable_ptr = sumtable + site_off;
         unsigned int rate_shift[RATE_CATS];
         bool rate_has_signal[RATE_CATS];
         unsigned int site_min_shift = 0u;
@@ -415,38 +414,38 @@ __device__ void LikelihoodSumtableUpdateKernel(
 
         #pragma unroll
         for(int r = 0; r < RATE_CATS; ++r){
-            const double4 Qclv = reinterpret_cast<const double4*>(left_clv  + (size_t)r * 4)[0];
-            const double4 Pclv = reinterpret_cast<const double4*>(right_clv + (size_t)r * 4)[0];
-            double* sumtable_row = sumtable_ptr  + (size_t)r * 4;
+            const fp4_t Qclv = reinterpret_cast<const fp4_t*>(left_clv  + (size_t)r * 4)[0];
+            const fp4_t Pclv = reinterpret_cast<const fp4_t*>(right_clv + (size_t)r * 4)[0];
+            fp_t* sumtable_row = sumtable_ptr  + (size_t)r * 4;
             
-            const double* Vinv = D.d_Vinv;
-            const double* V    = D.d_V;
-            const double* pi   = D.d_frequencies;
+            const fp_t* Vinv = D.d_Vinv;
+            const fp_t* V    = D.d_V;
+            const fp_t* pi   = D.d_frequencies;
 
             // query side (tip): Vinv * (pi .* Q)
-            const double l0 = (pi[0]*Qclv.x)*Vinv[0]  + (pi[1]*Qclv.y)*Vinv[4]  + (pi[2]*Qclv.z)*Vinv[8]  + (pi[3]*Qclv.w)*Vinv[12];
-            const double l1 = (pi[0]*Qclv.x)*Vinv[1]  + (pi[1]*Qclv.y)*Vinv[5]  + (pi[2]*Qclv.z)*Vinv[9]  + (pi[3]*Qclv.w)*Vinv[13];
-            const double l2 = (pi[0]*Qclv.x)*Vinv[2]  + (pi[1]*Qclv.y)*Vinv[6]  + (pi[2]*Qclv.z)*Vinv[10] + (pi[3]*Qclv.w)*Vinv[14];
-            const double l3 = (pi[0]*Qclv.x)*Vinv[3]  + (pi[1]*Qclv.y)*Vinv[7]  + (pi[2]*Qclv.z)*Vinv[11] + (pi[3]*Qclv.w)*Vinv[15];
+            const fp4_t piq = make_fp4(pi[0] * Qclv.x, pi[1] * Qclv.y, pi[2] * Qclv.z, pi[3] * Qclv.w);
+            const fp_t l0 = fp_dot4(make_fp4(Vinv[0], Vinv[4], Vinv[8], Vinv[12]), piq);
+            const fp_t l1 = fp_dot4(make_fp4(Vinv[1], Vinv[5], Vinv[9], Vinv[13]), piq);
+            const fp_t l2 = fp_dot4(make_fp4(Vinv[2], Vinv[6], Vinv[10], Vinv[14]), piq);
+            const fp_t l3 = fp_dot4(make_fp4(Vinv[3], Vinv[7], Vinv[11], Vinv[15]), piq);
 
-            // parent/midpoint side: V * P
-            const double r0 = V[0]*Pclv.x  + V[1]*Pclv.y  + V[2]*Pclv.z  + V[3]*Pclv.w;
-            const double r1 = V[4]*Pclv.x  + V[5]*Pclv.y  + V[6]*Pclv.z  + V[7]*Pclv.w;
-            const double r2 = V[8]*Pclv.x  + V[9]*Pclv.y  + V[10]*Pclv.z + V[11]*Pclv.w;
-            const double r3 = V[12]*Pclv.x + V[13]*Pclv.y + V[14]*Pclv.z + V[15]*Pclv.w;
+            const fp_t r0 = fp_dot4(make_fp4(V[0], V[1], V[2], V[3]), Pclv);
+            const fp_t r1 = fp_dot4(make_fp4(V[4], V[5], V[6], V[7]), Pclv);
+            const fp_t r2 = fp_dot4(make_fp4(V[8], V[9], V[10], V[11]), Pclv);
+            const fp_t r3 = fp_dot4(make_fp4(V[12], V[13], V[14], V[15]), Pclv);
 
             sumtable_row[0] = l0 * r0;
             sumtable_row[1] = l1 * r1;
             sumtable_row[2] = l2 * r2;
             sumtable_row[3] = l3 * r3;
-            const double row_max = fmax(
-                fmax(sumtable_row[0], sumtable_row[1]),
-                fmax(sumtable_row[2], sumtable_row[3]));
+            const fp_t row_max = fp_fmax(
+                fp_fmax(sumtable_row[0], sumtable_row[1]),
+                fp_fmax(sumtable_row[2], sumtable_row[3]));
             const unsigned int total_shift =
                 scaler_shift_at_site(D, left_scaler_base, site_idx, r) +
                 scaler_shift_at_site(D, right_scaler_base, site_idx, r);
             rate_shift[r] = total_shift;
-            rate_has_signal[r] = (row_max > 0.0);
+            rate_has_signal[r] = (row_max > fp_t(0));
             if (rate_has_signal[r]) {
                 if (!have_signal || total_shift < site_min_shift) {
                     site_min_shift = total_shift;
@@ -462,15 +461,15 @@ __device__ void LikelihoodSumtableUpdateKernel(
             if (!rate_has_signal[r]) continue;
             const int diff = (int)rate_shift[r] - (int)site_min_shift;
             if (diff <= 0) continue;
-            double* sumtable_row = sumtable_ptr + (size_t)r * 4;
-            sumtable_row[0] = ldexp(sumtable_row[0], -diff);
-            sumtable_row[1] = ldexp(sumtable_row[1], -diff);
-            sumtable_row[2] = ldexp(sumtable_row[2], -diff);
-            sumtable_row[3] = ldexp(sumtable_row[3], -diff);
+            fp_t* sumtable_row = sumtable_ptr + (size_t)r * 4;
+            sumtable_row[0] = fp_ldexp(sumtable_row[0], -diff);
+            sumtable_row[1] = fp_ldexp(sumtable_row[1], -diff);
+            sumtable_row[2] = fp_ldexp(sumtable_row[2], -diff);
+            sumtable_row[3] = fp_ldexp(sumtable_row[3], -diff);
         }
     } 
 
 // Explicit instantiations for the common rate category counts.
-template __device__ void LikelihoodSumtableUpdateKernel<1>(DeviceTree, const double*, const double*, const unsigned*, const unsigned*, unsigned int, double*);
-template __device__ void LikelihoodSumtableUpdateKernel<4>(DeviceTree, const double*, const double*, const unsigned*, const unsigned*, unsigned int, double*);
-template __device__ void LikelihoodSumtableUpdateKernel<8>(DeviceTree, const double*, const double*, const unsigned*, const unsigned*, unsigned int, double*);
+template __device__ void LikelihoodSumtableUpdateKernel<1>(DeviceTree, const fp_t*, const fp_t*, const unsigned*, const unsigned*, unsigned int, fp_t*);
+template __device__ void LikelihoodSumtableUpdateKernel<4>(DeviceTree, const fp_t*, const fp_t*, const unsigned*, const unsigned*, unsigned int, fp_t*);
+template __device__ void LikelihoodSumtableUpdateKernel<8>(DeviceTree, const fp_t*, const fp_t*, const unsigned*, const unsigned*, unsigned int, fp_t*);

@@ -18,7 +18,7 @@ CXX := g++
 # Usage: make DEBUG=1
 # ==========================================
 DEBUG ?= 0
-USE_DOUBLE ?= 0
+USE_DOUBLE ?= 1
 BUILD_DIR ?= build
 # ==========================================
 # libpll
@@ -140,4 +140,12 @@ cuda-gdb: $(TARGET)
 clean:
 	rm -rf $(BUILD_DIR)
 
-.PHONY: clean debug run cuda-gdb
+double:
+	$(MAKE) clean
+	$(MAKE) USE_DOUBLE=1 $(TARGET)
+
+float:
+	$(MAKE) clean
+	$(MAKE) USE_DOUBLE=0 $(TARGET)
+
+.PHONY: clean debug run cuda-gdb double float

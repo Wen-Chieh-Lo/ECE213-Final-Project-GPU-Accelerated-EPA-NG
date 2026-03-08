@@ -7,10 +7,8 @@
 #include "partial_likelihood.cuh"
 #include "../tree_generation/root_likelihood.cuh"
 
-__device__ inline void scale_double_pow2(double &x, int shift) {
-    long long bits = __double_as_longlong(x);
-    bits += ((long long)shift << 52);   // exponent += shift
-    x = __longlong_as_double(bits);
+__device__ inline void scale_clv_pow2(fp_t &x, int shift) {
+    fp_scale_pow2(x, shift);
 }
 
 __device__ __forceinline__ unsigned int scaler_slot(
@@ -78,19 +76,19 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)states * (size_t)rate_cats;
 
-    const double* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
-    const double* sibling_up  = D.d_clv_up   + (size_t)sibling_id * per_node + site_off;
-    double*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
-    double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
-    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
-    const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
+    const fp_t* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
+    const fp_t* sibling_up  = D.d_clv_up   + (size_t)sibling_id * per_node + site_off;
+    fp_t*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
+    fp_t*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
+    fp_t*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    const fp_t* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
     if (!parent_down || !sibling_up || !target_down) return;
 
-    const double* target_mat  = D.d_pmat + (size_t)target_id  * rate_cats * states * states;
-    const double* target_mat_half = D.d_pmat_mid
+    const fp_t* target_mat  = D.d_pmat + (size_t)target_id  * rate_cats * states * states;
+    const fp_t* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * rate_cats * states * states)
         : target_mat;
-    const double* sibling_mat = D.d_pmat + (size_t)sibling_id * rate_cats * states * states;
+    const fp_t* sibling_mat = D.d_pmat + (size_t)sibling_id * rate_cats * states * states;
     unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
     unsigned int* sibling_scaler = up_scaler_ptr(D, sibling_id, site);
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
@@ -106,19 +104,19 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
 
-        const double* Tmat = target_mat  + (size_t)r * states * states;
-        const double* Thalf= target_mat_half + (size_t)r * states * states;
-        const double* Smat = sibling_mat + (size_t)r * states * states;
-        const double* Ppar = parent_down + (size_t)r * states;
-        const double* Psib = sibling_up  + (size_t)r * states;
-        double*       Pout = target_down + (size_t)r * states;
-        double*       Pmid  = (target_mid && target_up) ? (target_mid + (size_t)r * states) : nullptr;
-        const double* Pup   = target_up ? (target_up + (size_t)r * states) : nullptr;
-        double*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
+        const fp_t* Tmat = target_mat  + (size_t)r * states * states;
+        const fp_t* Thalf= target_mat_half + (size_t)r * states * states;
+        const fp_t* Smat = sibling_mat + (size_t)r * states * states;
+        const fp_t* Ppar = parent_down + (size_t)r * states;
+        const fp_t* Psib = sibling_up  + (size_t)r * states;
+        fp_t*       Pout = target_down + (size_t)r * states;
+        fp_t*       Pmid  = (target_mid && target_up) ? (target_mid + (size_t)r * states) : nullptr;
+        const fp_t* Pup   = target_up ? (target_up + (size_t)r * states) : nullptr;
+        fp_t*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
 
         double sib_to_parent[64];
         for (unsigned int j = 0; j < states; ++j) {
-            const double* row = Smat + j * states;
+            const fp_t* row = Smat + j * states;
             double acc = 0.0;
             for (unsigned int k = 0; k < states; ++k) acc += row[k] * Psib[k];
             sib_to_parent[j] = acc;
@@ -126,7 +124,7 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
 
         double col_scale_max_val = 0.0;
         for (unsigned int i = 0; i < states; ++i) {
-            const double* Tcol = Tmat + i;
+            const fp_t* Tcol = Tmat + i;
             double acc = 0.0;
             for (unsigned int j = 0; j < states; ++j)
                 acc += Tcol[j * states] * (Ppar[j] * sib_to_parent[j]);
@@ -142,7 +140,7 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
                 }
             }
             for (unsigned int i = 0; i < states; ++i) {
-                const double* Throw = Thalf + i * states;
+                const fp_t* Throw = Thalf + i * states;
                 double par_acc = 0.0, tgt_acc = 0.0;
                 for (unsigned int j = 0; j < states; ++j) {
                     const double pj = Pbase ? Pbase[j] : (Ppar[j] * sib_to_parent[j]);
@@ -161,14 +159,14 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
             add_scaler_shift(D, down_scaler, r, shift);
             add_scaler_shift(D, mid_scaler, r, shift);
             for (unsigned int j = 0; j < states; ++j)
-                scale_double_pow2(Pout[j], shift);
+                    scale_clv_pow2(Pout[j], shift);
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], shift);
             }
             if (Pmid) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], shift);
             }
         }
     }
@@ -190,17 +188,17 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)states * (size_t)rate_cats;
 
-    const double* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
-    double*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
-    const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
+    const fp_t* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
+    fp_t*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
+    const fp_t* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
     if (!parent_down || !target_down) return;
 
-    const double* target_mat  = D.d_pmat + (size_t)target_id * rate_cats * states * states;
-    const double* target_mat_half = D.d_pmat_mid
+    const fp_t* target_mat  = D.d_pmat + (size_t)target_id * rate_cats * states * states;
+    const fp_t* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * rate_cats * states * states)
         : target_mat;
-    const double* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * rate_cats * states * states;
-    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    const fp_t* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * rate_cats * states * states;
+    fp_t*         mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
     unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
     unsigned int* sibling_scaler = up_scaler_ptr(D, target_is_left ? op.right_id : op.left_id, site);
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
@@ -219,20 +217,20 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
 
         const unsigned int mask = D.d_tipmap[tipchars[site]];
-        const double* Tmat = target_mat  + (size_t)r * states * states;
-        const double* Thalf= target_mat_half + (size_t)r * states * states;
-        const double* Smat = sibling_mat + (size_t)r * states * states;
-        const double* Ppar = parent_down + (size_t)r * states;
-        const double* Pup  = target_up ? (target_up + (size_t)r * states) : nullptr;
-        double*       Pout = target_down + (size_t)r * states;
-        double*       Pmid = (target_up && D.d_clv_mid)
+        const fp_t* Tmat = target_mat  + (size_t)r * states * states;
+        const fp_t* Thalf= target_mat_half + (size_t)r * states * states;
+        const fp_t* Smat = sibling_mat + (size_t)r * states * states;
+        const fp_t* Ppar = parent_down + (size_t)r * states;
+        const fp_t* Pup  = target_up ? (target_up + (size_t)r * states) : nullptr;
+        fp_t*       Pout = target_down + (size_t)r * states;
+        fp_t*       Pmid = (target_up && D.d_clv_mid)
             ? (D.d_clv_mid + (size_t)target_id * per_node + site_off + (size_t)r * states)
             : nullptr;
-        double*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
+        fp_t*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
 
         double sib_to_parent[64];
         for (unsigned int j = 0; j < states; ++j) {
-            const double* row = Smat + j * states;
+            const fp_t* row = Smat + j * states;
             double acc = 0.0;
             for (unsigned int k = 0; k < states; ++k)
                 if (mask & (1u << k)) acc += row[k];
@@ -241,7 +239,7 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
 
         double col_scale_max_val = 0.0;
         for (unsigned int i = 0; i < states; ++i) {
-            const double* Tcol = Tmat + i;
+            const fp_t* Tcol = Tmat + i;
             double acc = 0.0;
             for (unsigned int j = 0; j < states; ++j)
                 acc += Tcol[j * states] * (Ppar[j] * sib_to_parent[j]);
@@ -256,7 +254,7 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
                 }
             }
             for (unsigned int i = 0; i < states; ++i) {
-                const double* Throw = Thalf + i * states;
+                const fp_t* Throw = Thalf + i * states;
                 double par_acc = 0.0, tgt_acc = 0.0;
                 for (unsigned int j = 0; j < states; ++j) {
                     const double pj = Pbase ? Pbase[j] : (Ppar[j] * sib_to_parent[j]);
@@ -274,14 +272,14 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
             add_scaler_shift(D, down_scaler, r, shift);
             add_scaler_shift(D, mid_scaler, r, shift);
             for (unsigned int j = 0; j < states; ++j)
-                scale_double_pow2(Pout[j], shift);
+                    scale_clv_pow2(Pout[j], shift);
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], shift);
             }
             if (Pmid) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], shift);
             }
         }
     }
@@ -304,18 +302,18 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)states * (size_t)rate_cats;
 
-    const double* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
-    double*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
-    const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
+    const fp_t* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
+    fp_t*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
+    const fp_t* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
     if (!parent_down || !target_down) return;
 
-    const double* target_mat  = D.d_pmat + (size_t)target_id * rate_cats * states * states;
-    const double* target_mat_half = D.d_pmat_mid
+    const fp_t* target_mat  = D.d_pmat + (size_t)target_id * rate_cats * states * states;
+    const fp_t* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * rate_cats * states * states)
         : target_mat;
-    const double* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * rate_cats * states * states;
-    double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
-    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    const fp_t* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * rate_cats * states * states;
+    fp_t*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
+    fp_t*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
     unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
     unsigned int* sibling_scaler = up_scaler_ptr(D, target_is_left ? op.right_id : op.left_id, site);
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
@@ -333,18 +331,18 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
 
         const unsigned int mask = D.d_tipmap[tipchars[site]];
-        const double* Tmat = target_mat  + (size_t)r * states * states;
-        const double* Thalf= target_mat_half + (size_t)r * states * states;
-        const double* Smat = sibling_mat + (size_t)r * states * states;
-        const double* Ppar = parent_down + (size_t)r * states;
-        const double* Pup  = target_up ? (target_up + (size_t)r * states) : nullptr;
-        double*       Pout = target_down + (size_t)r * states;
-        double*       Pmid = (target_up && target_mid) ? (target_mid + (size_t)r * states) : nullptr;
-        double*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
+        const fp_t* Tmat = target_mat  + (size_t)r * states * states;
+        const fp_t* Thalf= target_mat_half + (size_t)r * states * states;
+        const fp_t* Smat = sibling_mat + (size_t)r * states * states;
+        const fp_t* Ppar = parent_down + (size_t)r * states;
+        const fp_t* Pup  = target_up ? (target_up + (size_t)r * states) : nullptr;
+        fp_t*       Pout = target_down + (size_t)r * states;
+        fp_t*       Pmid = (target_up && target_mid) ? (target_mid + (size_t)r * states) : nullptr;
+        fp_t*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
 
         double sib_to_parent[64];
         for (unsigned int j = 0; j < states; ++j) {
-            const double* row = Smat + j * states;
+            const fp_t* row = Smat + j * states;
             double acc = 0.0;
             for (unsigned int k = 0; k < states; ++k)
                 if (mask & (1u << k)) acc += row[k];
@@ -353,7 +351,7 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
 
         double col_scale_max_val = 0.0;
         for (unsigned int i = 0; i < states; ++i) {
-            const double* Tcol = Tmat + i;
+            const fp_t* Tcol = Tmat + i;
             double acc = 0.0;
             for (unsigned int j = 0; j < states; ++j)
                 acc += Tcol[j * states] * (Ppar[j] * sib_to_parent[j]);
@@ -368,7 +366,7 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
                 }
             }
             for (unsigned int i = 0; i < states; ++i) {
-                const double* Throw = Thalf + i * states;
+                const fp_t* Throw = Thalf + i * states;
                 double par_acc = 0.0, tgt_acc = 0.0;
                 for (unsigned int j = 0; j < states; ++j) {
                     const double pj = Pbase ? Pbase[j] : (Ppar[j] * sib_to_parent[j]);
@@ -386,14 +384,14 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
             add_scaler_shift(D, down_scaler, r, shift);
             add_scaler_shift(D, mid_scaler, r, shift);
             for (unsigned int j = 0; j < states; ++j)
-                scale_double_pow2(Pout[j], shift);
+                    scale_clv_pow2(Pout[j], shift);
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], shift);
             }
             if (Pmid) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], shift);
             }
         }
     }
@@ -415,21 +413,21 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)states * (size_t)rate_cats;
 
-    const double* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
-    const double* sibling_up  = D.d_clv_up   + (size_t)sibling_id * per_node + site_off;
-    double*       target_down = D.d_clv_down + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off;
-    const double* target_up   = D.d_clv_up   + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off;
+    const fp_t* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
+    const fp_t* sibling_up  = D.d_clv_up   + (size_t)sibling_id * per_node + site_off;
+    fp_t*       target_down = D.d_clv_down + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off;
+    const fp_t* target_up   = D.d_clv_up   + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off;
     if (!parent_down || !sibling_up || !target_down) return;
 
-    const double* target_mat  = D.d_pmat + (size_t)(target_is_left ? op.left_id : op.right_id) * rate_cats * states * states;
-    const double* target_mat_half = D.d_pmat_mid
+    const fp_t* target_mat  = D.d_pmat + (size_t)(target_is_left ? op.left_id : op.right_id) * rate_cats * states * states;
+    const fp_t* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)(target_is_left ? op.left_id : op.right_id) * rate_cats * states * states)
         : target_mat;
-    const double* sibling_mat = D.d_pmat + (size_t)sibling_id * rate_cats * states * states;
-    double*       target_mid  = D.d_clv_mid
+    const fp_t* sibling_mat = D.d_pmat + (size_t)sibling_id * rate_cats * states * states;
+    fp_t*       target_mid  = D.d_clv_mid
         ? (D.d_clv_mid + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off)
         : nullptr;
-    double*       mid_base    = D.d_clv_mid_base
+    fp_t*       mid_base    = D.d_clv_mid_base
         ? (D.d_clv_mid_base + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off)
         : nullptr;
     const int target_id       = target_is_left ? op.left_id : op.right_id;
@@ -451,19 +449,19 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
 
-        const double* Tmat = target_mat  + (size_t)r * states * states;
-        const double* Thalf= target_mat_half + (size_t)r * states * states;
-        const double* Smat = sibling_mat + (size_t)r * states * states;
-        const double* Ppar = parent_down + (size_t)r * states;
-        const double* Psib = sibling_up  + (size_t)r * states;
-        const double* Pup  = target_up ? (target_up + (size_t)r * states) : nullptr;
-        double*       Pout = target_down + (size_t)r * states;
-        double*       Pmid = (target_up && target_mid) ? (target_mid + (size_t)r * states) : nullptr;
-        double*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
+        const fp_t* Tmat = target_mat  + (size_t)r * states * states;
+        const fp_t* Thalf= target_mat_half + (size_t)r * states * states;
+        const fp_t* Smat = sibling_mat + (size_t)r * states * states;
+        const fp_t* Ppar = parent_down + (size_t)r * states;
+        const fp_t* Psib = sibling_up  + (size_t)r * states;
+        const fp_t* Pup  = target_up ? (target_up + (size_t)r * states) : nullptr;
+        fp_t*       Pout = target_down + (size_t)r * states;
+        fp_t*       Pmid = (target_up && target_mid) ? (target_mid + (size_t)r * states) : nullptr;
+        fp_t*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
 
         double sib_to_parent[64];
         for (unsigned int j = 0; j < states; ++j) {
-            const double* row = Smat + j * states;
+            const fp_t* row = Smat + j * states;
             double acc = 0.0;
             for (unsigned int k = 0; k < states; ++k) acc += row[k] * Psib[k];
             sib_to_parent[j] = acc;
@@ -471,7 +469,7 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
 
         double col_scale_max_val = 0.0;
         for (unsigned int i = 0; i < states; ++i) {
-            const double* Tcol = Tmat + i;
+            const fp_t* Tcol = Tmat + i;
             double acc = 0.0;
             for (unsigned int j = 0; j < states; ++j)
                 acc += Tcol[j * states] * (Ppar[j] * sib_to_parent[j]);
@@ -486,7 +484,7 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
                 }
             }
             for (unsigned int i = 0; i < states; ++i) {
-                const double* Throw = Thalf + i * states;
+                const fp_t* Throw = Thalf + i * states;
                 double par_acc = 0.0, tgt_acc = 0.0;
                 for (unsigned int j = 0; j < states; ++j) {
                     const double pj = Pbase ? Pbase[j] : (Ppar[j] * sib_to_parent[j]);
@@ -504,14 +502,14 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
             add_scaler_shift(D, down_scaler, r, shift);
             add_scaler_shift(D, mid_scaler, r, shift);
             for (unsigned int j = 0; j < states; ++j)
-                scale_double_pow2(Pout[j], shift);
+                    scale_clv_pow2(Pout[j], shift);
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], shift);
             }
             if (Pmid) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], shift);
             }
         }
     }
@@ -535,19 +533,19 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)RATE_CATS * 4;
 
-    const double* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
-    const double* sibling_up  = D.d_clv_up   + (size_t)sibling_id * per_node + site_off;
-    double*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
-    double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
-    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
-    const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
+    const fp_t* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
+    const fp_t* sibling_up  = D.d_clv_up   + (size_t)sibling_id * per_node + site_off;
+    fp_t*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
+    fp_t*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
+    fp_t*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    const fp_t* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
     if (!parent_down || !target_down || !sibling_up || !target_up) return;
 
-    const double* target_mat  = D.d_pmat + (size_t)target_id  * (size_t)RATE_CATS * 16;
-    const double* target_mat_half = D.d_pmat_mid
+    const fp_t* target_mat  = D.d_pmat + (size_t)target_id  * (size_t)RATE_CATS * 16;
+    const fp_t* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16)
         : target_mat;
-    const double* sibling_mat = D.d_pmat + (size_t)sibling_id * (size_t)RATE_CATS * 16;
+    const fp_t* sibling_mat = D.d_pmat + (size_t)sibling_id * (size_t)RATE_CATS * 16;
     unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
     unsigned int* sibling_scaler = up_scaler_ptr(D, sibling_id, site);
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
@@ -564,30 +562,30 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
 
-        const double* Tmat = target_mat  + (size_t)r * 16;
-        const double* Thalf= target_mat_half + (size_t)r * 16;
-        const double* Smat = sibling_mat + (size_t)r * 16;
-        const double4 Ppar = reinterpret_cast<const double4*>(parent_down)[r];
-        const double4 Psib = reinterpret_cast<const double4*>(sibling_up)[r];
-        const double4 Pup  = reinterpret_cast<const double4*>(target_up)[r];
-        double*       Pout = target_down + (size_t)r * 4;
+        const fp_t* Tmat = target_mat  + (size_t)r * 16;
+        const fp_t* Thalf= target_mat_half + (size_t)r * 16;
+        const fp_t* Smat = sibling_mat + (size_t)r * 16;
+        const fp4_t Ppar = reinterpret_cast<const fp4_t*>(parent_down)[r];
+        const fp4_t Psib = reinterpret_cast<const fp4_t*>(sibling_up)[r];
+        const fp4_t Pup  = reinterpret_cast<const fp4_t*>(target_up)[r];
+        fp_t*       Pout = target_down + (size_t)r * 4;
 
-        const double sib0 = Smat[0]*Psib.x + Smat[1]*Psib.y + Smat[2]*Psib.z + Smat[3]*Psib.w;
-        const double sib1 = Smat[4]*Psib.x + Smat[5]*Psib.y + Smat[6]*Psib.z + Smat[7]*Psib.w;
-        const double sib2 = Smat[8]*Psib.x + Smat[9]*Psib.y + Smat[10]*Psib.z+ Smat[11]*Psib.w;
-        const double sib3 = Smat[12]*Psib.x+ Smat[13]*Psib.y+ Smat[14]*Psib.z+ Smat[15]*Psib.w;
+        const fp_t sib0 = fp_dot4(make_fp4(Smat[0], Smat[1], Smat[2], Smat[3]), Psib);
+        const fp_t sib1 = fp_dot4(make_fp4(Smat[4], Smat[5], Smat[6], Smat[7]), Psib);
+        const fp_t sib2 = fp_dot4(make_fp4(Smat[8], Smat[9], Smat[10], Smat[11]), Psib);
+        const fp_t sib3 = fp_dot4(make_fp4(Smat[12], Smat[13], Smat[14], Smat[15]), Psib);
 
-        const double p0 = Ppar.x * sib0;
-        const double p1 = Ppar.y * sib1;
-        const double p2 = Ppar.z * sib2;
-        const double p3 = Ppar.w * sib3;
+        const fp_t p0 = Ppar.x * sib0;
+        const fp_t p1 = Ppar.y * sib1;
+        const fp_t p2 = Ppar.z * sib2;
+        const fp_t p3 = Ppar.w * sib3;
 
         Pout[0] = Tmat[0] * p0 + Tmat[4] * p1 + Tmat[8]  * p2 + Tmat[12] * p3;
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
         Pout[2] = Tmat[2] * p0 + Tmat[6] * p1 + Tmat[10] * p2 + Tmat[14] * p3;
         Pout[3] = Tmat[3] * p0 + Tmat[7] * p1 + Tmat[11] * p2 + Tmat[15] * p3;
         if (mid_base) {
-            double* Pbase = mid_base + (size_t)r * 4;
+            fp_t* Pbase = mid_base + (size_t)r * 4;
             Pbase[0] = p0;
             Pbase[1] = p1;
             Pbase[2] = p2;
@@ -595,16 +593,16 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
         }
 
         if (target_mid) {
-            double* Pmid = target_mid + (size_t)r * 4;
-            const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
-            const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
-            const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
-            const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
+            fp_t* Pmid = target_mid + (size_t)r * 4;
+            const fp_t par0 = fp_dot4(make_fp4(Thalf[0], Thalf[4], Thalf[8], Thalf[12]), make_fp4(p0, p1, p2, p3));
+            const fp_t par1 = fp_dot4(make_fp4(Thalf[1], Thalf[5], Thalf[9], Thalf[13]), make_fp4(p0, p1, p2, p3));
+            const fp_t par2 = fp_dot4(make_fp4(Thalf[2], Thalf[6], Thalf[10], Thalf[14]), make_fp4(p0, p1, p2, p3));
+            const fp_t par3 = fp_dot4(make_fp4(Thalf[3], Thalf[7], Thalf[11], Thalf[15]), make_fp4(p0, p1, p2, p3));
 
-            const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
-            const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
-            const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
-            const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
+            const fp_t tgt0 = fp_dot4(make_fp4(Thalf[0], Thalf[4], Thalf[8], Thalf[12]), Pup);
+            const fp_t tgt1 = fp_dot4(make_fp4(Thalf[1], Thalf[5], Thalf[9], Thalf[13]), Pup);
+            const fp_t tgt2 = fp_dot4(make_fp4(Thalf[2], Thalf[6], Thalf[10], Thalf[14]), Pup);
+            const fp_t tgt3 = fp_dot4(make_fp4(Thalf[3], Thalf[7], Thalf[11], Thalf[15]), Pup);
 
             Pmid[0] = par0 * tgt0;
             Pmid[1] = par1 * tgt1;
@@ -612,7 +610,7 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
             Pmid[3] = par3 * tgt3;
         }
 
-        double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
+        fp_t col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
         int scaling_exponent;
         frexp(col_scale_max_val, &scaling_exponent);
         if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
@@ -621,20 +619,20 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
             add_scaler_shift(D, mid_scaler, r, shift);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                scale_double_pow2(Pout[j], shift);
+                scale_clv_pow2(Pout[j], shift);
             }
             if (mid_base) {
-                double* Pbase = mid_base + (size_t)r * 4;
+                fp_t* Pbase = mid_base + (size_t)r * 4;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], shift);
                 }
             }
             if (target_mid) {
-                double* Pmid = target_mid + (size_t)r * 4;
+                fp_t* Pmid = target_mid + (size_t)r * 4;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], shift);
                 }
             }
         }
@@ -656,18 +654,18 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)RATE_CATS * 4;
 
-    const double* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
-    double*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
-    double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
-    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
-    const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
+    const fp_t* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
+    fp_t*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
+    fp_t*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
+    fp_t*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    const fp_t* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
     if (!parent_down || !target_down || !target_up) return;
 
-    const double* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
-    const double* target_mat_half = D.d_pmat_mid
+    const fp_t* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
+    const fp_t* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16)
         : target_mat;
-    const double* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * (size_t)RATE_CATS * 16;
+    const fp_t* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * (size_t)RATE_CATS * 16;
     unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
     unsigned int* sibling_scaler = up_scaler_ptr(D, target_is_left ? op.right_id : op.left_id, site);
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
@@ -687,29 +685,29 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
 
         const unsigned int mask = D.d_tipmap[tipchars[site]];
-        const double* Tmat = target_mat  + (size_t)r * 16;
-        const double* Thalf= target_mat_half + (size_t)r * 16;
-        const double* Smat = sibling_mat + (size_t)r * 16;
-        const double4 Ppar = reinterpret_cast<const double4*>(parent_down)[r];
-        const double4 Pup  = reinterpret_cast<const double4*>(target_up)[r];
-        double*       Pout = target_down + (size_t)r * 4;
+        const fp_t* Tmat = target_mat  + (size_t)r * 16;
+        const fp_t* Thalf= target_mat_half + (size_t)r * 16;
+        const fp_t* Smat = sibling_mat + (size_t)r * 16;
+        const fp4_t Ppar = reinterpret_cast<const fp4_t*>(parent_down)[r];
+        const fp4_t Pup  = reinterpret_cast<const fp4_t*>(target_up)[r];
+        fp_t*       Pout = target_down + (size_t)r * 4;
 
-        const double sib0 = ((mask & 1u) ? Smat[0]  : 0.0) + ((mask & 2u) ? Smat[1]  : 0.0) + ((mask & 4u) ? Smat[2]  : 0.0) + ((mask & 8u) ? Smat[3]  : 0.0);
-        const double sib1 = ((mask & 1u) ? Smat[4]  : 0.0) + ((mask & 2u) ? Smat[5]  : 0.0) + ((mask & 4u) ? Smat[6]  : 0.0) + ((mask & 8u) ? Smat[7]  : 0.0);
-        const double sib2 = ((mask & 1u) ? Smat[8]  : 0.0) + ((mask & 2u) ? Smat[9]  : 0.0) + ((mask & 4u) ? Smat[10] : 0.0) + ((mask & 8u) ? Smat[11] : 0.0);
-        const double sib3 = ((mask & 1u) ? Smat[12] : 0.0) + ((mask & 2u) ? Smat[13] : 0.0) + ((mask & 4u) ? Smat[14] : 0.0) + ((mask & 8u) ? Smat[15] : 0.0);
+        const fp_t sib0 = ((mask & 1u) ? Smat[0]  : fp_t(0)) + ((mask & 2u) ? Smat[1]  : fp_t(0)) + ((mask & 4u) ? Smat[2]  : fp_t(0)) + ((mask & 8u) ? Smat[3]  : fp_t(0));
+        const fp_t sib1 = ((mask & 1u) ? Smat[4]  : fp_t(0)) + ((mask & 2u) ? Smat[5]  : fp_t(0)) + ((mask & 4u) ? Smat[6]  : fp_t(0)) + ((mask & 8u) ? Smat[7]  : fp_t(0));
+        const fp_t sib2 = ((mask & 1u) ? Smat[8]  : fp_t(0)) + ((mask & 2u) ? Smat[9]  : fp_t(0)) + ((mask & 4u) ? Smat[10] : fp_t(0)) + ((mask & 8u) ? Smat[11] : fp_t(0));
+        const fp_t sib3 = ((mask & 1u) ? Smat[12] : fp_t(0)) + ((mask & 2u) ? Smat[13] : fp_t(0)) + ((mask & 4u) ? Smat[14] : fp_t(0)) + ((mask & 8u) ? Smat[15] : fp_t(0));
 
-        const double p0 = Ppar.x * sib0;
-        const double p1 = Ppar.y * sib1;
-        const double p2 = Ppar.z * sib2;
-        const double p3 = Ppar.w * sib3;
+        const fp_t p0 = Ppar.x * sib0;
+        const fp_t p1 = Ppar.y * sib1;
+        const fp_t p2 = Ppar.z * sib2;
+        const fp_t p3 = Ppar.w * sib3;
 
         Pout[0] = Tmat[0] * p0 + Tmat[4] * p1 + Tmat[8]  * p2 + Tmat[12] * p3;
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
         Pout[2] = Tmat[2] * p0 + Tmat[6] * p1 + Tmat[10] * p2 + Tmat[14] * p3;
         Pout[3] = Tmat[3] * p0 + Tmat[7] * p1 + Tmat[11] * p2 + Tmat[15] * p3;
         if (mid_base) {
-            double* Pbase = mid_base + (size_t)r * 4;
+            fp_t* Pbase = mid_base + (size_t)r * 4;
             Pbase[0] = p0;
             Pbase[1] = p1;
             Pbase[2] = p2;
@@ -717,16 +715,16 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
         }
 
         if (target_mid) {
-            double* Pmid = target_mid + (size_t)r * 4;
-            const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
-            const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
-            const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
-            const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
+            fp_t* Pmid = target_mid + (size_t)r * 4;
+            const fp_t par0 = fp_dot4(make_fp4(Thalf[0], Thalf[4], Thalf[8], Thalf[12]), make_fp4(p0, p1, p2, p3));
+            const fp_t par1 = fp_dot4(make_fp4(Thalf[1], Thalf[5], Thalf[9], Thalf[13]), make_fp4(p0, p1, p2, p3));
+            const fp_t par2 = fp_dot4(make_fp4(Thalf[2], Thalf[6], Thalf[10], Thalf[14]), make_fp4(p0, p1, p2, p3));
+            const fp_t par3 = fp_dot4(make_fp4(Thalf[3], Thalf[7], Thalf[11], Thalf[15]), make_fp4(p0, p1, p2, p3));
 
-            const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
-            const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
-            const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
-            const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
+            const fp_t tgt0 = fp_dot4(make_fp4(Thalf[0], Thalf[4], Thalf[8], Thalf[12]), Pup);
+            const fp_t tgt1 = fp_dot4(make_fp4(Thalf[1], Thalf[5], Thalf[9], Thalf[13]), Pup);
+            const fp_t tgt2 = fp_dot4(make_fp4(Thalf[2], Thalf[6], Thalf[10], Thalf[14]), Pup);
+            const fp_t tgt3 = fp_dot4(make_fp4(Thalf[3], Thalf[7], Thalf[11], Thalf[15]), Pup);
 
             Pmid[0] = par0 * tgt0;
             Pmid[1] = par1 * tgt1;
@@ -734,7 +732,7 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
             Pmid[3] = par3 * tgt3;
         }
 
-        double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
+        fp_t col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
         int scaling_exponent;
         frexp(col_scale_max_val, &scaling_exponent);
         if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
@@ -743,20 +741,20 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
             add_scaler_shift(D, mid_scaler, r, shift);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                scale_double_pow2(Pout[j], shift);
+                scale_clv_pow2(Pout[j], shift);
             }
             if (mid_base) {
-                double* Pbase = mid_base + (size_t)r * 4;
+                fp_t* Pbase = mid_base + (size_t)r * 4;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], shift);
                 }
             }
             if (target_mid) {
-                double* Pmid = target_mid + (size_t)r * 4;
+                fp_t* Pmid = target_mid + (size_t)r * 4;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], shift);
                 }
             }
         }
@@ -779,19 +777,19 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)RATE_CATS * 4;
 
-    const double* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
-    const double* sibling_up  = D.d_clv_up   + (size_t)sibling_id * per_node + site_off;
-    double*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
-    double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
-    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
-    const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
+    const fp_t* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
+    const fp_t* sibling_up  = D.d_clv_up   + (size_t)sibling_id * per_node + site_off;
+    fp_t*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
+    fp_t*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
+    fp_t*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    const fp_t* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
     if (!parent_down || !target_down || !sibling_up || !target_up) return;
 
-    const double* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
-    const double* target_mat_half = D.d_pmat_mid
+    const fp_t* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
+    const fp_t* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16)
         : target_mat;
-    const double* sibling_mat = D.d_pmat + (size_t)sibling_id * (size_t)RATE_CATS * 16;
+    const fp_t* sibling_mat = D.d_pmat + (size_t)sibling_id * (size_t)RATE_CATS * 16;
     unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
     unsigned int* sibling_scaler = up_scaler_ptr(D, sibling_id, site);
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
@@ -811,24 +809,23 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
 
-        const double* Tmat  = target_mat  + (size_t)r * 16;
-        const double* Thalf = target_mat_half + (size_t)r * 16;
-        const double* Smat  = sibling_mat + (size_t)r * 16;
-        const double4 Ppar = reinterpret_cast<const double4*>(parent_down)[r];
-        const double4 Psib = reinterpret_cast<const double4*>(sibling_up)[r];
-        const double4 Pup  = reinterpret_cast<const double4*>(target_up)[r];
-        double*       Pout = target_down + (size_t)r * 4;
+        const fp_t* Tmat  = target_mat  + (size_t)r * 16;
+        const fp_t* Thalf = target_mat_half + (size_t)r * 16;
+        const fp_t* Smat  = sibling_mat + (size_t)r * 16;
+        const fp4_t Ppar = reinterpret_cast<const fp4_t*>(parent_down)[r];
+        const fp4_t Psib = reinterpret_cast<const fp4_t*>(sibling_up)[r];
+        const fp4_t Pup  = reinterpret_cast<const fp4_t*>(target_up)[r];
+        fp_t*       Pout = target_down + (size_t)r * 4;
 
-        const double s0 = Psib.x, s1 = Psib.y, s2 = Psib.z, s3 = Psib.w;
-        const double sib0 = Smat[0]*s0 + Smat[1]*s1 + Smat[2]*s2 + Smat[3]*s3;
-        const double sib1 = Smat[4]*s0 + Smat[5]*s1 + Smat[6]*s2 + Smat[7]*s3;
-        const double sib2 = Smat[8]*s0 + Smat[9]*s1 + Smat[10]*s2 + Smat[11]*s3;
-        const double sib3 = Smat[12]*s0+ Smat[13]*s1+ Smat[14]*s2+ Smat[15]*s3;
+        const fp_t sib0 = fp_dot4(make_fp4(Smat[0], Smat[1], Smat[2], Smat[3]), Psib);
+        const fp_t sib1 = fp_dot4(make_fp4(Smat[4], Smat[5], Smat[6], Smat[7]), Psib);
+        const fp_t sib2 = fp_dot4(make_fp4(Smat[8], Smat[9], Smat[10], Smat[11]), Psib);
+        const fp_t sib3 = fp_dot4(make_fp4(Smat[12], Smat[13], Smat[14], Smat[15]), Psib);
 
-        const double p0 = Ppar.x * sib0;
-        const double p1 = Ppar.y * sib1;
-        const double p2 = Ppar.z * sib2;
-        const double p3 = Ppar.w * sib3;
+        const fp_t p0 = Ppar.x * sib0;
+        const fp_t p1 = Ppar.y * sib1;
+        const fp_t p2 = Ppar.z * sib2;
+        const fp_t p3 = Ppar.w * sib3;
 
         Pout[0] = Tmat[0] * p0 + Tmat[4] * p1 + Tmat[8]  * p2 + Tmat[12] * p3;
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
@@ -840,7 +837,7 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
         if (!(tmask & 8u)) Pout[3] = 0.0;
 
         if (mid_base) {
-            double* Pbase = mid_base + (size_t)r * 4;
+            fp_t* Pbase = mid_base + (size_t)r * 4;
             Pbase[0] = p0;
             Pbase[1] = p1;
             Pbase[2] = p2;
@@ -848,16 +845,16 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
         }
 
         if (target_mid) {
-            double* Pmid = target_mid + (size_t)r * 4;
-            const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
-            const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
-            const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
-            const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
+            fp_t* Pmid = target_mid + (size_t)r * 4;
+            const fp_t par0 = fp_dot4(make_fp4(Thalf[0], Thalf[4], Thalf[8], Thalf[12]), make_fp4(p0, p1, p2, p3));
+            const fp_t par1 = fp_dot4(make_fp4(Thalf[1], Thalf[5], Thalf[9], Thalf[13]), make_fp4(p0, p1, p2, p3));
+            const fp_t par2 = fp_dot4(make_fp4(Thalf[2], Thalf[6], Thalf[10], Thalf[14]), make_fp4(p0, p1, p2, p3));
+            const fp_t par3 = fp_dot4(make_fp4(Thalf[3], Thalf[7], Thalf[11], Thalf[15]), make_fp4(p0, p1, p2, p3));
 
-            const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
-            const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
-            const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
-            const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
+            const fp_t tgt0 = fp_dot4(make_fp4(Thalf[0], Thalf[4], Thalf[8], Thalf[12]), Pup);
+            const fp_t tgt1 = fp_dot4(make_fp4(Thalf[1], Thalf[5], Thalf[9], Thalf[13]), Pup);
+            const fp_t tgt2 = fp_dot4(make_fp4(Thalf[2], Thalf[6], Thalf[10], Thalf[14]), Pup);
+            const fp_t tgt3 = fp_dot4(make_fp4(Thalf[3], Thalf[7], Thalf[11], Thalf[15]), Pup);
 
             Pmid[0] = par0 * tgt0;
             Pmid[1] = par1 * tgt1;
@@ -869,7 +866,7 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
             if (!(tmask & 8u)) Pmid[3] = 0.0;
         }
 
-        double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
+        fp_t col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
         int scaling_exponent;
         frexp(col_scale_max_val, &scaling_exponent);
         if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
@@ -878,20 +875,20 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
             add_scaler_shift(D, mid_scaler, r, shift);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                scale_double_pow2(Pout[j], shift);
+                scale_clv_pow2(Pout[j], shift);
             }
             if (mid_base) {
-                double* Pbase = mid_base + (size_t)r * 4;
+                fp_t* Pbase = mid_base + (size_t)r * 4;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], shift);
                 }
             }
             if (target_mid) {
-                double* Pmid = target_mid + (size_t)r * 4;
+                fp_t* Pmid = target_mid + (size_t)r * 4;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], shift);
                 }
             }
         }
@@ -915,18 +912,18 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)RATE_CATS * 4;
 
-    const double* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
-    double*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
-    double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
-    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
-    const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
+    const fp_t* parent_down = D.d_clv_down + (size_t)op.parent_id * per_node + site_off;
+    fp_t*       target_down = D.d_clv_down + (size_t)target_id * per_node + site_off;
+    fp_t*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
+    fp_t*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    const fp_t* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
     if (!parent_down || !target_down || !target_up) return;
 
-    const double* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
-    const double* target_mat_half = D.d_pmat_mid
+    const fp_t* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
+    const fp_t* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16)
         : target_mat;
-    const double* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * (size_t)RATE_CATS * 16;
+    const fp_t* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * (size_t)RATE_CATS * 16;
     unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
     unsigned int* sibling_scaler = up_scaler_ptr(D, target_is_left ? op.right_id : op.left_id, site);
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
@@ -946,22 +943,22 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
 
         const unsigned int mask = D.d_tipmap[tipchars[site]];
-        const double* Tmat  = target_mat  + (size_t)r * 16;
-        const double* Thalf = target_mat_half + (size_t)r * 16;
-        const double* Smat  = sibling_mat + (size_t)r * 16;
-        const double4 Ppar = reinterpret_cast<const double4*>(parent_down)[r];
-        const double4 Pup  = reinterpret_cast<const double4*>(target_up)[r];
-        double*       Pout = target_down + (size_t)r * 4;
+        const fp_t* Tmat  = target_mat  + (size_t)r * 16;
+        const fp_t* Thalf = target_mat_half + (size_t)r * 16;
+        const fp_t* Smat  = sibling_mat + (size_t)r * 16;
+        const fp4_t Ppar = reinterpret_cast<const fp4_t*>(parent_down)[r];
+        const fp4_t Pup  = reinterpret_cast<const fp4_t*>(target_up)[r];
+        fp_t*       Pout = target_down + (size_t)r * 4;
 
-        const double sib0 = ((mask & 1u) ? Smat[0]  : 0.0) + ((mask & 2u) ? Smat[1]  : 0.0) + ((mask & 4u) ? Smat[2]  : 0.0) + ((mask & 8u) ? Smat[3]  : 0.0);
-        const double sib1 = ((mask & 1u) ? Smat[4]  : 0.0) + ((mask & 2u) ? Smat[5]  : 0.0) + ((mask & 4u) ? Smat[6]  : 0.0) + ((mask & 8u) ? Smat[7]  : 0.0);
-        const double sib2 = ((mask & 1u) ? Smat[8]  : 0.0) + ((mask & 2u) ? Smat[9]  : 0.0) + ((mask & 4u) ? Smat[10] : 0.0) + ((mask & 8u) ? Smat[11] : 0.0);
-        const double sib3 = ((mask & 1u) ? Smat[12] : 0.0) + ((mask & 2u) ? Smat[13] : 0.0) + ((mask & 4u) ? Smat[14] : 0.0) + ((mask & 8u) ? Smat[15] : 0.0);
+        const fp_t sib0 = ((mask & 1u) ? Smat[0]  : fp_t(0)) + ((mask & 2u) ? Smat[1]  : fp_t(0)) + ((mask & 4u) ? Smat[2]  : fp_t(0)) + ((mask & 8u) ? Smat[3]  : fp_t(0));
+        const fp_t sib1 = ((mask & 1u) ? Smat[4]  : fp_t(0)) + ((mask & 2u) ? Smat[5]  : fp_t(0)) + ((mask & 4u) ? Smat[6]  : fp_t(0)) + ((mask & 8u) ? Smat[7]  : fp_t(0));
+        const fp_t sib2 = ((mask & 1u) ? Smat[8]  : fp_t(0)) + ((mask & 2u) ? Smat[9]  : fp_t(0)) + ((mask & 4u) ? Smat[10] : fp_t(0)) + ((mask & 8u) ? Smat[11] : fp_t(0));
+        const fp_t sib3 = ((mask & 1u) ? Smat[12] : fp_t(0)) + ((mask & 2u) ? Smat[13] : fp_t(0)) + ((mask & 4u) ? Smat[14] : fp_t(0)) + ((mask & 8u) ? Smat[15] : fp_t(0));
 
-        const double p0 = Ppar.x * sib0;
-        const double p1 = Ppar.y * sib1;
-        const double p2 = Ppar.z * sib2;
-        const double p3 = Ppar.w * sib3;
+        const fp_t p0 = Ppar.x * sib0;
+        const fp_t p1 = Ppar.y * sib1;
+        const fp_t p2 = Ppar.z * sib2;
+        const fp_t p3 = Ppar.w * sib3;
 
         Pout[0] = Tmat[0] * p0 + Tmat[4] * p1 + Tmat[8]  * p2 + Tmat[12] * p3;
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
@@ -969,7 +966,7 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
         Pout[3] = Tmat[3] * p0 + Tmat[7] * p1 + Tmat[11] * p2 + Tmat[15] * p3;
 
         if (mid_base) {
-            double* Pbase = mid_base + (size_t)r * 4;
+            fp_t* Pbase = mid_base + (size_t)r * 4;
             Pbase[0] = p0;
             Pbase[1] = p1;
             Pbase[2] = p2;
@@ -977,16 +974,16 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
         }
 
         if (target_mid) {
-            double* Pmid = target_mid + (size_t)r * 4;
-            const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
-            const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
-            const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
-            const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
+            fp_t* Pmid = target_mid + (size_t)r * 4;
+            const fp_t par0 = fp_dot4(make_fp4(Thalf[0], Thalf[4], Thalf[8], Thalf[12]), make_fp4(p0, p1, p2, p3));
+            const fp_t par1 = fp_dot4(make_fp4(Thalf[1], Thalf[5], Thalf[9], Thalf[13]), make_fp4(p0, p1, p2, p3));
+            const fp_t par2 = fp_dot4(make_fp4(Thalf[2], Thalf[6], Thalf[10], Thalf[14]), make_fp4(p0, p1, p2, p3));
+            const fp_t par3 = fp_dot4(make_fp4(Thalf[3], Thalf[7], Thalf[11], Thalf[15]), make_fp4(p0, p1, p2, p3));
 
-            const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
-            const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
-            const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
-            const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
+            const fp_t tgt0 = fp_dot4(make_fp4(Thalf[0], Thalf[4], Thalf[8], Thalf[12]), Pup);
+            const fp_t tgt1 = fp_dot4(make_fp4(Thalf[1], Thalf[5], Thalf[9], Thalf[13]), Pup);
+            const fp_t tgt2 = fp_dot4(make_fp4(Thalf[2], Thalf[6], Thalf[10], Thalf[14]), Pup);
+            const fp_t tgt3 = fp_dot4(make_fp4(Thalf[3], Thalf[7], Thalf[11], Thalf[15]), Pup);
 
             Pmid[0] = par0 * tgt0;
             Pmid[1] = par1 * tgt1;
@@ -994,7 +991,7 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
             Pmid[3] = par3 * tgt3;
         }
 
-        double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
+        fp_t col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
         int scaling_exponent;
         frexp(col_scale_max_val, &scaling_exponent);
         if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
@@ -1003,20 +1000,20 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
             add_scaler_shift(D, mid_scaler, r, shift);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                scale_double_pow2(Pout[j], shift);
+                scale_clv_pow2(Pout[j], shift);
             }
             if (mid_base) {
-                double* Pbase = mid_base + (size_t)r * 4;
+                fp_t* Pbase = mid_base + (size_t)r * 4;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], shift);
                 }
             }
             if (target_mid) {
-                double* Pmid = target_mid + (size_t)r * 4;
+                fp_t* Pmid = target_mid + (size_t)r * 4;
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], shift);
                 }
             }
         }
@@ -1043,32 +1040,32 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
     // Ensure tip nodes have CLV-up initialized for downstream use.
     const size_t site_off = (size_t)site * span;
     if (op.left_id >= 0 && D.d_clv_up) {
-        double* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
+        fp_t* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
-            double* out = lclv + site_off + (size_t)r * 4;
-            out[0] = (lmask & 1u) ? 1.0 : 0.0;
-            out[1] = (lmask & 2u) ? 1.0 : 0.0;
-            out[2] = (lmask & 4u) ? 1.0 : 0.0;
-            out[3] = (lmask & 8u) ? 1.0 : 0.0;
+            fp_t* out = lclv + site_off + (size_t)r * 4;
+            out[0] = (lmask & 1u) ? fp_t(1) : fp_t(0);
+            out[1] = (lmask & 2u) ? fp_t(1) : fp_t(0);
+            out[2] = (lmask & 4u) ? fp_t(1) : fp_t(0);
+            out[3] = (lmask & 8u) ? fp_t(1) : fp_t(0);
         }
     }
     if (op.right_id >= 0 && D.d_clv_up) {
-        double* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
+        fp_t* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
-            double* out = rclv + site_off + (size_t)r * 4;
-            out[0] = (rmask & 1u) ? 1.0 : 0.0;
-            out[1] = (rmask & 2u) ? 1.0 : 0.0;
-            out[2] = (rmask & 4u) ? 1.0 : 0.0;
-            out[3] = (rmask & 8u) ? 1.0 : 0.0;
+            fp_t* out = rclv + site_off + (size_t)r * 4;
+            out[0] = (rmask & 1u) ? fp_t(1) : fp_t(0);
+            out[1] = (rmask & 2u) ? fp_t(1) : fp_t(0);
+            out[2] = (rmask & 4u) ? fp_t(1) : fp_t(0);
+            out[3] = (rmask & 8u) ? fp_t(1) : fp_t(0);
         }
     }
 
     const size_t parent_off = (size_t)op.parent_id * per_node + (size_t)site * span;
-    const double* Lbase = D.d_pmat + (size_t)op.left_id  * RATE_CATS * 4 * 4;
-    const double* Rbase = D.d_pmat + (size_t)op.right_id * RATE_CATS * 4 * 4;
-    double* parent_pool = clv_write_pool_base<double>(D, op);
+    const fp_t* Lbase = D.d_pmat + (size_t)op.left_id  * RATE_CATS * 4 * 4;
+    const fp_t* Rbase = D.d_pmat + (size_t)op.right_id * RATE_CATS * 4 * 4;
+    fp_t* parent_pool = clv_write_pool_base<fp_t>(D, op);
     if (!parent_pool) return; // placeholder until preorder input logic is defined
 
     unsigned int* site_scaler_ptr =
@@ -1077,15 +1074,15 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
         write_scaler_shift(D, site_scaler_ptr, r, 0u);
-        const double* Lmat = Lbase + (size_t)r * 16;
-        const double* Rmat = Rbase + (size_t)r * 16;
-        double* pout = parent_pool + parent_off + (size_t)r * 4;
+        const fp_t* Lmat = Lbase + (size_t)r * 16;
+        const fp_t* Rmat = Rbase + (size_t)r * 16;
+        fp_t* pout = parent_pool + parent_off + (size_t)r * 4;
 
-        double maxv = 0.0;
+        fp_t maxv = fp_t(0);
         // parent state j
         for (int j = 0; j < 4; ++j) {
-            double left_term = 0.0;
-            double right_term = 0.0;
+            fp_t left_term = fp_t(0);
+            fp_t right_term = fp_t(0);
             // sum over allowed tip states
             if (lmask & 1u) left_term  += Lmat[j * 4 + 0];
             if (lmask & 2u) left_term  += Lmat[j * 4 + 1];
@@ -1097,7 +1094,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
             if (rmask & 4u) right_term += Rmat[j * 4 + 2];
             if (rmask & 8u) right_term += Rmat[j * 4 + 3];
 
-            double v = left_term * right_term;
+            fp_t v = left_term * right_term;
             pout[j] = v;
             if (v > maxv) maxv = v;
         }
@@ -1111,7 +1108,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
 
                 #pragma unroll
                 for (int s = 0; s < 4; ++s) {
-                    scale_double_pow2(pout[s], shift);
+                    scale_clv_pow2(pout[s], shift);
                 }
             }
         }
@@ -1137,42 +1134,42 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
     const unsigned int jmask_base = D.d_tipmap[j];
     const unsigned int kmask_base = D.d_tipmap[k];
 
-    const double* __restrict__ jmat_base =
+    const fp_t* __restrict__ jmat_base =
         D.d_pmat + (size_t)op.left_id  * RATE_CATS * 4 * 4;
-    const double* __restrict__ kmat_base =
+    const fp_t* __restrict__ kmat_base =
         D.d_pmat + (size_t)op.right_id * RATE_CATS * 4 * 4;
 
     // Ensure tip nodes have CLV-up initialized for downstream use.
     const size_t site_off = (size_t)site * span;
     if (op.left_id >= 0 && D.d_clv_up) {
-        double* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
+        fp_t* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
-            double* out = lclv + site_off + (size_t)r * 4;
+            fp_t* out = lclv + site_off + (size_t)r * 4;
             unsigned int m = jmask_base;
-            out[0] = (m & 1u) ? 1.0 : 0.0;
-            out[1] = (m & 2u) ? 1.0 : 0.0;
-            out[2] = (m & 4u) ? 1.0 : 0.0;
-            out[3] = (m & 8u) ? 1.0 : 0.0;
+            out[0] = (m & 1u) ? fp_t(1) : fp_t(0);
+            out[1] = (m & 2u) ? fp_t(1) : fp_t(0);
+            out[2] = (m & 4u) ? fp_t(1) : fp_t(0);
+            out[3] = (m & 8u) ? fp_t(1) : fp_t(0);
         }
     }
     if (op.right_id >= 0 && D.d_clv_up) {
-        double* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
+        fp_t* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
-            double* out = rclv + site_off + (size_t)r * 4;
+            fp_t* out = rclv + site_off + (size_t)r * 4;
             unsigned int m = kmask_base;
-            out[0] = (m & 1u) ? 1.0 : 0.0;
-            out[1] = (m & 2u) ? 1.0 : 0.0;
-            out[2] = (m & 4u) ? 1.0 : 0.0;
-            out[3] = (m & 8u) ? 1.0 : 0.0;
+            out[0] = (m & 1u) ? fp_t(1) : fp_t(0);
+            out[1] = (m & 2u) ? fp_t(1) : fp_t(0);
+            out[2] = (m & 4u) ? fp_t(1) : fp_t(0);
+            out[3] = (m & 8u) ? fp_t(1) : fp_t(0);
         }
     }
 
     const size_t parent_off = (size_t)op.parent_id * per_node + (size_t)site * span;
-    double* parent_pool = clv_write_pool_base<double>(D, op);
+    fp_t* parent_pool = clv_write_pool_base<fp_t>(D, op);
     if (!parent_pool) return; // placeholder until preorder input logic is defined
-    double* __restrict__ dst = parent_pool + parent_off;
+    fp_t* __restrict__ dst = parent_pool + parent_off;
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, RATE_CATS);
@@ -1180,18 +1177,18 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
         write_scaler_shift(D, site_scaler_ptr, r, 0u);
-        const double* __restrict__ jmat = jmat_base + (size_t)r * 4 * 4;
-        const double* __restrict__ kmat = kmat_base + (size_t)r * 4 * 4;
-        double* __restrict__ Pout = dst + (size_t)r * 4;
+        const fp_t* __restrict__ jmat = jmat_base + (size_t)r * 4 * 4;
+        const fp_t* __restrict__ kmat = kmat_base + (size_t)r * 4 * 4;
+        fp_t* __restrict__ Pout = dst + (size_t)r * 4;
 
-        double col_scale_max_val = 0.0;
+        fp_t col_scale_max_val = fp_t(0);
 
-        const double* Lrow = jmat;
-        const double* Rrow = kmat;
+        const fp_t* Lrow = jmat;
+        const fp_t* Rrow = kmat;
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            double termj = 0.0;
-            double termk = 0.0;
+            fp_t termj = fp_t(0);
+            fp_t termk = fp_t(0);
             unsigned int jmask = jmask_base;
             unsigned int kmask = kmask_base;
 
@@ -1211,9 +1208,8 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
         }
 
         if (site_scaler_ptr) {
-            double* pout = Pout;
-            double maxv = fmax(fmax(pout[0], pout[1]),
-                               fmax(pout[2], pout[3]));
+            fp_t* pout = Pout;
+            fp_t maxv = fp_hmax4(pout[0], pout[1], pout[2], pout[3]);
             int expv;
             frexp(maxv, &expv);
             if (expv < SCALE_THRESHOLD_EXPONENT) {
@@ -1222,7 +1218,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
 
                 #pragma unroll
                 for (int s = 0; s < 4; ++s)
-                    scale_double_pow2(pout[s], shift);
+                    scale_clv_pow2(pout[s], shift);
             }
         }
     }
@@ -1245,57 +1241,57 @@ __device__ __forceinline__ void compute_tip_tip_site_4_generic(
     const unsigned int jmask_base = D.d_tipmap[j];
     const unsigned int kmask_base = D.d_tipmap[k];
 
-    const double* __restrict__ jmat_base =
+    const fp_t* __restrict__ jmat_base =
         D.d_pmat + (size_t)op.left_id  * D.rate_cats * 4 * 4;
-    const double* __restrict__ kmat_base =
+    const fp_t* __restrict__ kmat_base =
         D.d_pmat + (size_t)op.right_id * D.rate_cats * 4 * 4;
 
     // Ensure tip nodes have CLV-up initialized for downstream use.
     const size_t site_off = (size_t)site * span;
     if (op.left_id >= 0 && D.d_clv_up) {
-        double* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
+        fp_t* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
         for (int r = 0; r < D.rate_cats; ++r) {
-            double* out = lclv + site_off + (size_t)r * 4;
+            fp_t* out = lclv + site_off + (size_t)r * 4;
             unsigned int m = jmask_base;
-            out[0] = (m & 1u) ? 1.0 : 0.0;
-            out[1] = (m & 2u) ? 1.0 : 0.0;
-            out[2] = (m & 4u) ? 1.0 : 0.0;
-            out[3] = (m & 8u) ? 1.0 : 0.0;
+            out[0] = (m & 1u) ? fp_t(1) : fp_t(0);
+            out[1] = (m & 2u) ? fp_t(1) : fp_t(0);
+            out[2] = (m & 4u) ? fp_t(1) : fp_t(0);
+            out[3] = (m & 8u) ? fp_t(1) : fp_t(0);
         }
     }
     if (op.right_id >= 0 && D.d_clv_up) {
-        double* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
+        fp_t* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
         for (int r = 0; r < D.rate_cats; ++r) {
-            double* out = rclv + site_off + (size_t)r * 4;
+            fp_t* out = rclv + site_off + (size_t)r * 4;
             unsigned int m = kmask_base;
-            out[0] = (m & 1u) ? 1.0 : 0.0;
-            out[1] = (m & 2u) ? 1.0 : 0.0;
-            out[2] = (m & 4u) ? 1.0 : 0.0;
-            out[3] = (m & 8u) ? 1.0 : 0.0;
+            out[0] = (m & 1u) ? fp_t(1) : fp_t(0);
+            out[1] = (m & 2u) ? fp_t(1) : fp_t(0);
+            out[2] = (m & 4u) ? fp_t(1) : fp_t(0);
+            out[3] = (m & 8u) ? fp_t(1) : fp_t(0);
         }
     }
 
     const size_t parent_off = (size_t)op.parent_id * per_node + (size_t)site * span;
-    double* parent_pool = clv_write_pool_base<double>(D, op);
+    fp_t* parent_pool = clv_write_pool_base<fp_t>(D, op);
     if (!parent_pool) return; // placeholder until preorder input logic is defined
-    double* __restrict__ dst = parent_pool + parent_off;
+    fp_t* __restrict__ dst = parent_pool + parent_off;
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, (unsigned int)D.rate_cats);
 
     for (int r = 0; r < D.rate_cats; ++r) {
         write_scaler_shift(D, site_scaler_ptr, r, 0u);
-        const double* __restrict__ jmat = jmat_base + (size_t)r * 4 * 4;
-        const double* __restrict__ kmat = kmat_base + (size_t)r * 4 * 4;
-        double* __restrict__ Pout = dst + (size_t)r * 4;
+        const fp_t* __restrict__ jmat = jmat_base + (size_t)r * 4 * 4;
+        const fp_t* __restrict__ kmat = kmat_base + (size_t)r * 4 * 4;
+        fp_t* __restrict__ Pout = dst + (size_t)r * 4;
 
-        double col_scale_max_val = 0.0;
+        fp_t col_scale_max_val = fp_t(0);
 
-        const double* Lrow = jmat;
-        const double* Rrow = kmat;
+        const fp_t* Lrow = jmat;
+        const fp_t* Rrow = kmat;
         for (int i = 0; i < 4; ++i) {
-            double termj = 0.0;
-            double termk = 0.0;
+            fp_t termj = fp_t(0);
+            fp_t termk = fp_t(0);
             unsigned int jmask = jmask_base;
             unsigned int kmask = kmask_base;
 
@@ -1314,15 +1310,14 @@ __device__ __forceinline__ void compute_tip_tip_site_4_generic(
         }
 
         if (site_scaler_ptr) {
-            double maxv = fmax(fmax(Pout[0], Pout[1]),
-                               fmax(Pout[2], Pout[3]));
+            fp_t maxv = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
             int expv;
             frexp(maxv, &expv);
             if (expv < SCALE_THRESHOLD_EXPONENT) {
                 unsigned int shift = SCALE_THRESHOLD_EXPONENT - expv;
                 site_scaler_ptr[r] += shift;
                 for (int s = 0; s < 4; ++s) {
-                    scale_double_pow2(Pout[s], shift);
+                    scale_clv_pow2(Pout[s], shift);
                 }
             }
         }
@@ -1348,49 +1343,49 @@ __device__ __forceinline__ void compute_tip_tip_site_generic(
     // Ensure tip nodes have CLV-up initialized for downstream use.
     const size_t site_off = (size_t)site * span;
     if (op.left_id >= 0 && D.d_clv_up) {
-        double* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
+        fp_t* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
         for (unsigned int r = 0; r < rate_cats; ++r) {
-            double* out = lclv + site_off + (size_t)r * states;
+            fp_t* out = lclv + site_off + (size_t)r * states;
             for (unsigned int s = 0; s < states; ++s) {
-                out[s] = (lmask & (1u << s)) ? 1.0 : 0.0;
+                out[s] = (lmask & (1u << s)) ? fp_t(1) : fp_t(0);
             }
         }
     }
     if (op.right_id >= 0 && D.d_clv_up) {
-        double* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
+        fp_t* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
         for (unsigned int r = 0; r < rate_cats; ++r) {
-            double* out = rclv + site_off + (size_t)r * states;
+            fp_t* out = rclv + site_off + (size_t)r * states;
             for (unsigned int s = 0; s < states; ++s) {
-                out[s] = (rmask & (1u << s)) ? 1.0 : 0.0;
+                out[s] = (rmask & (1u << s)) ? fp_t(1) : fp_t(0);
             }
         }
     }
 
-    const double* Lbase = D.d_pmat + (size_t)op.left_id  * rate_cats * states * states;
-    const double* Rbase = D.d_pmat + (size_t)op.right_id * rate_cats * states * states;
+    const fp_t* Lbase = D.d_pmat + (size_t)op.left_id  * rate_cats * states * states;
+    const fp_t* Rbase = D.d_pmat + (size_t)op.right_id * rate_cats * states * states;
 
     const size_t dst_off = (size_t)op.parent_id * per_node + (size_t)site * span;
-    double* parent_pool = clv_write_pool_base<double>(D, op);
+    fp_t* parent_pool = clv_write_pool_base<fp_t>(D, op);
     if (!parent_pool) return; // placeholder until preorder input logic is defined
-    double* Pout = parent_pool + dst_off;
+    fp_t* Pout = parent_pool + dst_off;
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, rate_cats);
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
-        const double* Lmat = Lbase + (size_t)r * states * states;
-        const double* Rmat = Rbase + (size_t)r * states * states;
-        double* out_r = Pout + (size_t)r * states;
+        const fp_t* Lmat = Lbase + (size_t)r * states * states;
+        const fp_t* Rmat = Rbase + (size_t)r * states * states;
+        fp_t* out_r = Pout + (size_t)r * states;
 
-        double maxv = 0.0;
+        fp_t maxv = fp_t(0);
         for (unsigned int j = 0; j < states; ++j) {
-            double left_term = 0.0;
-            double right_term = 0.0;
+            fp_t left_term = fp_t(0);
+            fp_t right_term = fp_t(0);
             for (unsigned int k = 0; k < states; ++k) {
                 if (lmask & (1u << k)) left_term  += Lmat[j * states + k];
                 if (rmask & (1u << k)) right_term += Rmat[j * states + k];
             }
-            double v = left_term * right_term;
+            fp_t v = left_term * right_term;
             out_r[j] = v;
             if (v > maxv) maxv = v;
         }
@@ -1402,7 +1397,7 @@ __device__ __forceinline__ void compute_tip_tip_site_generic(
                 unsigned int shift = SCALE_THRESHOLD_EXPONENT - expv;
                 site_scaler_ptr[r] += shift;
                 for (unsigned int s = 0; s < states; ++s) {
-                    scale_double_pow2(out_r[s], shift);
+                    scale_clv_pow2(out_r[s], shift);
                 }
             }
         }
@@ -1424,26 +1419,26 @@ __device__ __forceinline__ void compute_tip_inner_site_ratecat(
     const int  tip_node_id = tip_on_left ? op.left_id  : op.right_id;
 
     const unsigned char* d_left_tip = D.d_tipchars + (size_t)tip_index * D.sites;
-    const double* d_right_clv = clv_read_ptr_for_node<const double>(D, op, inner_id);
-    double* parent_clv = clv_write_ptr_for_node<double>(D, op, op.parent_id);
+    const fp_t* d_right_clv = clv_read_ptr_for_node<const fp_t>(D, op, inner_id);
+    fp_t* parent_clv = clv_write_ptr_for_node<fp_t>(D, op, op.parent_id);
     if (!d_right_clv || !parent_clv) return; // placeholder until preorder input logic is defined
 
-    const double* d_Lmat = D.d_pmat + (size_t)tip_node_id * RATE_CATS * 4 * 4;
-    const double* d_Rmat = D.d_pmat + (size_t)inner_id * RATE_CATS * 4 * 4;
+    const fp_t* d_Lmat = D.d_pmat + (size_t)tip_node_id * RATE_CATS * 4 * 4;
+    const fp_t* d_Rmat = D.d_pmat + (size_t)inner_id * RATE_CATS * 4 * 4;
 
     const size_t site_off = (size_t)site * span;
     const unsigned int tmask = D.d_tipmap[d_left_tip[site]];
 
     // Write tip CLV into UP pool for downstream use.
     if (D.d_clv_up && tip_node_id >= 0) {
-        double* tip_up = D.d_clv_up + (size_t)tip_node_id * per_node;
+        fp_t* tip_up = D.d_clv_up + (size_t)tip_node_id * per_node;
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
-            double* out = tip_up + site_off + (size_t)r * 4;
-            out[0] = (tmask & 1u) ? 1.0 : 0.0;
-            out[1] = (tmask & 2u) ? 1.0 : 0.0;
-            out[2] = (tmask & 4u) ? 1.0 : 0.0;
-            out[3] = (tmask & 8u) ? 1.0 : 0.0;
+            fp_t* out = tip_up + site_off + (size_t)r * 4;
+            out[0] = (tmask & 1u) ? fp_t(1) : fp_t(0);
+            out[1] = (tmask & 2u) ? fp_t(1) : fp_t(0);
+            out[2] = (tmask & 4u) ? fp_t(1) : fp_t(0);
+            out[3] = (tmask & 8u) ? fp_t(1) : fp_t(0);
         }
     }
 
@@ -1454,28 +1449,28 @@ __device__ __forceinline__ void compute_tip_inner_site_ratecat(
 
     for (int r = 0; r < RATE_CATS; ++r) {
         write_scaler_shift(D, site_scaler_ptr, r, read_scaler_shift(D, inner_scaler, r));
-        const double* Lmat = d_Lmat + (size_t)r * 4 * 4;
-        const double* Rmat = d_Rmat + (size_t)r * 4 * 4;
-        const double* Rclv = d_right_clv + site_off + (size_t)r * 4;
-        double* Pout = parent_clv + site_off + (size_t)r * 4;
-        double col_scale_max_val = 0.0;
+        const fp_t* Lmat = d_Lmat + (size_t)r * 4 * 4;
+        const fp_t* Rmat = d_Rmat + (size_t)r * 4 * 4;
+        const fp_t* Rclv = d_right_clv + site_off + (size_t)r * 4;
+        fp_t* Pout = parent_clv + site_off + (size_t)r * 4;
+        fp_t col_scale_max_val = fp_t(0);
 
-        const double r0 = Rclv[0];
-        const double r1 = Rclv[1];
-        const double r2 = Rclv[2];
-        const double r3 = Rclv[3];
+        const fp_t r0 = Rclv[0];
+        const fp_t r1 = Rclv[1];
+        const fp_t r2 = Rclv[2];
+        const fp_t r3 = Rclv[3];
 
-        const double* Lrow = Lmat;
-        const double* Rrow = Rmat;
+        const fp_t* Lrow = Lmat;
+        const fp_t* Rrow = Rmat;
         for (int i = 0; i < 4; ++i) {
-            double lefterm = 0.0;
+            fp_t lefterm = fp_t(0);
             unsigned int lstate = tmask;
             if (lstate & 1u) lefterm += Lrow[0];
             if (lstate & 2u) lefterm += Lrow[1];
             if (lstate & 4u) lefterm += Lrow[2];
             if (lstate & 8u) lefterm += Lrow[3];
 
-            double righterm = Rrow[0] * r0 + Rrow[1] * r1 + Rrow[2] * r2 + Rrow[3] * r3;
+            fp_t righterm = fp_dot4(make_fp4(Rrow[0], Rrow[1], Rrow[2], Rrow[3]), make_fp4(r0, r1, r2, r3));
             Pout[i] = lefterm * righterm;
             if (Pout[i] > col_scale_max_val) col_scale_max_val = Pout[i];
             Lrow += 4;
@@ -1489,7 +1484,7 @@ __device__ __forceinline__ void compute_tip_inner_site_ratecat(
                 add_scaler_shift(D, site_scaler_ptr, r, SCALE_THRESHOLD_EXPONENT - scaling_exponent);
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    scale_double_pow2(Pout[i], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                    scale_clv_pow2(Pout[i], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
                 }
             }
         }
@@ -1512,23 +1507,23 @@ __device__ __forceinline__ void compute_tip_inner_site_generic(
     const int  tip_node_id = tip_on_left ? op.left_id  : op.right_id;
 
     const unsigned char* d_left_tip = D.d_tipchars + (size_t)tip_index * D.sites;
-    const double* d_right_clv = clv_read_ptr_for_node<const double>(D, op, inner_id);
-    double* parent_clv = clv_write_ptr_for_node<double>(D, op, op.parent_id);
+    const fp_t* d_right_clv = clv_read_ptr_for_node<const fp_t>(D, op, inner_id);
+    fp_t* parent_clv = clv_write_ptr_for_node<fp_t>(D, op, op.parent_id);
     if (!d_right_clv || !parent_clv) return; // placeholder until preorder input logic is defined
 
-    const double* d_Lmat = D.d_pmat + (size_t)tip_node_id * D.rate_cats * states * states;
-    const double* d_Rmat = D.d_pmat + (size_t)inner_id * D.rate_cats * states * states;
+    const fp_t* d_Lmat = D.d_pmat + (size_t)tip_node_id * D.rate_cats * states * states;
+    const fp_t* d_Rmat = D.d_pmat + (size_t)inner_id * D.rate_cats * states * states;
 
     const size_t site_off = (size_t)site * span;
     const unsigned int tmask = D.d_tipmap[d_left_tip[site]];
 
     // Write tip CLV into UP pool for downstream use.
     if (D.d_clv_up && tip_node_id >= 0) {
-        double* tip_up = D.d_clv_up + (size_t)tip_node_id * per_node;
+        fp_t* tip_up = D.d_clv_up + (size_t)tip_node_id * per_node;
         for (unsigned int r = 0; r < rate_cats; ++r) {
-            double* out = tip_up + site_off + (size_t)r * states;
+            fp_t* out = tip_up + site_off + (size_t)r * states;
             for (unsigned int s = 0; s < states; ++s) {
-                out[s] = (tmask & (1u << s)) ? 1.0 : 0.0;
+                out[s] = (tmask & (1u << s)) ? fp_t(1) : fp_t(0);
             }
         }
     }
@@ -1540,17 +1535,17 @@ __device__ __forceinline__ void compute_tip_inner_site_generic(
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
         write_scaler_shift(D, site_scaler_ptr, r, read_scaler_shift(D, inner_scaler, r));
-        double col_scale_max_val = 0.0;
+        fp_t col_scale_max_val = fp_t(0);
         int scaling_exponent;
-        const double* Lmat = d_Lmat + (size_t)r * states * states;
-        const double* Rmat = d_Rmat + (size_t)r * states * states;
-        const double* Rclv = d_right_clv + site_off + (size_t)r * states;
-        double* Pout = parent_clv + site_off + (size_t)r * states;
+        const fp_t* Lmat = d_Lmat + (size_t)r * states * states;
+        const fp_t* Rmat = d_Rmat + (size_t)r * states * states;
+        const fp_t* Rclv = d_right_clv + site_off + (size_t)r * states;
+        fp_t* Pout = parent_clv + site_off + (size_t)r * states;
 
-        const double* Lrow = Lmat;
-        const double* Rrow = Rmat;
+        const fp_t* Lrow = Lmat;
+        const fp_t* Rrow = Rmat;
         for (unsigned int i = 0; i < states; ++i) {
-            double lefterm = 0.0, righterm = 0.0;
+            fp_t lefterm = fp_t(0), righterm = fp_t(0);
             unsigned int lstate = tmask;
             for (unsigned int j = 0; j < states; ++j) {
                 if (lstate & 1u) lefterm += Lrow[j];
@@ -1567,7 +1562,7 @@ __device__ __forceinline__ void compute_tip_inner_site_generic(
             if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
                 site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
                 for (unsigned int i = 0; i < states; ++i) {
-                    scale_double_pow2(Pout[i], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                    scale_clv_pow2(Pout[i], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
                 }
             }
         }
@@ -1584,13 +1579,13 @@ __device__ __forceinline__ void compute_inner_inner_site_ratecat(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * span;
 
-    const double* d_left_clv  = clv_read_ptr_for_node<const double>(D, op, op.left_id);
-    const double* d_right_clv = clv_read_ptr_for_node<const double>(D, op, op.right_id);
+    const fp_t* d_left_clv  = clv_read_ptr_for_node<const fp_t>(D, op, op.left_id);
+    const fp_t* d_right_clv = clv_read_ptr_for_node<const fp_t>(D, op, op.right_id);
 
-    double* parent_clv = clv_write_ptr_for_node<double>(D, op, op.parent_id);
+    fp_t* parent_clv = clv_write_ptr_for_node<fp_t>(D, op, op.parent_id);
     if (!d_left_clv || !d_right_clv || !parent_clv) return; // placeholder until preorder input logic is defined
-    const double* d_left_mat  = D.d_pmat + (size_t)op.left_id  * RATE_CATS * 4 * 4;
-    const double* d_right_mat = D.d_pmat + (size_t)op.right_id * RATE_CATS * 4 * 4;
+    const fp_t* d_left_mat  = D.d_pmat + (size_t)op.left_id  * RATE_CATS * 4 * 4;
+    const fp_t* d_right_mat = D.d_pmat + (size_t)op.right_id * RATE_CATS * 4 * 4;
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, RATE_CATS);
@@ -1606,42 +1601,42 @@ __device__ __forceinline__ void compute_inner_inner_site_ratecat(
             r,
             read_scaler_shift(D, left_scaler, r) +
             read_scaler_shift(D, right_scaler, r));
-        const double* Lclv = d_left_clv  + site_off + (size_t)r * 4;
-        const double* Rclv = d_right_clv + site_off + (size_t)r * 4;
+        const fp_t* Lclv = d_left_clv  + site_off + (size_t)r * 4;
+        const fp_t* Rclv = d_right_clv + site_off + (size_t)r * 4;
 
         
 
-        const double* Lmat = d_left_mat  + (size_t)r * 4 * 4;
-        const double* Rmat = d_right_mat + (size_t)r * 4 * 4;
+        const fp_t* Lmat = d_left_mat  + (size_t)r * 4 * 4;
+        const fp_t* Rmat = d_right_mat + (size_t)r * 4 * 4;
 
-        double* Pout = parent_clv + site_off + (size_t)r * 4;
-        double col_scale_max_val = 0.0;
+        fp_t* Pout = parent_clv + site_off + (size_t)r * 4;
+        fp_t col_scale_max_val = fp_t(0);
 
-        const double l0 = Lclv[0];
-        const double l1 = Lclv[1];
-        const double l2 = Lclv[2];
-        const double l3 = Lclv[3];
-        const double r0 = Rclv[0];
-        const double r1 = Rclv[1];
-        const double r2 = Rclv[2];
-        const double r3 = Rclv[3];
+        const fp_t l0 = Lclv[0];
+        const fp_t l1 = Lclv[1];
+        const fp_t l2 = Lclv[2];
+        const fp_t l3 = Lclv[3];
+        const fp_t r0 = Rclv[0];
+        const fp_t r1 = Rclv[1];
+        const fp_t r2 = Rclv[2];
+        const fp_t r3 = Rclv[3];
 
-        const double lt0 = Lmat[0]*l0 + Lmat[1]*l1 + Lmat[2]*l2 + Lmat[3]*l3;
-        const double lt1 = Lmat[4]*l0 + Lmat[5]*l1 + Lmat[6]*l2 + Lmat[7]*l3;
-        const double lt2 = Lmat[8]*l0 + Lmat[9]*l1 + Lmat[10]*l2 + Lmat[11]*l3;
-        const double lt3 = Lmat[12]*l0 + Lmat[13]*l1 + Lmat[14]*l2 + Lmat[15]*l3;
+        const fp_t lt0 = fp_dot4(make_fp4(Lmat[0], Lmat[1], Lmat[2], Lmat[3]), make_fp4(l0, l1, l2, l3));
+        const fp_t lt1 = fp_dot4(make_fp4(Lmat[4], Lmat[5], Lmat[6], Lmat[7]), make_fp4(l0, l1, l2, l3));
+        const fp_t lt2 = fp_dot4(make_fp4(Lmat[8], Lmat[9], Lmat[10], Lmat[11]), make_fp4(l0, l1, l2, l3));
+        const fp_t lt3 = fp_dot4(make_fp4(Lmat[12], Lmat[13], Lmat[14], Lmat[15]), make_fp4(l0, l1, l2, l3));
 
-        const double rt0 = Rmat[0]*r0 + Rmat[1]*r1 + Rmat[2]*r2 + Rmat[3]*r3;
-        const double rt1 = Rmat[4]*r0 + Rmat[5]*r1 + Rmat[6]*r2 + Rmat[7]*r3;
-        const double rt2 = Rmat[8]*r0 + Rmat[9]*r1 + Rmat[10]*r2 + Rmat[11]*r3;
-        const double rt3 = Rmat[12]*r0 + Rmat[13]*r1 + Rmat[14]*r2 + Rmat[15]*r3;
+        const fp_t rt0 = fp_dot4(make_fp4(Rmat[0], Rmat[1], Rmat[2], Rmat[3]), make_fp4(r0, r1, r2, r3));
+        const fp_t rt1 = fp_dot4(make_fp4(Rmat[4], Rmat[5], Rmat[6], Rmat[7]), make_fp4(r0, r1, r2, r3));
+        const fp_t rt2 = fp_dot4(make_fp4(Rmat[8], Rmat[9], Rmat[10], Rmat[11]), make_fp4(r0, r1, r2, r3));
+        const fp_t rt3 = fp_dot4(make_fp4(Rmat[12], Rmat[13], Rmat[14], Rmat[15]), make_fp4(r0, r1, r2, r3));
 
         Pout[0] = lt0 * rt0;
         Pout[1] = lt1 * rt1;
         Pout[2] = lt2 * rt2;
         Pout[3] = lt3 * rt3;
 
-        col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
+        col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
 
         if (site_scaler_ptr) {
             int scaling_exponent;
@@ -1650,7 +1645,7 @@ __device__ __forceinline__ void compute_inner_inner_site_ratecat(
                 add_scaler_shift(D, site_scaler_ptr, r, SCALE_THRESHOLD_EXPONENT - scaling_exponent);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                    scale_clv_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
                 }
             }
         }
@@ -1679,22 +1674,22 @@ __device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)RATE_CATS * 4;
 
-    double*       target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
-    const double* parent_down = D.d_clv_down
+    fp_t*         target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
+    const fp_t*   parent_down = D.d_clv_down
         ? D.d_clv_down + (size_t)op.parent_id * per_node + site_off
         : nullptr;
-    const double* sibling_up  = D.d_clv_up
+    const fp_t*   sibling_up  = D.d_clv_up
         ? D.d_clv_up + (size_t)sibling_id * per_node + site_off
         : nullptr;
-    const double* mid_base    = D.d_clv_mid_base
+    const fp_t*   mid_base    = D.d_clv_mid_base
         ? D.d_clv_mid_base + (size_t)target_id * per_node + site_off
         : nullptr;
     // proximal_mode uses query CLV as the "upper" side; pendant uses target_up.
-    const double* target_up  = proximal_mode
+    const fp_t* target_up  = proximal_mode
         ? (D.d_query_clv ? (D.d_query_clv + site_off) : nullptr)
         : (D.d_clv_up    ? (D.d_clv_up   + (size_t)target_id * per_node + site_off) : nullptr);
     if (!target_up || !parent_down || !sibling_up) return;
-    const double* target_mat = nullptr;
+    const fp_t* target_mat = nullptr;
     if (proximal_mode && D.d_query_pmat) {
         target_mat = D.d_query_pmat + (size_t)op_idx * (size_t)RATE_CATS * 16;
     } else if (D.d_pmat_mid_prox) {
@@ -1705,7 +1700,7 @@ __device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
         // Fall back to half-branch pmats at minimum; avoid full-length pmats here.
         target_mat = D.d_pmat_mid ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16) : nullptr;
     }
-    const double* parent_mat = nullptr;
+    const fp_t* parent_mat = nullptr;
     if (D.d_pmat_mid_dist) {
         parent_mat = D.d_pmat_mid_dist + (size_t)target_id * (size_t)RATE_CATS * 16;
     } else if (D.d_pmat_mid) {
@@ -1726,44 +1721,44 @@ __device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
         }
         write_scaler_shift(D, mid_scaler, r, inherited_shift);
 
-        const double* Mtarget = target_mat + (size_t)r * 16;
-        const double* Mparent = parent_mat + (size_t)r * 16;
-        const double4 Pup   = reinterpret_cast<const double4*>(target_up   + (size_t)r * 4)[0];
-        double*       Pmid  = target_mid + (size_t)r * 4;
-        const double* Pbase = mid_base ? (mid_base + (size_t)r * 4) : nullptr;
+        const fp_t* Mtarget = target_mat + (size_t)r * 16;
+        const fp_t* Mparent = parent_mat + (size_t)r * 16;
+        const fp4_t Pup   = reinterpret_cast<const fp4_t*>(target_up   + (size_t)r * 4)[0];
+        fp_t*       Pmid  = target_mid + (size_t)r * 4;
+        const fp_t* Pbase = mid_base ? (mid_base + (size_t)r * 4) : nullptr;
 
-        const double src0 = Pbase[0];
-        const double src1 = Pbase[1];
-        const double src2 = Pbase[2];
-        const double src3 = Pbase[3];
+        const fp_t src0 = Pbase[0];
+        const fp_t src1 = Pbase[1];
+        const fp_t src2 = Pbase[2];
+        const fp_t src3 = Pbase[3];
 
         // propagate parent_down half-branch
-        const double par0 = Mparent[0]*src0 + Mparent[1]*src1 + Mparent[2]*src2 + Mparent[3]*src3;
-        const double par1 = Mparent[4]*src0 + Mparent[5]*src1 + Mparent[6]*src2 + Mparent[7]*src3;
-        const double par2 = Mparent[8]*src0 + Mparent[9]*src1 + Mparent[10]*src2+ Mparent[11]*src3;
-        const double par3 = Mparent[12]*src0+ Mparent[13]*src1+ Mparent[14]*src2+ Mparent[15]*src3;
+        const fp_t par0 = fp_dot4(make_fp4(Mparent[0], Mparent[1], Mparent[2], Mparent[3]), make_fp4(src0, src1, src2, src3));
+        const fp_t par1 = fp_dot4(make_fp4(Mparent[4], Mparent[5], Mparent[6], Mparent[7]), make_fp4(src0, src1, src2, src3));
+        const fp_t par2 = fp_dot4(make_fp4(Mparent[8], Mparent[9], Mparent[10], Mparent[11]), make_fp4(src0, src1, src2, src3));
+        const fp_t par3 = fp_dot4(make_fp4(Mparent[12], Mparent[13], Mparent[14], Mparent[15]), make_fp4(src0, src1, src2, src3));
 
         // propagate target up branch
-        const double tgt0 = Mtarget[0]*Pup.x + Mtarget[1]*Pup.y + Mtarget[2]*Pup.z + Mtarget[3]*Pup.w;
-        const double tgt1 = Mtarget[4]*Pup.x + Mtarget[5]*Pup.y + Mtarget[6]*Pup.z + Mtarget[7]*Pup.w;
-        const double tgt2 = Mtarget[8]*Pup.x + Mtarget[9]*Pup.y + Mtarget[10]*Pup.z+ Mtarget[11]*Pup.w;
-        const double tgt3 = Mtarget[12]*Pup.x+ Mtarget[13]*Pup.y+ Mtarget[14]*Pup.z+ Mtarget[15]*Pup.w;
+        const fp_t tgt0 = fp_dot4(make_fp4(Mtarget[0], Mtarget[1], Mtarget[2], Mtarget[3]), Pup);
+        const fp_t tgt1 = fp_dot4(make_fp4(Mtarget[4], Mtarget[5], Mtarget[6], Mtarget[7]), Pup);
+        const fp_t tgt2 = fp_dot4(make_fp4(Mtarget[8], Mtarget[9], Mtarget[10], Mtarget[11]), Pup);
+        const fp_t tgt3 = fp_dot4(make_fp4(Mtarget[12], Mtarget[13], Mtarget[14], Mtarget[15]), Pup);
 
         Pmid[0] = par0 * tgt0;
         Pmid[1] = par1 * tgt1;
         Pmid[2] = par2 * tgt2;
         Pmid[3] = par3 * tgt3;
         
-        double col_scale_max_val = fmax(fmax(Pmid[0], Pmid[1]), fmax(Pmid[2], Pmid[3]));
+        fp_t col_scale_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
         int scaling_exponent;
         frexp(col_scale_max_val, &scaling_exponent);
         if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
             unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
             add_scaler_shift(D, mid_scaler, r, shift);
-            Pmid[0] = ldexp(Pmid[0], shift);
-            Pmid[1] = ldexp(Pmid[1], shift);
-            Pmid[2] = ldexp(Pmid[2], shift);
-            Pmid[3] = ldexp(Pmid[3], shift);
+            Pmid[0] = fp_ldexp(Pmid[0], shift);
+            Pmid[1] = fp_ldexp(Pmid[1], shift);
+            Pmid[2] = fp_ldexp(Pmid[2], shift);
+            Pmid[3] = fp_ldexp(Pmid[3], shift);
         }
 
     }
@@ -1808,38 +1803,37 @@ __device__ __forceinline__ void combine_query_midpoint_ratecat(
     const size_t site_off = (size_t)site * (size_t)RATE_CATS * 4;
     const size_t per_query = (size_t)RATE_CATS * 16;
 
-    double*       target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
-    const double* query_clv  = D.d_query_clv + site_off;
-    const double* query_mat  = D.d_query_pmat + (size_t)op_idx * per_query;
+    fp_t*         target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
+    const fp_t*   query_clv  = D.d_query_clv + site_off;
+    const fp_t* query_mat  = D.d_query_pmat + (size_t)op_idx * per_query;
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
-        const double* M = query_mat + (size_t)r * 16;
-        const double4 Q = reinterpret_cast<const double4*>(query_clv)[r];
-        double*       Pmid = target_mid + (size_t)r * 4;
+        const fp_t* M = query_mat + (size_t)r * 16;
+        const fp4_t Q = reinterpret_cast<const fp4_t*>(query_clv)[r];
+        fp_t*       Pmid = target_mid + (size_t)r * 4;
 
-        const double q0 = Q.x, q1 = Q.y, q2 = Q.z, q3 = Q.w;
-        const double t0 = M[0]*q0 + M[1]*q1 + M[2]*q2 + M[3]*q3;
-        const double t1 = M[4]*q0 + M[5]*q1 + M[6]*q2 + M[7]*q3;
-        const double t2 = M[8]*q0 + M[9]*q1 + M[10]*q2 + M[11]*q3;
-        const double t3 = M[12]*q0+ M[13]*q1+ M[14]*q2+ M[15]*q3;
+        const fp_t t0 = fp_dot4(make_fp4(M[0], M[1], M[2], M[3]), Q);
+        const fp_t t1 = fp_dot4(make_fp4(M[4], M[5], M[6], M[7]), Q);
+        const fp_t t2 = fp_dot4(make_fp4(M[8], M[9], M[10], M[11]), Q);
+        const fp_t t3 = fp_dot4(make_fp4(M[12], M[13], M[14], M[15]), Q);
 
         Pmid[0] *= t0;
         Pmid[1] *= t1;
         Pmid[2] *= t2;
         Pmid[3] *= t3;
 
-        double col_scale_max_val = fmax(fmax(Pmid[0], Pmid[1]), fmax(Pmid[2], Pmid[3]));
+        fp_t col_scale_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
         int scaling_exponent;
         frexp(col_scale_max_val, &scaling_exponent);
         if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
             unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
             add_scaler_shift(D, mid_scaler, r, shift);
-            Pmid[0] = ldexp(Pmid[0], shift);
-            Pmid[1] = ldexp(Pmid[1], shift);
-            Pmid[2] = ldexp(Pmid[2], shift);
-            Pmid[3] = ldexp(Pmid[3], shift);
+            Pmid[0] = fp_ldexp(Pmid[0], shift);
+            Pmid[1] = fp_ldexp(Pmid[1], shift);
+            Pmid[2] = fp_ldexp(Pmid[2], shift);
+            Pmid[3] = fp_ldexp(Pmid[3], shift);
         }
     }
 }
@@ -1864,21 +1858,21 @@ __device__ __forceinline__ void combine_query_midpoint_generic(
     const size_t site_off = (size_t)site * (size_t)states * (size_t)rate_cats;
     const size_t per_query = (size_t)rate_cats * (size_t)states * (size_t)states;
 
-    double*       target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
-    const double* query_clv  = D.d_query_clv + site_off;
-    const double* query_mat  = D.d_query_pmat + (size_t)op_idx * per_query;
+    fp_t*       target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
+    const fp_t* query_clv  = D.d_query_clv + site_off;
+    const fp_t* query_mat  = D.d_query_pmat + (size_t)op_idx * per_query;
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
-        const double* M = query_mat + (size_t)r * states * states;
-        const double* Q = query_clv  + (size_t)r * states;
-        double*       Pmid = target_mid + (size_t)r * states;
+        const fp_t* M = query_mat + (size_t)r * states * states;
+        const fp_t* Q = query_clv  + (size_t)r * states;
+        fp_t*       Pmid = target_mid + (size_t)r * states;
 
-        double col_scale_max_val = 0.0;
+        fp_t col_scale_max_val = fp_t(0);
         for (unsigned int i = 0; i < states; ++i) {
-            double acc = 0.0;
+            fp_t acc = fp_t(0);
             for (unsigned int j = 0; j < states; ++j) {
-                acc += M[i * states + j] * Q[j];
+                acc = fp_fma(M[i * states + j], Q[j], acc);
             }
             Pmid[i] *= acc;
             if (Pmid[i] > col_scale_max_val) col_scale_max_val = Pmid[i];
@@ -1890,7 +1884,7 @@ __device__ __forceinline__ void combine_query_midpoint_generic(
             unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
             add_scaler_shift(D, mid_scaler, r, shift);
             for (unsigned int j = 0; j < states; ++j) {
-                Pmid[j] = ldexp(Pmid[j], shift);
+                Pmid[j] = fp_ldexp(Pmid[j], shift);
             }
         }
     }
@@ -1934,12 +1928,12 @@ __device__ __forceinline__ void compute_inner_inner_site_generic(
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * span;
 
-    const double* d_left_clv  = clv_read_ptr_for_node<const double>(D, op, op.left_id);
-    const double* d_right_clv = clv_read_ptr_for_node<const double>(D, op, op.right_id);
-    double* parent_clv = clv_write_ptr_for_node<double>(D, op, op.parent_id);
+    const fp_t* d_left_clv  = clv_read_ptr_for_node<const fp_t>(D, op, op.left_id);
+    const fp_t* d_right_clv = clv_read_ptr_for_node<const fp_t>(D, op, op.right_id);
+    fp_t* parent_clv = clv_write_ptr_for_node<fp_t>(D, op, op.parent_id);
     if (!d_left_clv || !d_right_clv || !parent_clv) return; // placeholder until preorder input logic is defined
-    const double* d_left_mat  = D.d_pmat + (size_t)op.left_id  * D.rate_cats * states * states;
-    const double* d_right_mat = D.d_pmat + (size_t)op.right_id * D.rate_cats * states * states;
+    const fp_t* d_left_mat  = D.d_pmat + (size_t)op.left_id  * D.rate_cats * states * states;
+    const fp_t* d_right_mat = D.d_pmat + (size_t)op.right_id * D.rate_cats * states * states;
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, rate_cats);
@@ -1955,23 +1949,23 @@ __device__ __forceinline__ void compute_inner_inner_site_generic(
             r,
             read_scaler_shift(D, left_scaler, r) +
             read_scaler_shift(D, right_scaler, r));
-        const double* Lclv = d_left_clv  + site_off + (size_t)r * states;
-        const double* Rclv = d_right_clv + site_off + (size_t)r * states;
+        const fp_t* Lclv = d_left_clv  + site_off + (size_t)r * states;
+        const fp_t* Rclv = d_right_clv + site_off + (size_t)r * states;
 
-        const double* Lmat = d_left_mat  + (size_t)r * states * states;
-        const double* Rmat = d_right_mat + (size_t)r * states * states;
+        const fp_t* Lmat = d_left_mat  + (size_t)r * states * states;
+        const fp_t* Rmat = d_right_mat + (size_t)r * states * states;
 
-        double* Pout = parent_clv + site_off + (size_t)r * states;
-        double col_scale_max_val = 0.0;
+        fp_t* Pout = parent_clv + site_off + (size_t)r * states;
+        fp_t col_scale_max_val = fp_t(0);
 
-        const double* Lrow = Lmat;
-        const double* Rrow = Rmat;
+        const fp_t* Lrow = Lmat;
+        const fp_t* Rrow = Rmat;
         for (unsigned int j = 0; j < states; ++j) {
-            double lt = 0.0, rt = 0.0;
+            fp_t lt = fp_t(0), rt = fp_t(0);
             #pragma unroll
             for (unsigned int k = 0; k < states; ++k) {
-                lt += Lrow[k] * Lclv[k];
-                rt += Rrow[k] * Rclv[k];
+                lt = fp_fma(Lrow[k], Lclv[k], lt);
+                rt = fp_fma(Rrow[k], Rclv[k], rt);
             }
             Pout[j] = lt * rt;
             if (Pout[j] > col_scale_max_val) col_scale_max_val = Pout[j];
@@ -1985,7 +1979,7 @@ __device__ __forceinline__ void compute_inner_inner_site_generic(
             if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
                 site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
                 for (unsigned int j = 0; j < states; ++j) {
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                    scale_clv_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
                 }
             }
         }

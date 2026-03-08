@@ -19,8 +19,8 @@
 
 __global__ void BuildOpPendantLengthsKernel(
     const NodeOpInfo* ops,
-    const double* node_lengths,
-    double* op_lengths,
+    const fp_t* node_lengths,
+    fp_t* op_lengths,
     int num_ops,
     int total_nodes,
     double min_len,
@@ -31,7 +31,7 @@ __global__ void BuildOpPendantLengthsKernel(
     if (op_idx < 0 || op_idx >= num_ops) return;
     if (!ops || !op_lengths) return;
 
-    double t = default_len;
+    fp_t t = static_cast<fp_t>(default_len);
     if (node_lengths) {
         const NodeOpInfo op = ops[op_idx];
         const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
@@ -40,16 +40,16 @@ __global__ void BuildOpPendantLengthsKernel(
             t = node_lengths[target_id];
         }
     }
-    if (t < min_len) t = min_len;
-    if (t > max_len) t = max_len;
+    if (t < static_cast<fp_t>(min_len)) t = static_cast<fp_t>(min_len);
+    if (t > static_cast<fp_t>(max_len)) t = static_cast<fp_t>(max_len);
     op_lengths[op_idx] = t;
 }
 
 __global__ void BuildOpDistalLengthsKernel(
     const NodeOpInfo* ops,
-    const double* total_lengths,
-    const double* proximal_lengths,
-    double* op_lengths,
+    const fp_t* total_lengths,
+    const fp_t* proximal_lengths,
+    fp_t* op_lengths,
     int num_ops,
     int total_nodes,
     double min_len,
@@ -60,7 +60,7 @@ __global__ void BuildOpDistalLengthsKernel(
     if (op_idx < 0 || op_idx >= num_ops) return;
     if (!ops || !op_lengths) return;
 
-    double t = default_len;
+    fp_t t = static_cast<fp_t>(default_len);
     if (total_lengths && proximal_lengths) {
         const NodeOpInfo op = ops[op_idx];
         const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
@@ -69,14 +69,14 @@ __global__ void BuildOpDistalLengthsKernel(
             t = total_lengths[target_id] - proximal_lengths[target_id];
         }
     }
-    if (t < min_len) t = min_len;
-    if (t > max_len) t = max_len;
+    if (t < static_cast<fp_t>(min_len)) t = static_cast<fp_t>(min_len);
+    if (t > static_cast<fp_t>(max_len)) t = static_cast<fp_t>(max_len);
     op_lengths[op_idx] = t;
 }
 
 __global__ void BuildNodePendantLengthsKernel(
-    const double* node_lengths,
-    double* out_lengths,
+    const fp_t* node_lengths,
+    fp_t* out_lengths,
     int total_nodes,
     int root_id,
     double min_len,
@@ -87,22 +87,22 @@ __global__ void BuildNodePendantLengthsKernel(
     if (node_idx < 0 || node_idx >= total_nodes) return;
     if (!out_lengths) return;
 
-    double t = default_len;
+    fp_t t = static_cast<fp_t>(default_len);
     if (node_lengths) {
         t = node_lengths[node_idx];
     }
     if (node_idx == root_id) {
-        t = default_len;
+        t = static_cast<fp_t>(default_len);
     }
-    if (t < min_len) t = min_len;
-    if (t > max_len) t = max_len;
+    if (t < static_cast<fp_t>(min_len)) t = static_cast<fp_t>(min_len);
+    if (t > static_cast<fp_t>(max_len)) t = static_cast<fp_t>(max_len);
     out_lengths[node_idx] = t;
 }
 
 __global__ void BuildNodeDistalLengthsKernel(
-    const double* total_lengths,
-    const double* proximal_lengths,
-    double* out_lengths,
+    const fp_t* total_lengths,
+    const fp_t* proximal_lengths,
+    fp_t* out_lengths,
     int total_nodes,
     int root_id,
     double min_len,
@@ -113,27 +113,27 @@ __global__ void BuildNodeDistalLengthsKernel(
     if (node_idx < 0 || node_idx >= total_nodes) return;
     if (!out_lengths) return;
 
-    double t = default_len;
+    fp_t t = static_cast<fp_t>(default_len);
     if (total_lengths && proximal_lengths) {
         t = total_lengths[node_idx] - proximal_lengths[node_idx];
     }
     if (node_idx == root_id) {
-        t = default_len;
+        t = static_cast<fp_t>(default_len);
     }
-    if (t < min_len) t = min_len;
-    if (t > max_len) t = max_len;
+    if (t < static_cast<fp_t>(min_len)) t = static_cast<fp_t>(min_len);
+    if (t > static_cast<fp_t>(max_len)) t = static_cast<fp_t>(max_len);
     out_lengths[node_idx] = t;
 }
 
 // Keep per-op best log-likelihood; rollback branch lengths if current pass is worse.
 __global__ void KeepBestBranchLengthsKernel(
     const NodeOpInfo* ops,
-    double* curr_loglk,
-    double* prev_loglk,
-    double* curr_pendant,
-    double* curr_proximal,
-    double* prev_pendant,
-    double* prev_proximal,
+    fp_t* curr_loglk,
+    fp_t* prev_loglk,
+    fp_t* curr_pendant,
+    fp_t* curr_proximal,
+    fp_t* prev_pendant,
+    fp_t* prev_proximal,
     int* active_ops,
     int num_ops,
     int total_nodes)
@@ -150,8 +150,8 @@ __global__ void KeepBestBranchLengthsKernel(
     if (target_id < 0 || target_id >= total_nodes) return;
     // if(threadIdx.x == 6 && blockIdx.x == 0)
     // printf("Ops = %d target = %d prevloglk = %f currloglk = %f pendant = %f proximal = %f\n", op_idx, target_id, prev_loglk[op_idx], curr_loglk[op_idx], curr_pendant[target_id], curr_proximal[target_id]);
-    const double curr = curr_loglk[op_idx];
-    const double prev = prev_loglk[op_idx];
+    const fp_t curr = curr_loglk[op_idx];
+    const fp_t prev = prev_loglk[op_idx];
     if (curr < prev) {
         curr_loglk[op_idx] = prev;
         curr_pendant[target_id] = prev_pendant[target_id];
@@ -167,12 +167,12 @@ __global__ void KeepBestBranchLengthsKernel(
 // Fused per-op pendant PMAT builder: computes branch length and writes PMAT without staging.
 __global__ void BuildPendantPMATPerOpKernel(
     const NodeOpInfo* ops,
-    const double* node_lengths,
-    const double* Vinv,
-    const double* V,
-    const double* lambdas,
+    const fp_t* node_lengths,
+    const fp_t* Vinv,
+    const fp_t* V,
+    const fp_t* lambdas,
     double p,
-    double* P,
+    fp_t* P,
     int states,
     int rate_cats,
     int num_ops,
@@ -193,26 +193,26 @@ __global__ void BuildPendantPMATPerOpKernel(
     const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
     const int target_id = target_is_left ? op.left_id : op.right_id;
 
-    double t = default_len;
+    fp_t t = static_cast<fp_t>(default_len);
     if (node_lengths && target_id >= 0 && target_id < total_nodes) {
         t = node_lengths[target_id];
     }
-    if (t < min_len) t = min_len;
-    if (t > max_len) t = max_len;
+    if (t < static_cast<fp_t>(min_len)) t = static_cast<fp_t>(min_len);
+    if (t > static_cast<fp_t>(max_len)) t = static_cast<fp_t>(max_len);
 
-    const double* lamb = lambdas + (size_t)rc * (size_t)states;
-    double* out = P + (size_t)idx * (size_t)states * (size_t)states;
-    pmatrix_from_triple_device(Vinv, V, lamb, 1.0, t, p, out, states);
+    const fp_t* lamb = lambdas + (size_t)rc * (size_t)states;
+    fp_t* out = P + (size_t)idx * (size_t)states * (size_t)states;
+    pmatrix_from_triple_device(Vinv, V, lamb, fp_t(1.0), t, static_cast<fp_t>(p), out, states);
 }
 
 // Fused per-node PMAT builder for proximal branches.
 __global__ void BuildNodeProximalPMATKernel(
-    const double* node_lengths,
-    const double* Vinv,
-    const double* V,
-    const double* lambdas,
+    const fp_t* node_lengths,
+    const fp_t* Vinv,
+    const fp_t* V,
+    const fp_t* lambdas,
     double p,
-    double* P,
+    fp_t* P,
     int states,
     int rate_cats,
     int num_nodes,
@@ -229,31 +229,31 @@ __global__ void BuildNodeProximalPMATKernel(
     const int rc = idx - node_idx * rate_cats;
     if (node_idx < 0 || node_idx >= num_nodes || rc < 0 || rc >= rate_cats) return;
 
-    double t = default_len;
+    fp_t t = static_cast<fp_t>(default_len);
     if (node_lengths) {
         t = node_lengths[node_idx];
     }
     if (node_idx == root_id) {
-        t = default_len;
+        t = static_cast<fp_t>(default_len);
     }
-    if (t < min_len) t = min_len;
-    if (t > max_len) t = max_len;
+    if (t < static_cast<fp_t>(min_len)) t = static_cast<fp_t>(min_len);
+    if (t > static_cast<fp_t>(max_len)) t = static_cast<fp_t>(max_len);
 
-    const double* lamb = lambdas + (size_t)rc * (size_t)states;
-    double* out = P + ((size_t)node_idx * (size_t)rate_cats + (size_t)rc)
+    const fp_t* lamb = lambdas + (size_t)rc * (size_t)states;
+    fp_t* out = P + ((size_t)node_idx * (size_t)rate_cats + (size_t)rc)
         * (size_t)states * (size_t)states;
-    pmatrix_from_triple_device(Vinv, V, lamb, 1.0, t, p, out, states);
+    pmatrix_from_triple_device(Vinv, V, lamb, fp_t(1.0), t, static_cast<fp_t>(p), out, states);
 }
 
 // Fused per-node PMAT builder for distal branches (total - proximal).
 __global__ void BuildNodeDistalPMATKernel(
-    const double* total_lengths,
-    const double* proximal_lengths,
-    const double* Vinv,
-    const double* V,
-    const double* lambdas,
+    const fp_t* total_lengths,
+    const fp_t* proximal_lengths,
+    const fp_t* Vinv,
+    const fp_t* V,
+    const fp_t* lambdas,
     double p,
-    double* P,
+    fp_t* P,
     int states,
     int rate_cats,
     int num_nodes,
@@ -271,17 +271,17 @@ __global__ void BuildNodeDistalPMATKernel(
     if (node_idx < 0 || node_idx >= num_nodes || rc < 0 || rc >= rate_cats) return;
     if (!total_lengths || !proximal_lengths) return;
 
-    double t = total_lengths[node_idx] - proximal_lengths[node_idx];
+    fp_t t = total_lengths[node_idx] - proximal_lengths[node_idx];
     if (node_idx == root_id) {
-        t = default_len;
+        t = static_cast<fp_t>(default_len);
     }
-    if (t < min_len) t = min_len;
-    if (t > max_len) t = max_len;
+    if (t < static_cast<fp_t>(min_len)) t = static_cast<fp_t>(min_len);
+    if (t > static_cast<fp_t>(max_len)) t = static_cast<fp_t>(max_len);
 
-    const double* lamb = lambdas + (size_t)rc * (size_t)states;
-    double* out = P + ((size_t)node_idx * (size_t)rate_cats + (size_t)rc)
+    const fp_t* lamb = lambdas + (size_t)rc * (size_t)states;
+    fp_t* out = P + ((size_t)node_idx * (size_t)rate_cats + (size_t)rc)
         * (size_t)states * (size_t)states;
-    pmatrix_from_triple_device(Vinv, V, lamb, 1.0, t, p, out, states);
+    pmatrix_from_triple_device(Vinv, V, lamb, fp_t(1.0), t, static_cast<fp_t>(p), out, states);
 }
 
 // Per-site placement kernel: build midpoint CLV for placement.
@@ -355,11 +355,11 @@ PlacementResult PlacementEvaluationKernel (
     if ((size_t)num_ops > D.sumtable_capacity_ops || (size_t)num_ops > D.likelihood_capacity_ops) {
         throw std::runtime_error("DeviceTree buffers too small for num_ops.");
     }
-    double* d_likelihoods = D.d_likelihoods;
-    double* d_sumtable = D.d_sumtable;
+    fp_t* d_likelihoods = D.d_likelihoods;
+    fp_t* d_sumtable = D.d_sumtable;
 
     const size_t diag_shared = (size_t)D.rate_cats * (size_t)D.states * 4;
-    size_t shmem_bytes = sizeof(double) * diag_shared; // diag table only (df/ddf/loglk reduced via warp shuffle)
+    size_t shmem_bytes = sizeof(fp_t) * diag_shared; // diag table only (df/ddf/loglk reduced via warp shuffle)
 
     // Choose a block size that fits the device based on occupancy.
     int block_threads = 512;
@@ -383,56 +383,56 @@ PlacementResult PlacementEvaluationKernel (
     dim3 midpoint_grid((D.sites + placement_block.x - 1) / placement_block.x, (unsigned)num_ops);
     dim3 deriv_grid((unsigned)num_ops);
 
-    double* d_prev_loglk = nullptr;
+    fp_t* d_prev_loglk = nullptr;
     int* d_active_ops = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_prev_loglk, sizeof(double) * (size_t)num_ops));
+    CUDA_CHECK(cudaMalloc(&d_prev_loglk, sizeof(fp_t) * (size_t)num_ops));
     CUDA_CHECK(cudaMalloc(&d_active_ops, sizeof(int) * (size_t)num_ops));
     CUDA_CHECK(cudaMemset(d_active_ops, 1, sizeof(int) * (size_t)num_ops));
     {
         const size_t total_nodes = (size_t)D.N;
-        std::vector<double> h_prev_pendant(total_nodes, DEFAULT_BRANCH_LENGTH);
-        std::vector<double> h_prev_proximal(total_nodes, DEFAULT_BRANCH_LENGTH);
+        std::vector<fp_t> h_prev_pendant(total_nodes, static_cast<fp_t>(DEFAULT_BRANCH_LENGTH));
+        std::vector<fp_t> h_prev_proximal(total_nodes, static_cast<fp_t>(DEFAULT_BRANCH_LENGTH));
         if (D.d_blen && total_nodes > 0) {
-            std::vector<double> h_blen(total_nodes, DEFAULT_BRANCH_LENGTH);
+            std::vector<fp_t> h_blen(total_nodes, static_cast<fp_t>(DEFAULT_BRANCH_LENGTH));
             CUDA_CHECK(cudaMemcpyAsync(
                 h_blen.data(),
                 D.d_blen,
-                sizeof(double) * total_nodes,
+                sizeof(fp_t) * total_nodes,
                 cudaMemcpyDeviceToHost,
                 stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
             for (size_t i = 0; i < total_nodes; ++i) {
                 double proximal = (static_cast<int>(i) == D.root_id)
                     ? DEFAULT_BRANCH_LENGTH
-                    : 0.5 * h_blen[i];
+                    : 0.5 * static_cast<double>(h_blen[i]);
                 if (proximal < OPT_BRANCH_LEN_MIN) proximal = OPT_BRANCH_LEN_MIN;
                 if (proximal > OPT_BRANCH_LEN_MAX) proximal = OPT_BRANCH_LEN_MAX;
-                h_prev_proximal[i] = proximal;
+                h_prev_proximal[i] = static_cast<fp_t>(proximal);
             }
         } else {
             for (size_t i = 0; i < total_nodes; ++i) {
                 double proximal = DEFAULT_BRANCH_LENGTH;
                 if (proximal < OPT_BRANCH_LEN_MIN) proximal = OPT_BRANCH_LEN_MIN;
                 if (proximal > OPT_BRANCH_LEN_MAX) proximal = OPT_BRANCH_LEN_MAX;
-                h_prev_proximal[i] = proximal;
+                h_prev_proximal[i] = static_cast<fp_t>(proximal);
             }
         }
         for (size_t i = 0; i < total_nodes; ++i) {
-            double pendant = h_prev_pendant[i];
+            double pendant = static_cast<double>(h_prev_pendant[i]);
             if (pendant < OPT_BRANCH_LEN_MIN) pendant = OPT_BRANCH_LEN_MIN;
             if (pendant > OPT_BRANCH_LEN_MAX) pendant = OPT_BRANCH_LEN_MAX;
-            h_prev_pendant[i] = pendant;
+            h_prev_pendant[i] = static_cast<fp_t>(pendant);
         }
         CUDA_CHECK(cudaMemcpyAsync(
             D.d_prev_pendant_length,
             h_prev_pendant.data(),
-            sizeof(double) * total_nodes,
+            sizeof(fp_t) * total_nodes,
             cudaMemcpyHostToDevice,
             stream));
         CUDA_CHECK(cudaMemcpyAsync(
             D.d_prev_proximal_length,
             h_prev_proximal.data(),
-            sizeof(double) * total_nodes,
+            sizeof(fp_t) * total_nodes,
             cudaMemcpyHostToDevice,
             stream));
     }
@@ -669,7 +669,7 @@ PlacementResult PlacementEvaluationKernel (
     }
     
     // Argmax on device to get best op index.
-    using Pair = cub::KeyValuePair<int, double>;
+    using Pair = cub::KeyValuePair<int, fp_t>;
     Pair* d_best = nullptr;
     CUDA_CHECK(cudaMalloc(&d_best, sizeof(Pair)));
     void* d_temp = nullptr;
@@ -706,18 +706,18 @@ PlacementResult PlacementEvaluationKernel (
     const int op_target_id = target_is_left ? h_op.left_id
                              : (target_is_right ? h_op.right_id : h_op.parent_id);
 
-    double pendant_length = 0.0;
-    double proximal_length = 0.0;
+    fp_t pendant_length = fp_t(0);
+    fp_t proximal_length = fp_t(0);
     CUDA_CHECK(cudaMemcpyAsync(
         &pendant_length,
         D.d_prev_pendant_length + op_target_id,
-        sizeof(double),
+        sizeof(fp_t),
         cudaMemcpyDeviceToHost,
         stream));
     CUDA_CHECK(cudaMemcpyAsync(
         &proximal_length,
         D.d_prev_proximal_length + op_target_id,
-        sizeof(double),
+        sizeof(fp_t),
         cudaMemcpyDeviceToHost,
         stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -727,9 +727,9 @@ PlacementResult PlacementEvaluationKernel (
     CUDA_CHECK(cudaFree(d_prev_loglk));
     CUDA_CHECK(cudaFree(d_active_ops));
     result.target_id = op_target_id;
-    result.loglikelihood = h_best.value;
-    result.proximal_length = proximal_length;
-    result.pendant_length = pendant_length;
+    result.loglikelihood = static_cast<double>(h_best.value);
+    result.proximal_length = static_cast<double>(proximal_length);
+    result.pendant_length = static_cast<double>(pendant_length);
     return result;
 }
 
@@ -831,7 +831,7 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
     std::vector<SearchState> next_frontier;
     std::vector<SearchState> eval_states;
     std::vector<NodeOpInfo> batch_ops;
-    std::vector<double> batch_ll;
+    std::vector<fp_t> batch_ll;
     eval_states.reserve((size_t)num_ops);
     batch_ops.reserve((size_t)num_ops);
     batch_ll.reserve((size_t)num_ops);
@@ -883,7 +883,7 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
         CUDA_CHECK(cudaMemcpyAsync(
             batch_ll.data(),
             D.d_likelihoods,
-            sizeof(double) * (size_t)batch_n,
+            sizeof(fp_t) * (size_t)batch_n,
             cudaMemcpyDeviceToHost,
             stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -895,7 +895,7 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
             const SearchState cur_state = eval_states[(size_t)batch_i];
             const NodeOpInfo& op = host_ops[(size_t)cur_state.op_idx];
             const int target_id = target_id_of(op);
-            const double cur_ll = batch_ll[(size_t)batch_i];
+            const double cur_ll = static_cast<double>(batch_ll[(size_t)batch_i]);
 
             if (target_id >= 0 && target_id < D.N && cur_ll > best.loglikelihood) {
                 best.target_id = target_id;

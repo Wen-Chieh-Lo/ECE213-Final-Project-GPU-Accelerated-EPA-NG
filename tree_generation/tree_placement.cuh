@@ -15,7 +15,7 @@ void InsertLikelihoodEvaluationKernel(
     const std::vector<double>& rate_multipliers,
     const NodeOpInfo* d_ops,
     int op_idx,
-    double* d_likelihoods,
+    fp_t* d_likelihoods,
     void* d_temp_reduce,
     size_t temp_bytes_reduce,
     cudaStream_t stream);

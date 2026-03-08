@@ -10,6 +10,7 @@
 #include <libpll/pll.h>
 
 #include "../pmatrix/pmat.h"
+#include "precision.hpp"
 
 struct PlacementResult;
 
@@ -37,8 +38,8 @@ inline uint8_t encode_state_DNA5(char c) {
 
 struct NewPlacementQuery{
     std::pair<int,int> node_id_pair{-1, -1}; // node where to insert {first = parent, second = child}
-    double pendant = 0.0;                    // branch length of new insertion
-    double distal = 0.0;                     // branch length to new insertion 
+    fp_t pendant = fp_t(0);                  // branch length of new insertion
+    fp_t distal = fp_t(0);                   // branch length to new insertion
     std::string msa;                         // sequence
     std::string msa_name;                    // sequence name
 };
@@ -51,8 +52,8 @@ struct TreeNode {
     int   left = -1;    // child id
     int   right = -1;   // child id
     int   parent = -1;  // parent id (root = -1)
-    double branch_length_to_parent = 0.0; // Number after the colon in Newick
-    double branch_length_to_insert = 0.0; // for insertion operations
+    fp_t branch_length_to_parent = fp_t(0); // Number after the colon in Newick
+    fp_t branch_length_to_insert = fp_t(0); // for insertion operations
     std::string name;   // only for tips
     // GPU offsets: use these directly with scaler pool
     size_t scaler_offset = 0;  // elements-based offset (per-site or per-rate)
@@ -96,22 +97,22 @@ struct DeviceTree {
     bool    force_generic_downward = false;
     bool    force_generic_upward = false;
 
-    double *d_lambdas  = nullptr;  // [rate_cats * states]
-    double *d_V        = nullptr;  // [states*states]  row-major
-    double *d_Vinv     = nullptr;  // [states*states]  row-major
-    double *d_U        = nullptr;  // [states*states]  (optional; use directly if kernels need U)
-    double *d_rate_w   = nullptr;  // [rate_cats]      Discrete Gamma or other rate categories
-    double *d_frequencies = nullptr;  // [states]       Base frequencies (pi)
-    double *d_rate_weights = nullptr; // [rate_cats]    Discrete rate weights (copy of host)
+    fp_t   *d_lambdas  = nullptr;  // [rate_cats * states]
+    fp_t   *d_V        = nullptr;  // [states*states]  row-major
+    fp_t   *d_Vinv     = nullptr;  // [states*states]  row-major
+    fp_t   *d_U        = nullptr;  // [states*states]  (optional; use directly if kernels need U)
+    fp_t   *d_rate_w   = nullptr;  // [rate_cats]      Discrete Gamma or other rate categories
+    fp_t   *d_frequencies = nullptr;  // [states]       Base frequencies (pi)
+    fp_t   *d_rate_weights = nullptr; // [rate_cats]    Discrete rate weights (copy of host)
 
     // topology (device)
     // NOTE: this pipeline uses host-built NodeOpInfo lists to drive kernels, so we do not store
     // full tree topology arrays on device (postorder/preorder/parent/left/right).
-    double *d_blen      = nullptr; // [N] branch length to parent
-    double *d_new_pendant_length = nullptr;  // [N] updated pendant branch lengths (derivative output)
-    double *d_new_proximal_length = nullptr; // [N] updated proximal branch lengths (derivative output)
-    double *d_prev_pendant_length = nullptr;  // [N] previous pendant branch lengths (smoothing rollback)
-    double *d_prev_proximal_length = nullptr; // [N] previous proximal branch lengths (smoothing rollback)
+    fp_t   *d_blen      = nullptr; // [N] branch length to parent
+    fp_t   *d_new_pendant_length = nullptr;  // [N] updated pendant branch lengths (derivative output)
+    fp_t   *d_new_proximal_length = nullptr; // [N] updated proximal branch lengths (derivative output)
+    fp_t   *d_prev_pendant_length = nullptr;  // [N] previous pendant branch lengths (smoothing rollback)
+    fp_t   *d_prev_proximal_length = nullptr; // [N] previous proximal branch lengths (smoothing rollback)
 
     // tips
     // tip indices 0..tips-1 follow the postorder traversal order encountered in TreeBuildResult.nodes
@@ -119,21 +120,21 @@ struct DeviceTree {
 
     // CLV buffers: up/down split (can be two allocations or two slices of one big allocation).
     // layout per segment: contiguous by node: node i at [i * per_node_elems ..)
-    double  *d_clv_up       = nullptr;          // up/passive CLV (postorder result)
-    double  *d_clv_down     = nullptr;          // down/alternative CLV (optional second half of a big pool)
+    fp_t    *d_clv_up       = nullptr;          // up/passive CLV (postorder result)
+    fp_t    *d_clv_down     = nullptr;          // down/alternative CLV (optional second half of a big pool)
     // When using a single allocation cut in two, clv_down_offset_elems is the base offset into that buffer.
     size_t   clv_down_offset_elems = 0;
     // Midpoint CLV scratch (per-node sized, reused per branch)
-    double  *d_clv_mid      = nullptr;          // [sites * rate_cats * states]
+    fp_t    *d_clv_mid      = nullptr;          // [sites * rate_cats * states]
     // Cached parent_down * sibling_up products for midpoint reuse.
-    double  *d_clv_mid_base = nullptr;          // [sites * rate_cats * states]
+    fp_t    *d_clv_mid_base = nullptr;          // [sites * rate_cats * states]
     // Persistent workspace for downward convergence updates (same span as one CLV pool).
-    double  *d_downward_scratch = nullptr;      // [capacity_N * sites * rate_cats * states]
+    fp_t    *d_downward_scratch = nullptr;      // [capacity_N * sites * rate_cats * states]
     // Midpoint debug accumulator
-    double  *d_placement_clv = nullptr;         
+    fp_t    *d_placement_clv = nullptr;
     // Workspace for derivative/sumtable calculations reused across placements.
-    double  *d_sumtable = nullptr;              // [sumtable_capacity_ops * sites * rate_cats * states]
-    double  *d_likelihoods = nullptr;           // [likelihood_capacity_ops]
+    fp_t    *d_sumtable = nullptr;              // [sumtable_capacity_ops * sites * rate_cats * states]
+    fp_t    *d_likelihoods = nullptr;           // [likelihood_capacity_ops]
     size_t   sumtable_capacity_ops = 0;
     size_t   likelihood_capacity_ops = 0;
 
@@ -146,16 +147,16 @@ struct DeviceTree {
     unsigned *d_site_scaler_mid = nullptr;
     unsigned *d_site_scaler_mid_base = nullptr;
 
-    double* d_pmat = nullptr;
-    double* d_pmat_mid = nullptr;             // half-branch pmats for midpoint calculations
-    double* d_pmat_mid_prox = nullptr;        // proximal branch pmats for midpoint calculations
-    double* d_pmat_mid_dist = nullptr;        // distal branch pmats for midpoint calculations
+    fp_t* d_pmat = nullptr;
+    fp_t* d_pmat_mid = nullptr;             // half-branch pmats for midpoint calculations
+    fp_t* d_pmat_mid_prox = nullptr;        // proximal branch pmats for midpoint calculations
+    fp_t* d_pmat_mid_dist = nullptr;        // distal branch pmats for midpoint calculations
     unsigned int* d_tipmap = nullptr;
 
     // Ready-to-place query buffers
     uint8_t* d_query_chars = nullptr;            // [num_queries * sites] encoded DNA5
-    double *d_query_clv  = nullptr;              // [sites * rate_cats * states] working buffer
-    double *d_query_pmat = nullptr;              // base pointer for query pmats
+    fp_t   *d_query_clv  = nullptr;              // [sites * rate_cats * states] working buffer
+    fp_t   *d_query_pmat = nullptr;              // base pointer for query pmats
 
     // Helpers for calculating sizes
     size_t per_node_elems() const {
@@ -182,25 +183,25 @@ struct HostPacking {
     // Host-side staging buffers for cudaMemcpy
     std::vector<int>     postorder, preorder, parent, left, right;
     std::vector<uint8_t> is_tip;
-    std::vector<double>  blen;
+    std::vector<fp_t>    blen;
 
     std::vector<int>     tip_node_ids;      // size = tips
     std::vector<uint8_t> tipchars;          // size = tips * sites
 
     std::vector<unsigned> site_scaler;      // size = sites or sites*rate
-    std::vector<double>   pmats;
-    std::vector<double>   pmats_mid;        // half-branch pmats for midpoint calculations
-    std::vector<double>   pmats_mid_prox;   // proximal branch pmats for midpoint calculations
-    std::vector<double>   pmats_mid_dist;   // distal branch pmats for midpoint calculations
+    std::vector<fp_t>     pmats;
+    std::vector<fp_t>     pmats_mid;        // half-branch pmats for midpoint calculations
+    std::vector<fp_t>     pmats_mid_prox;   // proximal branch pmats for midpoint calculations
+    std::vector<fp_t>     pmats_mid_dist;   // distal branch pmats for midpoint calculations
 };
 
 // Placement queries are staged separately from HostPacking to avoid coupling
 // tree staging with per-query data.
 struct PlacementQueryBatch {
     size_t count = 0;                            // number of placement queries
-    std::vector<double> branch_lengths;          // per-query pendant length
+    std::vector<fp_t> branch_lengths;            // per-query pendant length
     std::vector<uint8_t> query_chars;            // [count * sites] encoded DNA5
-    std::vector<double> query_pmats;             // [count * rate_cats * states * states] half-branch pmats
+    std::vector<fp_t> query_pmats;               // [count * rate_cats * states * states] half-branch pmats
 
     bool empty() const { return count == 0; }
     size_t size() const { return count; }

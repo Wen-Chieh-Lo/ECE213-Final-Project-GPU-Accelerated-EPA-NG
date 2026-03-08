@@ -90,10 +90,10 @@ void fill_pmats_in_host_packing(
     const bool want_incremental = (changed_nodes && num_changed_nodes > 0);
 
     auto reset_all = [&]() {
-        H.pmats.assign(required, 0.0);
-        H.pmats_mid.assign(required, 0.0);
-        H.pmats_mid_prox.assign(required, 0.0);
-        H.pmats_mid_dist.assign(required, 0.0);
+        H.pmats.assign(required, fp_t(0));
+        H.pmats_mid.assign(required, fp_t(0));
+        H.pmats_mid_prox.assign(required, fp_t(0));
+        H.pmats_mid_dist.assign(required, fp_t(0));
     };
 
     auto buffers_look_compatible = [&]() -> bool {
@@ -113,40 +113,46 @@ void fill_pmats_in_host_packing(
         reset_all();
     } else {
         // Preserve existing pmats for unchanged nodes; extend buffers for newly added nodes.
-        H.pmats.resize(required, 0.0);
-        H.pmats_mid.resize(required, 0.0);
-        if (!H.pmats_mid_prox.empty()) H.pmats_mid_prox.resize(required, 0.0);
-        if (!H.pmats_mid_dist.empty()) H.pmats_mid_dist.resize(required, 0.0);
+        H.pmats.resize(required, fp_t(0));
+        H.pmats_mid.resize(required, fp_t(0));
+        if (!H.pmats_mid_prox.empty()) H.pmats_mid_prox.resize(required, fp_t(0));
+        if (!H.pmats_mid_dist.empty()) H.pmats_mid_dist.resize(required, fp_t(0));
     }
 
     auto compute_node_pmats = [&](int nid) {
         if (nid < 0 || nid >= N) return;
         const TreeNode& nd = T.nodes[nid];
         if (nd.parent < 0) return;
-        double* base = H.pmats.data() + (size_t)nid * per_node;
-        double* base_mid = H.pmats_mid.data() + (size_t)nid * per_node;
-        double* base_mid_prox = H.pmats_mid_prox.empty() ? nullptr : (H.pmats_mid_prox.data() + (size_t)nid * per_node);
-        double* base_mid_dist = H.pmats_mid_dist.empty() ? nullptr : (H.pmats_mid_dist.data() + (size_t)nid * per_node);
-        const double blen  = nd.branch_length_to_parent;
+        fp_t* base = H.pmats.data() + (size_t)nid * per_node;
+        fp_t* base_mid = H.pmats_mid.data() + (size_t)nid * per_node;
+        fp_t* base_mid_prox = H.pmats_mid_prox.empty() ? nullptr : (H.pmats_mid_prox.data() + (size_t)nid * per_node);
+        fp_t* base_mid_dist = H.pmats_mid_dist.empty() ? nullptr : (H.pmats_mid_dist.data() + (size_t)nid * per_node);
+        const double blen  = static_cast<double>(nd.branch_length_to_parent);
+        std::vector<double> pbuf((size_t)states * (size_t)states);
+        std::vector<double> pbuf_mid((size_t)states * (size_t)states);
 
         for (int rc = 0; rc < rate_cats; ++rc) {
             double r = rate_multipliers[rc];  // rate category multiplier
             double t = blen;                  // branch length
             double p = 0;
 
-            double* P = base + (size_t)rc * states * states;
-            double* Pmid = base_mid + (size_t)rc * states * states;
-            double* Pprox = base_mid_prox ? (base_mid_prox + (size_t)rc * states * states) : nullptr;
-            double* Pdist = base_mid_dist ? (base_mid_dist + (size_t)rc * states * states) : nullptr;
+            fp_t* P = base + (size_t)rc * states * states;
+            fp_t* Pmid = base_mid + (size_t)rc * states * states;
+            fp_t* Pprox = base_mid_prox ? (base_mid_prox + (size_t)rc * states * states) : nullptr;
+            fp_t* Pdist = base_mid_dist ? (base_mid_dist + (size_t)rc * states * states) : nullptr;
             pmatrix_from_triple(
                 er.Vinv.data(), er.V.data(), er.lambdas.data(),
-                            r, t, p, P, states);
+                            r, t, p, pbuf.data(), states);
             // half-branch PMAT for midpoint
             pmatrix_from_triple(
                 er.Vinv.data(), er.V.data(), er.lambdas.data(),
-                            r, t * 0.5, p, Pmid, states);
-            if (Pprox) std::memcpy(Pprox, Pmid, sizeof(double) * (size_t)states * (size_t)states);
-            if (Pdist) std::memcpy(Pdist, Pmid, sizeof(double) * (size_t)states * (size_t)states);
+                            r, t * 0.5, p, pbuf_mid.data(), states);
+            for (size_t idx = 0; idx < pbuf.size(); ++idx) {
+                P[idx] = static_cast<fp_t>(pbuf[idx]);
+                Pmid[idx] = static_cast<fp_t>(pbuf_mid[idx]);
+            }
+            if (Pprox) std::copy(Pmid, Pmid + pbuf.size(), Pprox);
+            if (Pdist) std::copy(Pmid, Pmid + pbuf.size(), Pdist);
         }
     };
 
@@ -166,23 +172,27 @@ void fill_query_pmats(
 {
     const size_t per_query = (size_t)rate_cats * states * states;
     const size_t qcount = Q.count;
-    Q.query_pmats.assign(per_query * qcount, 0.0);
+    Q.query_pmats.assign(per_query * qcount, fp_t(0));
     if (Q.branch_lengths.size() != qcount) {
-        Q.branch_lengths.assign(qcount, 0.5);
+        Q.branch_lengths.assign(qcount, fp_t(0.5));
     }
     for (size_t qi = 0; qi < qcount; ++qi) {
-        double* base = Q.query_pmats.data() + qi * per_query;
-        double blen  = Q.branch_lengths[qi];
+        fp_t* base = Q.query_pmats.data() + qi * per_query;
+        double blen  = static_cast<double>(Q.branch_lengths[qi]);
+        std::vector<double> pbuf((size_t)states * (size_t)states);
         for (int rc = 0; rc < rate_cats; ++rc) {
             double r = rate_multipliers[rc];  // rate category multiplier
             double t = blen;                  // branch length
             double p = 0;
 
-            double* P = base + (size_t)rc * states * states;
+            fp_t* P = base + (size_t)rc * states * states;
 
             pmatrix_from_triple(
                 er.Vinv.data(), er.V.data(), er.lambdas.data(),
-                            r, t, p, P, states);
+                            r, t, p, pbuf.data(), states);
+            for (size_t idx = 0; idx < pbuf.size(); ++idx) {
+                P[idx] = static_cast<fp_t>(pbuf[idx]);
+            }
         }
     }
 }
@@ -214,11 +224,11 @@ __global__ void BuildQueryClvKernel(
 
     const size_t per_site = (size_t)D.rate_cats * (size_t)D.states;
     const size_t clv_span = (size_t)D.sites * per_site;
-    double* out = D.d_query_clv + (size_t)query_idx * clv_span + (size_t)site * per_site;
+    fp_t* out = D.d_query_clv + (size_t)query_idx * clv_span + (size_t)site * per_site;
     for (int rc = 0; rc < D.rate_cats; ++rc) {
-        double* row = out + (size_t)rc * D.states;
+        fp_t* row = out + (size_t)rc * D.states;
         for (int s = 0; s < D.states; ++s) {
-            row[s] = (enc < D.states) ? (s == enc ? 1.0 : 0.0) : 1.0;
+            row[s] = (enc < D.states) ? (s == enc ? fp_t(1) : fp_t(0)) : fp_t(1);
         }
     }
 }
@@ -260,7 +270,7 @@ HostPacking pack_host_arrays_from_tree_and_msa(
     H.left.resize(N, -1);
     H.right.resize(N, -1);
     H.is_tip.resize(N, 0);
-    H.blen.resize(N, 0.0);
+    H.blen.resize(N, fp_t(0));
 
     for (int i = 0; i < N; ++i) {
         const auto& nd = T.nodes[i];
@@ -339,6 +349,15 @@ static inline std::vector<double> transpose_sq(const std::vector<double>& M, int
     }
     return T;
 }
+
+static inline std::vector<fp_t> cast_to_fp(const std::vector<double>& src) {
+    std::vector<fp_t> out(src.size());
+    for (size_t i = 0; i < src.size(); ++i) {
+        out[i] = static_cast<fp_t>(src[i]);
+    }
+    return out;
+}
+
 // ===== Copy host packing to GPU and build DeviceTree =====
 // Upload host packing and model parameters to GPU, constructing DeviceTree.
 DeviceTree upload_to_gpu(
@@ -372,58 +391,59 @@ DeviceTree upload_to_gpu(
     D.force_generic_upward = (std::getenv("MLIPPER_FORCE_GENERIC_UPWARD") != nullptr);
     
     // --- alloc topology ---
-    CUDA_CHECK(cudaMalloc(&D.d_lambdas, sizeof(double) * (size_t)D.rate_cats * D.states));
-    CUDA_CHECK(cudaMalloc(&D.d_V,       sizeof(double) * D.states * D.states));
-    CUDA_CHECK(cudaMalloc(&D.d_Vinv,    sizeof(double) * D.states * D.states));
+    CUDA_CHECK(cudaMalloc(&D.d_lambdas, sizeof(fp_t) * (size_t)D.rate_cats * D.states));
+    CUDA_CHECK(cudaMalloc(&D.d_V,       sizeof(fp_t) * D.states * D.states));
+    CUDA_CHECK(cudaMalloc(&D.d_Vinv,    sizeof(fp_t) * D.states * D.states));
 
-    CUDA_CHECK(cudaMalloc(&D.d_U,       sizeof(double) * D.states * D.states));
-    CUDA_CHECK(cudaMalloc(&D.d_rate_weights, sizeof(double) * D.rate_cats));
-    CUDA_CHECK(cudaMalloc(&D.d_frequencies, sizeof(double) * D.states));
+    CUDA_CHECK(cudaMalloc(&D.d_U,       sizeof(fp_t) * D.states * D.states));
+    CUDA_CHECK(cudaMalloc(&D.d_rate_weights, sizeof(fp_t) * D.rate_cats));
+    CUDA_CHECK(cudaMalloc(&D.d_frequencies, sizeof(fp_t) * D.states));
 
     // expand lambdas per rate category, scaling by the per-category rate multiplier.
     {
-        std::vector<double> lambdas_scaled((size_t)D.rate_cats * D.states, 0.0);
+        std::vector<fp_t> lambdas_scaled((size_t)D.rate_cats * D.states, fp_t(0));
         for (int rc = 0; rc < D.rate_cats; ++rc) {
             double r = rate_multipliers[rc];
             for (int s = 0; s < D.states; ++s) {
-                lambdas_scaled[(size_t)rc * D.states + s] = er.lambdas[s] * r;
+                lambdas_scaled[(size_t)rc * D.states + s] = static_cast<fp_t>(er.lambdas[s] * r);
             }
         }
         CUDA_CHECK(cudaMemcpy(D.d_lambdas,
                             lambdas_scaled.data(),
-                            sizeof(double) * lambdas_scaled.size(),
+                            sizeof(fp_t) * lambdas_scaled.size(),
                             cudaMemcpyHostToDevice));
     }
 
     //Temporary Fixed : Transpose of Eigen vectors for coalescent model
-    auto V_T    = transpose_sq(er.V,    D.states);
-    auto Vinv_T = transpose_sq(er.Vinv, D.states);
-    auto U_T    = transpose_sq(er.U,    D.states);
+    auto V_T    = cast_to_fp(transpose_sq(er.V,    D.states));
+    auto Vinv_T = cast_to_fp(transpose_sq(er.Vinv, D.states));
+    auto U_T    = cast_to_fp(transpose_sq(er.U,    D.states));
+    auto rate_weights_fp = cast_to_fp(rate_weights);
+    auto pi_fp = cast_to_fp(pi);
 
-    CUDA_CHECK(cudaMemcpy(D.d_V,    V_T.data(),    sizeof(double) * D.states * D.states, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(D.d_Vinv, Vinv_T.data(), sizeof(double) * D.states * D.states, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(D.d_U,    U_T.data(),    sizeof(double) * D.states * D.states, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_V,    V_T.data(),    sizeof(fp_t) * D.states * D.states, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_Vinv, Vinv_T.data(), sizeof(fp_t) * D.states * D.states, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_U,    U_T.data(),    sizeof(fp_t) * D.states * D.states, cudaMemcpyHostToDevice));
     if ((int)rate_weights.size() != rate_cats) {
         throw std::runtime_error("rate_weights size mismatch.");
     }
-    CUDA_CHECK(cudaMemcpy(D.d_rate_weights, rate_weights.data(), sizeof(double) * D.rate_cats, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_rate_weights, rate_weights_fp.data(), sizeof(fp_t) * D.rate_cats, cudaMemcpyHostToDevice));
     if ((int)pi.size() != states) {
         throw std::runtime_error("pi size mismatch.");
     }
-    CUDA_CHECK(cudaMemcpy(D.d_frequencies, pi.data(), sizeof(double) * D.states, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_frequencies, pi_fp.data(), sizeof(fp_t) * D.states, cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMalloc(&D.d_blen,      sizeof(double) * D.capacity_N));
-    CUDA_CHECK(cudaMalloc(&D.d_new_pendant_length,  sizeof(double) * D.capacity_N));
-    CUDA_CHECK(cudaMalloc(&D.d_new_proximal_length, sizeof(double) * D.capacity_N));
-    CUDA_CHECK(cudaMalloc(&D.d_prev_pendant_length,  sizeof(double) * D.capacity_N));
-    CUDA_CHECK(cudaMalloc(&D.d_prev_proximal_length, sizeof(double) * D.capacity_N));
+    CUDA_CHECK(cudaMalloc(&D.d_blen,      sizeof(fp_t) * D.capacity_N));
+    CUDA_CHECK(cudaMalloc(&D.d_new_pendant_length,  sizeof(fp_t) * D.capacity_N));
+    CUDA_CHECK(cudaMalloc(&D.d_new_proximal_length, sizeof(fp_t) * D.capacity_N));
+    CUDA_CHECK(cudaMalloc(&D.d_prev_pendant_length,  sizeof(fp_t) * D.capacity_N));
+    CUDA_CHECK(cudaMalloc(&D.d_prev_proximal_length, sizeof(fp_t) * D.capacity_N));
     
-
-    CUDA_CHECK(cudaMemcpy(D.d_blen,      H.blen.data(),      sizeof(double) * D.N, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(D.d_new_pendant_length,  0, sizeof(double) * D.capacity_N));
-    CUDA_CHECK(cudaMemset(D.d_new_proximal_length, 0, sizeof(double) * D.capacity_N));
-    CUDA_CHECK(cudaMemset(D.d_prev_pendant_length,  0, sizeof(double) * D.capacity_N));
-    CUDA_CHECK(cudaMemset(D.d_prev_proximal_length, 0, sizeof(double) * D.capacity_N));
+    CUDA_CHECK(cudaMemcpy(D.d_blen,      H.blen.data(),       sizeof(fp_t) * D.N, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(D.d_new_pendant_length,  0, sizeof(fp_t) * D.capacity_N));
+    CUDA_CHECK(cudaMemset(D.d_new_proximal_length, 0, sizeof(fp_t) * D.capacity_N));
+    CUDA_CHECK(cudaMemset(D.d_prev_pendant_length,  0, sizeof(fp_t) * D.capacity_N));
+    CUDA_CHECK(cudaMemset(D.d_prev_proximal_length, 0, sizeof(fp_t) * D.capacity_N));
 
     // --- tips ---
 
@@ -437,47 +457,47 @@ DeviceTree upload_to_gpu(
     const size_t per_node = (size_t)sites * (size_t)rate_cats * (size_t)states;
     const size_t clv_capacity_elems = (size_t)D.capacity_N * per_node;
     const size_t clv_total = clv_capacity_elems * 2; // up + down
-    CUDA_CHECK(cudaMalloc(&D.d_clv_up,  sizeof(double) * clv_total));
+    CUDA_CHECK(cudaMalloc(&D.d_clv_up,  sizeof(fp_t) * clv_total));
     D.d_clv_down = D.d_clv_up + clv_capacity_elems;
     D.clv_down_offset_elems = clv_capacity_elems;
     // Midpoint buffer: one per node
-    CUDA_CHECK(cudaMalloc(&D.d_clv_mid, sizeof(double) * clv_capacity_elems));
+    CUDA_CHECK(cudaMalloc(&D.d_clv_mid, sizeof(fp_t) * clv_capacity_elems));
     // Cached parent_down * sibling_up products for midpoint reuse
-    CUDA_CHECK(cudaMalloc(&D.d_clv_mid_base, sizeof(double) * clv_capacity_elems));
+    CUDA_CHECK(cudaMalloc(&D.d_clv_mid_base, sizeof(fp_t) * clv_capacity_elems));
     // Persistent workspace for downward convergence update.
-    CUDA_CHECK(cudaMalloc(&D.d_downward_scratch, sizeof(double) * clv_capacity_elems));
-    CUDA_CHECK(cudaMalloc(&D.d_placement_clv, sizeof(double) * D.sites));
-    CUDA_CHECK(cudaMemset(D.d_placement_clv, 0, sizeof(double) * D.sites));
+    CUDA_CHECK(cudaMalloc(&D.d_downward_scratch, sizeof(fp_t) * clv_capacity_elems));
+    CUDA_CHECK(cudaMalloc(&D.d_placement_clv, sizeof(fp_t) * D.sites));
+    CUDA_CHECK(cudaMemset(D.d_placement_clv, 0, sizeof(fp_t) * D.sites));
     // Reusable derivative workspaces
     const size_t sumtable_stride = (size_t)sites * (size_t)rate_cats * (size_t)states;
     const size_t max_ops = (size_t)D.capacity_N * 2;
     D.sumtable_capacity_ops = max_ops;
     D.likelihood_capacity_ops = max_ops;
     if (sumtable_stride > 0 && max_ops > 0) {
-        CUDA_CHECK(cudaMalloc(&D.d_sumtable, sizeof(double) * sumtable_stride * max_ops));
+        CUDA_CHECK(cudaMalloc(&D.d_sumtable, sizeof(fp_t) * sumtable_stride * max_ops));
     }
     if (max_ops > 0) {
-        CUDA_CHECK(cudaMalloc(&D.d_likelihoods, sizeof(double) * max_ops));
+        CUDA_CHECK(cudaMalloc(&D.d_likelihoods, sizeof(fp_t) * max_ops));
     }
 
     // Optionally zero out the CLV pool (or let kernels overwrite)
-    CUDA_CHECK(cudaMemset(D.d_clv_up, 0, sizeof(double) * clv_total));
-    CUDA_CHECK(cudaMemset(D.d_clv_mid, 0, sizeof(double) * clv_capacity_elems));
-    CUDA_CHECK(cudaMemset(D.d_clv_mid_base, 0, sizeof(double) * clv_capacity_elems));
-    CUDA_CHECK(cudaMemset(D.d_downward_scratch, 0, sizeof(double) * clv_capacity_elems));
+    CUDA_CHECK(cudaMemset(D.d_clv_up, 0, sizeof(fp_t) * clv_total));
+    CUDA_CHECK(cudaMemset(D.d_clv_mid, 0, sizeof(fp_t) * clv_capacity_elems));
+    CUDA_CHECK(cudaMemset(D.d_clv_mid_base, 0, sizeof(fp_t) * clv_capacity_elems));
+    CUDA_CHECK(cudaMemset(D.d_downward_scratch, 0, sizeof(fp_t) * clv_capacity_elems));
     // Initialize only the root slice of down pool to exact 1.0; others remain 0 until overwritten.
     if (per_node > 0) {
-        std::vector<double> ones(per_node, 1.0);
+        std::vector<fp_t> ones(per_node, fp_t(1));
         CUDA_CHECK(cudaMemcpy(D.d_clv_down + (size_t)T.root_id * per_node,
                               ones.data(),
-                              per_node * sizeof(double),
+                              per_node * sizeof(fp_t),
                               cudaMemcpyHostToDevice));
     }
 
     const size_t pmat_elems_cur = (size_t)D.N * (size_t)D.rate_cats * (size_t)D.states * (size_t)D.states;
     const size_t pmat_elems_cap = (size_t)D.capacity_N * (size_t)D.rate_cats * (size_t)D.states * (size_t)D.states;
-    const size_t pmat_bytes_cur = sizeof(double) * pmat_elems_cur;
-    const size_t pmat_bytes_cap = sizeof(double) * pmat_elems_cap;
+    const size_t pmat_bytes_cur = sizeof(fp_t) * pmat_elems_cur;
+    const size_t pmat_bytes_cap = sizeof(fp_t) * pmat_elems_cap;
     CUDA_CHECK(cudaMalloc(&D.d_pmat, pmat_bytes_cap));
     CUDA_CHECK(cudaMemset(D.d_pmat, 0, pmat_bytes_cap));
     CUDA_CHECK(cudaMemcpy(D.d_pmat, H.pmats.data(), pmat_bytes_cur, cudaMemcpyHostToDevice));
@@ -485,34 +505,24 @@ DeviceTree upload_to_gpu(
     CUDA_CHECK(cudaMemset(D.d_pmat_mid, 0, pmat_bytes_cap));
     CUDA_CHECK(cudaMemcpy(D.d_pmat_mid, H.pmats_mid.data(), pmat_bytes_cur, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&D.d_pmat_mid_prox, pmat_bytes_cap));
-    const double* pmat_mid_prox_src = !H.pmats_mid_prox.empty()
-        ? H.pmats_mid_prox.data()
-        : H.pmats_mid.data();
-    if (!pmat_mid_prox_src) {
-        throw std::runtime_error("pmats_mid_prox source is empty.");
-    }
     if (!H.pmats_mid_prox.empty() && H.pmats_mid_prox.size() != pmat_elems_cur) {
         throw std::runtime_error("pmats_mid_prox size mismatch.");
     }
+    const fp_t* pmat_mid_prox_src = H.pmats_mid_prox.empty() ? H.pmats_mid.data() : H.pmats_mid_prox.data();
     CUDA_CHECK(cudaMemset(D.d_pmat_mid_prox, 0, pmat_bytes_cap));
     CUDA_CHECK(cudaMemcpy(D.d_pmat_mid_prox, pmat_mid_prox_src, pmat_bytes_cur, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&D.d_pmat_mid_dist, pmat_bytes_cap));
-    const double* pmat_mid_dist_src = !H.pmats_mid_dist.empty()
-        ? H.pmats_mid_dist.data()
-        : H.pmats_mid.data();
-    if (!pmat_mid_dist_src) {
-        throw std::runtime_error("pmats_mid_dist source is empty.");
-    }
     if (!H.pmats_mid_dist.empty() && H.pmats_mid_dist.size() != pmat_elems_cur) {
         throw std::runtime_error("pmats_mid_dist size mismatch.");
     }
+    const fp_t* pmat_mid_dist_src = H.pmats_mid_dist.empty() ? H.pmats_mid.data() : H.pmats_mid_dist.data();
     CUDA_CHECK(cudaMemset(D.d_pmat_mid_dist, 0, pmat_bytes_cap));
     CUDA_CHECK(cudaMemcpy(D.d_pmat_mid_dist, pmat_mid_dist_src, pmat_bytes_cur, cudaMemcpyHostToDevice));
     // Allocate query PMAT buffer sized for up to ~2*N placement ops (edges).
     {
         const size_t per_query = (size_t)D.rate_cats * (size_t)D.states * (size_t)D.states;
         const size_t query_slots = (size_t)D.capacity_N * 2;
-        const size_t query_pmat_bytes = sizeof(double) * per_query * query_slots;
+        const size_t query_pmat_bytes = sizeof(fp_t) * per_query * query_slots;
         CUDA_CHECK(cudaMalloc(&D.d_query_pmat, query_pmat_bytes));
         CUDA_CHECK(cudaMemset(D.d_query_pmat, 0, query_pmat_bytes));
     }
@@ -526,7 +536,7 @@ DeviceTree upload_to_gpu(
         CUDA_CHECK(cudaMemcpy(D.d_query_chars, queries->query_chars.data(), sizeof(uint8_t) * qcount * sites, cudaMemcpyHostToDevice));
 
         const size_t query_clv_elems = qcap * (size_t)sites * (size_t)rate_cats * (size_t)states;
-        const size_t query_clv_bytes = sizeof(double) * query_clv_elems;
+        const size_t query_clv_bytes = sizeof(fp_t) * query_clv_elems;
         CUDA_CHECK(cudaMalloc(&D.d_query_clv, query_clv_bytes));
         CUDA_CHECK(cudaMemset(D.d_query_clv, 0, query_clv_bytes));
 

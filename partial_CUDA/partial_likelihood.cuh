@@ -7,7 +7,11 @@
 #include <cstddef>
 #include <cstdint>
 #include "../mlipper_util.h"
+#if defined(MLIPPER_USE_DOUBLE)
 #define SCALE_THRESHOLD_EXPONENT -64
+#else
+#define SCALE_THRESHOLD_EXPONENT -32
+#endif
 
 namespace partial_likelihood {
 

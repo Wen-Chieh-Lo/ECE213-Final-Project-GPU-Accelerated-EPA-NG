@@ -12,6 +12,7 @@
 #include <CLI/CLI.hpp>
 #include <libpll/pll.h>
 
+#include "precision.hpp"
 #include "tree.hpp"
 #include "tree_placement.cuh"
 #include "parse_file.hpp"
@@ -80,7 +81,7 @@ static void print_pmat_host_node_rc0(const HostPacking& H, int node_id, int stat
     if (H.pmats.size() < base + (size_t)states * (size_t)states) return;
 
     std::cout << "PMAT node " << node_id << " rc 0:\n";
-    const double* P = H.pmats.data() + base;
+    const fp_t* P = H.pmats.data() + base;
     for (int i = 0; i < states; ++i) {
         for (int j = 0; j < states; ++j) {
             std::cout << P[i * states + j];
@@ -337,6 +338,10 @@ int main(int argc, char** argv) {
     const std::string& query_alignment_cfg = inputs.config.files.query_alignment;
     std::vector<NewPlacementQuery> placement_queries =
         build_placement_query(resolve_path(config_base, query_alignment_cfg));
+    printf("Precision mode: %s\n", FP_MODE_NAME);
+#if !defined(MLIPPER_USE_DOUBLE)
+    printf("Warning: float precision path is still experimental.\n");
+#endif
     printf("Query sequences for placement: %zu\n", placement_queries.size());
     for(auto & q : placement_queries) {
         printf("  Query '%s'\n", q.msa_name.c_str());
