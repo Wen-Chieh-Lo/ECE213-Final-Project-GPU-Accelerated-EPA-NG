@@ -15,11 +15,11 @@
 #include "tree_generation/tree.hpp"
 
 // Branch length defaults to match epa-ng constants.
-__host__ __device__ constexpr double DEFAULT_BRANCH_LENGTH = 0.10536051565782628; // -log(0.9)
-__host__ __device__ constexpr double OPT_BRANCH_LEN_MIN = 1.0e-4; // PLLMOD_OPT_MIN_BRANCH_LEN
-__host__ __device__ constexpr double OPT_BRANCH_LEN_MAX = 100.0;  // PLLMOD_OPT_MAX_BRANCH_LEN
-__host__ __device__ constexpr double OPT_BRANCH_EPSILON = 1.0e-1;
-__host__ __device__ constexpr double OPT_BRANCH_XTOL = OPT_BRANCH_LEN_MIN / 10.0;
+constexpr double DEFAULT_BRANCH_LENGTH = 0.10536051565782628; // -log(0.9)
+constexpr double OPT_BRANCH_LEN_MIN = 1.0e-4; // PLLMOD_OPT_MIN_BRANCH_LEN
+constexpr double OPT_BRANCH_LEN_MAX = 100.0;  // PLLMOD_OPT_MAX_BRANCH_LEN
+constexpr double OPT_BRANCH_EPSILON = 1.0e-1;
+constexpr double OPT_BRANCH_XTOL = OPT_BRANCH_LEN_MIN / 10.0;
 
 // Basic tags describing the operation type and CLV buffer selection.
 enum NodeOpType : int {

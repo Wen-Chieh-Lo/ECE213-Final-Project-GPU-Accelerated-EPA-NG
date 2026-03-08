@@ -1,2 +1,2 @@
 ./MLIPPER --tree-alignment ./data/neotrop/reference.fasta --query-alignment ./data/neotrop/query_1k.fasta --tree ./data/neotrop/tree.newick --states 4 --subst-model GTR --ncat 4 --alpha 0.3 --pinv 0.0 --freqs 0.25,0.25,0.25,0.25 --rates 1.0,1.0,1.0,1.0,1.0,1.0 --rate-weights 0.25,0.25,0.25,0.25 --jplace-out ./output/result.jplace
-python3 ./scripts/compare_jplace.py   --truth ./output/epa_neotrop_1k/epa_result.jplace   --pred ./output/neotrop_1k_mlipper.jplace --truth-topk 5
+python3 ./scripts/compare_jplace.py   --truth ./output/epa_neotrop_1k/epa_result.jplace   --pred ./output/result.jplace --truth-topk 5

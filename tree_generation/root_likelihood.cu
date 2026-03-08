@@ -2,7 +2,6 @@
 #include <cuda_runtime.h>
 #include <cstddef>
 #include <cmath>
-#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 #include "tree.hpp"
@@ -11,8 +10,6 @@
 
 namespace root_likelihood {
 
-__device__ __constant__ int c_debug_combined_op;
-__device__ __constant__ int c_debug_combined_site;
 constexpr double kLn2 = 0.69314718055994530942;
 
 __device__ __forceinline__ unsigned int combined_scaler_shift_at(
@@ -320,16 +317,9 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
 
     double local_sum = 0.0;
     for (unsigned int site = threadIdx.x; site < D.sites; site += blockDim.x) {
-        const bool debug_exact_site =
-            (op_idx == c_debug_combined_op) && (c_debug_combined_site >= 0) && ((int)site == c_debug_combined_site);
-        const bool debug_all_sites =
-            (op_idx == c_debug_combined_op) && (c_debug_combined_site == -2);
         const double* query_clv = D.d_query_clv + (size_t)site * per_site;
         const double* distal_clv = D.d_clv_mid_base + (size_t)target_id * per_node + (size_t)site * per_site;
         const double* prox_clv = D.d_clv_up + (size_t)target_id * per_node + (size_t)site * per_site;
-        const double* mid_clv = D.d_clv_mid
-            ? (D.d_clv_mid + (size_t)target_id * per_node + (size_t)site * per_site)
-            : nullptr;
 
         double rate_vals[RATE_CATS];
         unsigned int rate_shifts[RATE_CATS];
@@ -384,36 +374,6 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
                 }
                 have_positive = true;
             }
-            if (debug_exact_site) {
-                const double4 mid = mid_clv
-                    ? reinterpret_cast<const double4*>(mid_clv + (size_t)rc * 4)[0]
-                    : make_double4(0.0, 0.0, 0.0, 0.0);
-                const double recon0 = acc_dist0 * acc_prox0;
-                const double recon1 = acc_dist1 * acc_prox1;
-                const double recon2 = acc_dist2 * acc_prox2;
-                const double recon3 = acc_dist3 * acc_prox3;
-                printf(
-                    "[combined-debug] op=%d target=%d site=%u rc=%d "
-                    "q=(%.3e %.3e %.3e %.3e) "
-                    "d=(%.3e %.3e %.3e %.3e) "
-                    "p=(%.3e %.3e %.3e %.3e) "
-                    "mid=(%.3e %.3e %.3e %.3e) "
-                    "recon=(%.3e %.3e %.3e %.3e) "
-                    "pend=(%.3e %.3e %.3e %.3e) "
-                    "dist=(%.3e %.3e %.3e %.3e) "
-                    "prox=(%.3e %.3e %.3e %.3e) "
-                    "v=(%.3e %.3e %.3e %.3e) val=%.3e dshift=%u pshift=%u tshift=%u\n",
-                    op_idx, target_id, site, rc,
-                    q.x, q.y, q.z, q.w,
-                    d.x, d.y, d.z, d.w,
-                    p.x, p.y, p.z, p.w,
-                    mid.x, mid.y, mid.z, mid.w,
-                    recon0, recon1, recon2, recon3,
-                    acc_pend0, acc_pend1, acc_pend2, acc_pend3,
-                    acc_dist0, acc_dist1, acc_dist2, acc_dist3,
-                    acc_prox0, acc_prox1, acc_prox2, acc_prox3,
-                    v0, v1, v2, v3, val, distal_shift, prox_shift, rate_shifts[rc]);
-            }
         }
         double site_lk = 0.0;
         #pragma unroll
@@ -427,11 +387,6 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
             }
         }
         const double eps = 1e-300;
-        if (debug_exact_site || debug_all_sites) {
-            printf("[combined-debug] op=%d target=%d site=%u site_lk=%.12e min_shift=%u log=%.12e\n",
-                   op_idx, target_id, site, site_lk, site_min_shift,
-                   log(site_lk > eps ? site_lk : eps) - (double)site_min_shift * kLn2);
-        }
         local_sum += log(site_lk > eps ? site_lk : eps) - (double)site_min_shift * kLn2;
     }
 
@@ -484,8 +439,6 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
 
     double local_sum = 0.0;
     for (unsigned int site = threadIdx.x; site < D.sites; site += blockDim.x) {
-        const bool debug_all_sites =
-            (op_idx == c_debug_combined_op) && (c_debug_combined_site == -2);
         const double* query_clv = D.d_query_clv + (size_t)site * per_site;
         const double* distal_clv = D.d_clv_mid_base + (size_t)target_id * per_node + (size_t)site * per_site;
         const double* prox_clv = D.d_clv_up + (size_t)target_id * per_node + (size_t)site * per_site;
@@ -546,11 +499,6 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
             }
         }
         const double eps = 1e-300;
-        if (debug_all_sites) {
-            printf("[combined-debug] op=%d target=%d site=%u site_lk=%.12e min_shift=%u log=%.12e\n",
-                   op_idx, target_id, site, site_lk, site_min_shift,
-                   log(site_lk > eps ? site_lk : eps) - (double)site_min_shift * kLn2);
-        }
         local_sum += log(site_lk > eps ? site_lk : eps) - (double)site_min_shift * kLn2;
     }
 
@@ -619,13 +567,6 @@ void compute_combined_loglik_per_op_device(
     if (!D.d_query_clv || !D.d_clv_mid_base || !D.d_clv_up || !D.d_rate_weights || !D.d_frequencies) {
         throw std::runtime_error("Placement buffers not initialized.");
     }
-
-    int debug_op = -1;
-    int debug_site = -1;
-    if (const char* raw = std::getenv("MLIPPER_DEBUG_COMBINED_OP")) debug_op = std::atoi(raw);
-    if (const char* raw = std::getenv("MLIPPER_DEBUG_COMBINED_SITE")) debug_site = std::atoi(raw);
-    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_debug_combined_op, &debug_op, sizeof(int), 0, cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyToSymbolAsync(c_debug_combined_site, &debug_site, sizeof(int), 0, cudaMemcpyHostToDevice, stream));
 
     const size_t per_query = (size_t)D.rate_cats * (size_t)D.states * (size_t)D.states;
     const size_t per_node_pmat = per_query;

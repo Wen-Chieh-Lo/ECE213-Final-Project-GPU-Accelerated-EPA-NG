@@ -135,17 +135,17 @@ namespace partial_likelihood {
 
 // Downward specializations for states=4 (ratecat-specific).
 template<int RATE_CATS>
-__device__ void compute_downward_inner_inner_ratecat(const DeviceTree& D, const NodeOpInfo& op, unsigned int site);
+__device__ __forceinline__ void compute_downward_inner_inner_ratecat(const DeviceTree& D, const NodeOpInfo& op, unsigned int site);
 
 template<int RATE_CATS>
-__device__ void compute_downward_inner_tip_ratecat(const DeviceTree& D, const NodeOpInfo& op, unsigned int site);
+__device__ __forceinline__ void compute_downward_inner_tip_ratecat(const DeviceTree& D, const NodeOpInfo& op, unsigned int site);
 
 template<int RATE_CATS>
-__device__ void compute_downward_tip_inner_ratecat(const DeviceTree& D, const NodeOpInfo& op, unsigned int site);
+__device__ __forceinline__ void compute_downward_tip_inner_ratecat(const DeviceTree& D, const NodeOpInfo& op, unsigned int site);
 
 // Midpoint helper (states=4) used by placement.
 template<int RATE_CATS>
-__device__ void compute_midpoint_inner_inner_ratecat(
+__device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
     const DeviceTree& D,
     const NodeOpInfo& op,
     unsigned int site,

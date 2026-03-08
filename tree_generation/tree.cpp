@@ -389,14 +389,8 @@ int main(int argc, char** argv) {
         res.tree,
         res.hostPack,
         res.eig,
-        res.queries,
         rate_multipliers,
-        &placement_queries,
         &placement_results,
-        &pi,
-        &rate_weights,
-        logL,
-        /*debug_mid=*/true,
         1,
         0);
 

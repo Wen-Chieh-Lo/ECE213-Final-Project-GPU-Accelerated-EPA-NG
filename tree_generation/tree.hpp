@@ -312,14 +312,8 @@ void UpdateTreeLogLikelihood_device(
     TreeBuildResult&       T,
     HostPacking&           H,
     const EigResult& er,
-    PlacementQueryBatch& Q,
     const std::vector<double>& rate_multipliers,
-    const std::vector<NewPlacementQuery>* queries = nullptr,
     std::vector<struct PlacementResult>* placement_results_out = nullptr,
-    const std::vector<double>* pi_debug = nullptr,
-    const std::vector<double>* rate_weights_debug = nullptr,
-    double baseline_loglik = 0.0,
-    bool debug_mid = false,
     int smoothing = 1,
     cudaStream_t           stream = 0);
 

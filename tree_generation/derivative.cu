@@ -130,48 +130,6 @@ void core_site_likelihood_derivatives_site(
     }
 }
 
-// Compute per-site log-likelihood for a given branch (diag table already built).
-static __device__ __forceinline__
-double core_site_loglikelihood(
-    const DeviceTree D,
-    const int*    __restrict__ invariant_site,
-    const double* __restrict__ invar_proportion,
-    double invar_scalar,
-    const double* __restrict__ sumtable,
-    const double* __restrict__ lambdas,
-    const double* __restrict__ pattern_weights,
-    size_t site)
-{
-    double site_lk0 = 0.0;
-    const int inv = invariant_site ? invariant_site[site] : -1;
-    const size_t site_stride = (size_t)D.rate_cats * (size_t)D.states;
-
-    for (int i = 0; i < D.rate_cats; ++i) {
-        const double* sum  = sumtable + site * site_stride + (size_t)i * D.states;
-        const double* diag = lambdas + ((size_t)i * D.states) * 4;
-        const double* t_freqs = D.d_frequencies;
-
-        double cat0 = 0.0;
-        for (int j = 0; j < D.states; ++j) {
-            cat0 += sum[j] * diag[0];
-            diag += 4;
-        }
-
-        const double pinv = invar_proportion ? invar_proportion[i] : invar_scalar;
-        if (pinv > 0.0) {
-            const double inv_site_lk = (inv < 0) ? 0.0 : (t_freqs[inv] * pinv);
-            const double non_pinv = (1.0 - pinv);
-            cat0 = cat0 * non_pinv + inv_site_lk;
-        }
-        const double w = D.d_rate_weights ? D.d_rate_weights[i] : 1.0;
-        site_lk0 += cat0 * w;
-    }
-
-    const double weight = pattern_weights ? pattern_weights[site] : 1.0;
-    const double eps = 1e-300;
-    return log(site_lk0 > eps ? site_lk0 : eps) * weight;
-}
-
 template<int RATE_CATS>
 __device__ void LikelihoodSumtableUpdateKernel(
         DeviceTree D,
@@ -229,12 +187,8 @@ __global__ void LikelihoodDerivativeKernel(
     const unsigned* right_scaler_base = D.d_site_scaler_mid
         ? (D.d_site_scaler_mid + (size_t)target_id * scaler_span)
         : nullptr;
-    const double* proximal_base = D.d_clv_up
-        ? D.d_clv_up + (size_t)target_id * clv_span
-        : nullptr;
 
     if (!left_base || !right_base) return;
-    (void)proximal_base;
 
     double* sumtable_op = sumtable ? sumtable + (size_t)op_global * sumtable_stride : nullptr;
     double* placement_clv = placement_clv_base
@@ -243,7 +197,6 @@ __global__ void LikelihoodDerivativeKernel(
 
     // Shared branch accumulator so all threads use the same value each iteration.
     __shared__ double branch_shared;
-    __shared__ double init_branch_shared;
     __shared__ int stop_updates;
     __shared__ double bracket_low_shared;
     __shared__ double bracket_high_shared;
@@ -264,7 +217,6 @@ __global__ void LikelihoodDerivativeKernel(
         if (init_branch < OPT_BRANCH_LEN_MIN) init_branch = OPT_BRANCH_LEN_MIN;
         if (init_branch > OPT_BRANCH_LEN_MAX) init_branch = OPT_BRANCH_LEN_MAX;
         branch_shared = init_branch;
-        init_branch_shared = init_branch;
         bracket_low_shared = OPT_BRANCH_LEN_MIN;
         
         if(proximal_mode){
