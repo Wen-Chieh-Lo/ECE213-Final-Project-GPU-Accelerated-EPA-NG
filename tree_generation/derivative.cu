@@ -41,8 +41,24 @@ __device__ void LikelihoodSumtableUpdateKernel(
     DeviceTree D,
     const double* __restrict__ left_clv_base,
     const double* __restrict__ right_clv_base,
+    const unsigned* __restrict__ left_scaler_base,
+    const unsigned* __restrict__ right_scaler_base,
     unsigned int site_idx,
     double *sumtable);
+
+static __device__ __forceinline__
+unsigned int scaler_shift_at_site(
+    const DeviceTree& D,
+    const unsigned* __restrict__ scaler_base,
+    unsigned int site_idx,
+    int rate_idx)
+{
+    if (!scaler_base) return 0u;
+    if (D.per_rate_scaling) {
+        return scaler_base[(size_t)site_idx * (size_t)D.rate_cats + (size_t)rate_idx];
+    }
+    return scaler_base[(size_t)site_idx];
+}
 
 static __device__ __forceinline__
 void core_site_likelihood_derivatives_site(
@@ -198,11 +214,20 @@ __global__ void LikelihoodDerivativeKernel(
     // Pendant mode: left=query, right=midpoint (parent_down * sibling_up).
     // Proximal mode: left=target up (clv_up), right=midpoint rebuilt with query/parent/child.
     const size_t clv_span = (size_t)D.sites * (size_t)D.rate_cats * (size_t)D.states;
+    const size_t scaler_span = D.per_rate_scaling
+        ? (D.sites * (size_t)D.rate_cats)
+        : D.sites;
     const double* left_base = proximal_mode
         ? (D.d_clv_up ? D.d_clv_up + (size_t)target_id * clv_span : nullptr)
         : D.d_query_clv;
     const double* right_base = D.d_clv_mid
         ? D.d_clv_mid + (size_t)target_id * clv_span
+        : nullptr;
+    const unsigned* left_scaler_base = proximal_mode
+        ? (D.d_site_scaler_up ? (D.d_site_scaler_up + (size_t)target_id * scaler_span) : nullptr)
+        : nullptr;
+    const unsigned* right_scaler_base = D.d_site_scaler_mid
+        ? (D.d_site_scaler_mid + (size_t)target_id * scaler_span)
         : nullptr;
     const double* proximal_base = D.d_clv_up
         ? D.d_clv_up + (size_t)target_id * clv_span
@@ -244,7 +269,9 @@ __global__ void LikelihoodDerivativeKernel(
         
         if(proximal_mode){
             dxmax_shared = (D.d_blen[target_id] - OPT_BRANCH_XTOL) / static_cast<double>(max_iter);
-            bracket_high_shared = 0.5 * D.d_blen[target_id] - OPT_BRANCH_LEN_MIN/10;
+            // Proximal split can slide across the full target edge; clamping to half
+            // the branch length prevents valid optima on the parent-side half.
+            bracket_high_shared = D.d_blen[target_id] - OPT_BRANCH_LEN_MIN/10;
         }
         else{
             dxmax_shared = OPT_BRANCH_LEN_MAX / static_cast<double>(max_iter);
@@ -269,11 +296,32 @@ __global__ void LikelihoodDerivativeKernel(
     for (size_t site = tid; site < D.sites; site += step) {
         const unsigned int site_idx = static_cast<unsigned int>(site);
         if (D.rate_cats == 1) {
-            LikelihoodSumtableUpdateKernel<1>(D, left_base, right_base, site_idx, sumtable_op);
+            LikelihoodSumtableUpdateKernel<1>(
+                D,
+                left_base,
+                right_base,
+                left_scaler_base,
+                right_scaler_base,
+                site_idx,
+                sumtable_op);
         } else if (D.rate_cats == 4) {
-            LikelihoodSumtableUpdateKernel<4>(D, left_base, right_base, site_idx, sumtable_op);
+            LikelihoodSumtableUpdateKernel<4>(
+                D,
+                left_base,
+                right_base,
+                left_scaler_base,
+                right_scaler_base,
+                site_idx,
+                sumtable_op);
         } else if (D.rate_cats == 8) {
-            LikelihoodSumtableUpdateKernel<8>(D, left_base, right_base, site_idx, sumtable_op);
+            LikelihoodSumtableUpdateKernel<8>(
+                D,
+                left_base,
+                right_base,
+                left_scaler_base,
+                right_scaler_base,
+                site_idx,
+                sumtable_op);
         }
     }
     __syncthreads();
@@ -393,6 +441,8 @@ __device__ void LikelihoodSumtableUpdateKernel(
         DeviceTree D,
         const double* __restrict__ left_clv_base,
         const double* __restrict__ right_clv_base,
+        const unsigned* __restrict__ left_scaler_base,
+        const unsigned* __restrict__ right_scaler_base,
         unsigned int site_idx,
         double *sumtable
     ){
@@ -406,6 +456,10 @@ __device__ void LikelihoodSumtableUpdateKernel(
         const double* left_clv  = left_clv_base  + site_off;
         const double* right_clv = right_clv_base + site_off;
         double* sumtable_ptr = sumtable + site_off;
+        unsigned int rate_shift[RATE_CATS];
+        bool rate_has_signal[RATE_CATS];
+        unsigned int site_min_shift = 0u;
+        bool have_signal = false;
 
         #pragma unroll
         for(int r = 0; r < RATE_CATS; ++r){
@@ -433,11 +487,38 @@ __device__ void LikelihoodSumtableUpdateKernel(
             sumtable_row[1] = l1 * r1;
             sumtable_row[2] = l2 * r2;
             sumtable_row[3] = l3 * r3;
+            const double row_max = fmax(
+                fmax(sumtable_row[0], sumtable_row[1]),
+                fmax(sumtable_row[2], sumtable_row[3]));
+            const unsigned int total_shift =
+                scaler_shift_at_site(D, left_scaler_base, site_idx, r) +
+                scaler_shift_at_site(D, right_scaler_base, site_idx, r);
+            rate_shift[r] = total_shift;
+            rate_has_signal[r] = (row_max > 0.0);
+            if (rate_has_signal[r]) {
+                if (!have_signal || total_shift < site_min_shift) {
+                    site_min_shift = total_shift;
+                }
+                have_signal = true;
+            }
+        }
 
+        if (!have_signal) return;
+
+        #pragma unroll
+        for (int r = 0; r < RATE_CATS; ++r) {
+            if (!rate_has_signal[r]) continue;
+            const int diff = (int)rate_shift[r] - (int)site_min_shift;
+            if (diff <= 0) continue;
+            double* sumtable_row = sumtable_ptr + (size_t)r * 4;
+            sumtable_row[0] = ldexp(sumtable_row[0], -diff);
+            sumtable_row[1] = ldexp(sumtable_row[1], -diff);
+            sumtable_row[2] = ldexp(sumtable_row[2], -diff);
+            sumtable_row[3] = ldexp(sumtable_row[3], -diff);
         }
     } 
 
 // Explicit instantiations for the common rate category counts.
-template __device__ void LikelihoodSumtableUpdateKernel<1>(DeviceTree, const double*, const double*, unsigned int, double*);
-template __device__ void LikelihoodSumtableUpdateKernel<4>(DeviceTree, const double*, const double*, unsigned int, double*);
-template __device__ void LikelihoodSumtableUpdateKernel<8>(DeviceTree, const double*, const double*, unsigned int, double*);
+template __device__ void LikelihoodSumtableUpdateKernel<1>(DeviceTree, const double*, const double*, const unsigned*, const unsigned*, unsigned int, double*);
+template __device__ void LikelihoodSumtableUpdateKernel<4>(DeviceTree, const double*, const double*, const unsigned*, const unsigned*, unsigned int, double*);
+template __device__ void LikelihoodSumtableUpdateKernel<8>(DeviceTree, const double*, const double*, const unsigned*, const unsigned*, unsigned int, double*);

@@ -42,7 +42,8 @@ PlacementResult PlacementEvaluationKernel(
     const NodeOpInfo* d_ops,
     int num_ops,
     int smoothing,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int debug_query_idx = -1);
 
 PlacementResult PlacementEvaluationKernelPreorderPruned(
     const DeviceTree& D,
@@ -54,6 +55,16 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
     int smoothing,
     const PlacementPruneConfig& prune_cfg,
     cudaStream_t stream,
-    int pseudo_root_id = -1);
+    int pseudo_root_id = -1,
+    int debug_query_idx = -1);
+
+int get_env_int_or(const char* name, int fallback);
+
+void dump_node_scaler_and_clv_snapshot(
+    const DeviceTree& D,
+    int node_id,
+    int max_sites,
+    cudaStream_t stream,
+    const char* tag);
 
 #endif // TREE_GENERATION_TREE_PLACEMENT_CUH

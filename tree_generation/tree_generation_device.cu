@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -70,6 +71,65 @@ static void rebuild_traversals(TreeBuildResult& T) {
                 if (n.left >= 0) st.emplace_back(n.left, false);
             }
         }
+    }
+}
+
+static inline int target_id_of_downward_op(const NodeOpInfo& op) {
+    const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
+    const bool target_is_right = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
+    return target_is_left ? op.left_id : (target_is_right ? op.right_id : op.parent_id);
+}
+
+static void print_edge_to_op_mapping_debug(
+    const TreeBuildResult& T,
+    const std::vector<NodeOpInfo>& ops_host,
+    int edge_num)
+{
+    if (edge_num < 0) return;
+
+    const JplaceTreeExport jplace_tree = build_jplace_tree_export(T);
+    int node_id = -1;
+    for (int nid = 0; nid < (int)jplace_tree.edge_num_by_node.size(); ++nid) {
+        if (jplace_tree.edge_num_by_node[(size_t)nid] == edge_num) {
+            node_id = nid;
+            break;
+        }
+    }
+
+    if (node_id < 0 || node_id >= (int)T.nodes.size()) {
+        std::fprintf(stderr, "[edge-debug] edge=%d not found in current tree\n", edge_num);
+        return;
+    }
+
+    const TreeNode& node = T.nodes[(size_t)node_id];
+    std::fprintf(stderr,
+        "[edge-debug] edge=%d node=%d parent=%d left=%d right=%d is_tip=%d blen=%.12f\n",
+        edge_num,
+        node_id,
+        node.parent,
+        node.left,
+        node.right,
+        node.is_tip ? 1 : 0,
+        node.branch_length_to_parent);
+
+    int matched = 0;
+    for (int op_idx = 0; op_idx < (int)ops_host.size(); ++op_idx) {
+        const NodeOpInfo& op = ops_host[(size_t)op_idx];
+        if (target_id_of_downward_op(op) != node_id) continue;
+        ++matched;
+        std::fprintf(stderr,
+            "[edge-debug] edge=%d op=%d parent=%d left=%d right=%d dir=%u type=%d\n",
+            edge_num,
+            op_idx,
+            op.parent_id,
+            op.left_id,
+            op.right_id,
+            static_cast<unsigned>(op.dir_tag),
+            op.op_type);
+    }
+
+    if (matched == 0) {
+        std::fprintf(stderr, "[edge-debug] edge=%d node=%d has no matching downward op\n", edge_num, node_id);
     }
 }
 
@@ -742,6 +802,7 @@ void UpdateTreeLogLikelihood_device(
     PlacementQueryBatch& Q,
     const std::vector<double>& rate_multipliers,
     const std::vector<NewPlacementQuery>* queries,
+    std::vector<PlacementResult>* placement_results_out,
     const std::vector<double>* pi_debug,
     const std::vector<double>* rate_weights_debug,
     double baseline_loglik,
@@ -1047,6 +1108,8 @@ DeviceTree upload_to_gpu(
     D.rate_cats = rate_cats;
     D.log2_stride = ceil_log2_u32((unsigned int)(D.states + 1));
     D.per_rate_scaling = per_rate_scaling;
+    D.force_generic_downward = (std::getenv("MLIPPER_FORCE_GENERIC_DOWNWARD") != nullptr);
+    D.force_generic_upward = (std::getenv("MLIPPER_FORCE_GENERIC_UPWARD") != nullptr);
     
     // --- alloc topology ---
     CUDA_CHECK(cudaMalloc(&D.d_lambdas, sizeof(double) * (size_t)D.rate_cats * D.states));
@@ -1212,9 +1275,15 @@ DeviceTree upload_to_gpu(
 
     }
     // --- scaler ---
-    const size_t scaler_len = per_rate_scaling ? (sites * (size_t)rate_cats) : sites;
-    // CUDA_CHECK(cudaMalloc(&D.d_site_scaler, sizeof(unsigned) * scaler_len));
-    // CUDA_CHECK(cudaMemset(D.d_site_scaler, 0, sizeof(unsigned) * scaler_len));
+    const size_t scaler_span = per_rate_scaling ? (sites * (size_t)rate_cats) : sites;
+    const size_t scaler_pool = (size_t)D.capacity_N * scaler_span;
+    CUDA_CHECK(cudaMalloc(&D.d_site_scaler_storage, sizeof(unsigned) * scaler_pool * 3));
+    CUDA_CHECK(cudaMemset(D.d_site_scaler_storage, 0, sizeof(unsigned) * scaler_pool * 3));
+    D.d_site_scaler_up = D.d_site_scaler_storage;
+    D.d_site_scaler_down = D.d_site_scaler_storage + scaler_pool;
+    D.d_site_scaler_mid = D.d_site_scaler_storage + scaler_pool * 2;
+    D.d_site_scaler_mid_base = D.d_site_scaler_down;
+    D.d_site_scaler = D.d_site_scaler_up;
 
     std::vector<unsigned int> tipmap(tipmap_size);
     for (unsigned int j = 0; j < tipmap_size; ++j) {
@@ -1244,7 +1313,7 @@ void free_device_tree(DeviceTree& D) {
     F(D.d_clv_mid);
     F(D.d_clv_mid_base);
     F(D.d_downward_scratch);
-    F(D.d_site_scaler);
+    F(D.d_site_scaler_storage);
     F(D.d_lambdas); F(D.d_V); F(D.d_Vinv); F(D.d_U); F(D.d_rate_weights); F(D.d_frequencies);
     F(D.d_pmat); F(D.d_pmat_mid); F(D.d_pmat_mid_prox); F(D.d_pmat_mid_dist);
     F(D.d_placement_clv);
@@ -1415,6 +1484,7 @@ void UpdateTreeLogLikelihood_device(
     PlacementQueryBatch&        Q,
     const std::vector<double>&  rate_multipliers,
     const std::vector<NewPlacementQuery>* queries,
+    std::vector<PlacementResult>* placement_results_out,
     const std::vector<double>*  pi_debug,
     const std::vector<double>*  rate_weights_debug,
     double                      baseline_loglik,
@@ -1631,7 +1701,27 @@ void UpdateTreeLogLikelihood_device(
     prune_cfg.enable_small_frontier_fallback = true;
     prune_cfg.small_frontier_threshold = 16;
 
-    for (int qi = 0; qi < D.placement_queries; ++qi) {
+    if (placement_results_out) {
+        placement_results_out->clear();
+        placement_results_out->reserve((size_t)D.placement_queries);
+    }
+
+    int max_debug_queries = D.placement_queries;
+    if (const char* env_max_queries = std::getenv("MLIPPER_MAX_QUERIES")) {
+        const int parsed = std::atoi(env_max_queries);
+        if (parsed > 0) {
+            max_debug_queries = std::min(D.placement_queries, parsed);
+        }
+    }
+    const int scaler_debug_query = get_env_int_or("MLIPPER_DEBUG_SCALER_QUERY", -1);
+    const int scaler_debug_sites = get_env_int_or("MLIPPER_DEBUG_SCALER_SITES", 4);
+    const int debug_edge_num = get_env_int_or("MLIPPER_DEBUG_EDGE_NUM", -1);
+
+    if (debug_edge_num >= 0) {
+        print_edge_to_op_mapping_debug(T, ops_host, debug_edge_num);
+    }
+
+    for (int qi = 0; qi < max_debug_queries; ++qi) {
         printf("Placing query %d \n", qi + 1);
 
         // At the start of each query, ensure d_ops corresponds to CURRENT tree's downward ops.
@@ -1650,7 +1740,7 @@ void UpdateTreeLogLikelihood_device(
 
 	        // d_ops/num_ops must be valid here
 	        // PlacementResult pres = PlacementEvaluationKernel(Dq, er, rate_multipliers, d_ops, num_ops, smoothing, stream);
-	        PlacementResult pres = PlacementEvaluationKernelPreorderPruned(
+        PlacementResult pres = PlacementEvaluationKernelPreorderPruned(
 	            Dq,
 	            T,
 	            er,
@@ -1660,10 +1750,24 @@ void UpdateTreeLogLikelihood_device(
 	            smoothing,
 	            prune_cfg,
 	            stream,
-	            T.root_id);
+	            T.root_id,
+                (qi < 10) ? qi : -1);
 
-        printf("Query %d -> insert in: %d (loglik=%.6f) pendant=%.6f proximal=%.6f\n",
-               qi, pres.target_id, pres.loglikelihood, pres.pendant_length, pres.proximal_length);
+        int best_edge_num = -1;
+        if (pres.target_id >= 0 && pres.target_id < (int)T.nodes.size()) {
+            const JplaceTreeExport jplace_tree = build_jplace_tree_export(T);
+            if (pres.target_id < (int)jplace_tree.edge_num_by_node.size()) {
+                best_edge_num = jplace_tree.edge_num_by_node[(size_t)pres.target_id];
+            }
+        }
+        printf("Query %d -> insert in: %d edge=%d (loglik=%.6f) pendant=%.6f proximal=%.6f\n",
+               qi, pres.target_id, best_edge_num, pres.loglikelihood, pres.pendant_length, pres.proximal_length);
+        if (qi == scaler_debug_query) {
+            dump_node_scaler_and_clv_snapshot(Dq, pres.target_id, scaler_debug_sites, stream, "best-target");
+        }
+        if (placement_results_out) {
+            placement_results_out->push_back(pres);
+        }
 
         // const std::string qname = (queries && qi < (int)queries->size())
         //     ? (*queries)[qi].msa_name

@@ -13,6 +13,54 @@ __device__ inline void scale_double_pow2(double &x, int shift) {
     x = __longlong_as_double(bits);
 }
 
+__device__ __forceinline__ unsigned int scaler_slot(
+    const DeviceTree& D,
+    unsigned int rate_idx)
+{
+    return D.per_rate_scaling ? rate_idx : 0u;
+}
+
+__device__ __forceinline__ unsigned int read_scaler_shift(
+    const DeviceTree& D,
+    const unsigned int* scaler,
+    unsigned int rate_idx)
+{
+    if (!scaler) return 0u;
+    return scaler[scaler_slot(D, rate_idx)];
+}
+
+__device__ __forceinline__ void write_scaler_shift(
+    const DeviceTree& D,
+    unsigned int* scaler,
+    unsigned int rate_idx,
+    unsigned int value)
+{
+    if (!scaler) return;
+    scaler[scaler_slot(D, rate_idx)] = value;
+}
+
+__device__ __forceinline__ unsigned int* scaler_ptr_for_pool(
+    const DeviceTree& D,
+    uint8_t clv_pool,
+    int node_id,
+    unsigned int site)
+{
+    if (clv_pool == static_cast<uint8_t>(CLV_POOL_DOWN)) {
+        return down_scaler_ptr(D, node_id, site);
+    }
+    return up_scaler_ptr(D, node_id, site);
+}
+
+__device__ __forceinline__ void add_scaler_shift(
+    const DeviceTree& D,
+    unsigned int* scaler,
+    unsigned int rate_idx,
+    unsigned int shift)
+{
+    if (!scaler || shift == 0) return;
+    scaler[scaler_slot(D, rate_idx)] += shift;
+}
+
 // ---- Downward per-case helpers (states arbitrary) ----
 __device__ __forceinline__ void compute_downward_inner_inner_generic(
     const DeviceTree& D,
@@ -43,9 +91,21 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
         ? (D.d_pmat_mid + (size_t)target_id * rate_cats * states * states)
         : target_mat;
     const double* sibling_mat = D.d_pmat + (size_t)sibling_id * rate_cats * states * states;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, rate_cats);
+    unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
+    unsigned int* sibling_scaler = up_scaler_ptr(D, sibling_id, site);
+    unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
+        const unsigned int down_inherited =
+            read_scaler_shift(D, parent_scaler, r) +
+            read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int mid_inherited =
+            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        write_scaler_shift(D, down_scaler, r, down_inherited);
+        write_scaler_shift(D, mid_scaler, r, mid_inherited);
+
         const double* Tmat = target_mat  + (size_t)r * states * states;
         const double* Thalf= target_mat_half + (size_t)r * states * states;
         const double* Smat = sibling_mat + (size_t)r * states * states;
@@ -94,17 +154,21 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
             }
         }
 
-        if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            const unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, down_scaler, r, shift);
+            add_scaler_shift(D, mid_scaler, r, shift);
+            for (unsigned int j = 0; j < states; ++j)
+                scale_double_pow2(Pout[j], shift);
+            if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                if (Pmid) {
-                    for (unsigned int j = 0; j < states; ++j)
-                        scale_double_pow2(Pmid[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                }
+                    scale_double_pow2(Pbase[j], shift);
+            }
+            if (Pmid) {
+                for (unsigned int j = 0; j < states; ++j)
+                    scale_double_pow2(Pmid[j], shift);
             }
         }
     }
@@ -136,11 +200,24 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
         ? (D.d_pmat_mid + (size_t)target_id * rate_cats * states * states)
         : target_mat;
     const double* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * rate_cats * states * states;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, rate_cats);
+    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
+    unsigned int* sibling_scaler = up_scaler_ptr(D, target_is_left ? op.right_id : op.left_id, site);
+    unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)sibling_tip_idx * D.sites;
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
+        const unsigned int down_inherited =
+            read_scaler_shift(D, parent_scaler, r) +
+            read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int mid_inherited =
+            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        write_scaler_shift(D, down_scaler, r, down_inherited);
+        write_scaler_shift(D, mid_scaler, r, mid_inherited);
+
         const unsigned int mask = D.d_tipmap[tipchars[site]];
         const double* Tmat = target_mat  + (size_t)r * states * states;
         const double* Thalf= target_mat_half + (size_t)r * states * states;
@@ -151,6 +228,7 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
         double*       Pmid = (target_up && D.d_clv_mid)
             ? (D.d_clv_mid + (size_t)target_id * per_node + site_off + (size_t)r * states)
             : nullptr;
+        double*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
 
         double sib_to_parent[64];
         for (unsigned int j = 0; j < states; ++j) {
@@ -172,11 +250,16 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
         }
 
         if (Pmid) {
+            if (Pbase) {
+                for (unsigned int j = 0; j < states; ++j) {
+                    Pbase[j] = Ppar[j] * sib_to_parent[j];
+                }
+            }
             for (unsigned int i = 0; i < states; ++i) {
                 const double* Throw = Thalf + i * states;
                 double par_acc = 0.0, tgt_acc = 0.0;
                 for (unsigned int j = 0; j < states; ++j) {
-                    const double pj = Ppar[j] * sib_to_parent[j];
+                    const double pj = Pbase ? Pbase[j] : (Ppar[j] * sib_to_parent[j]);
                     par_acc += Throw[j] * pj;
                     tgt_acc += Throw[j] * Pup[j];
                 }
@@ -184,17 +267,21 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
             }
         }
 
-        if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            const unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, down_scaler, r, shift);
+            add_scaler_shift(D, mid_scaler, r, shift);
+            for (unsigned int j = 0; j < states; ++j)
+                scale_double_pow2(Pout[j], shift);
+            if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                if (Pmid) {
-                    for (unsigned int j = 0; j < states; ++j)
-                        scale_double_pow2(Pmid[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                }
+                    scale_double_pow2(Pbase[j], shift);
+            }
+            if (Pmid) {
+                for (unsigned int j = 0; j < states; ++j)
+                    scale_double_pow2(Pmid[j], shift);
             }
         }
     }
@@ -227,10 +314,24 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
         ? (D.d_pmat_mid + (size_t)target_id * rate_cats * states * states)
         : target_mat;
     const double* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * rate_cats * states * states;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, rate_cats);
+    double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
+    double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
+    unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
+    unsigned int* sibling_scaler = up_scaler_ptr(D, target_is_left ? op.right_id : op.left_id, site);
+    unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
     const unsigned char* tipchars = D.d_tipchars + (size_t)sibling_tip_idx * D.sites;
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
+        const unsigned int down_inherited =
+            read_scaler_shift(D, parent_scaler, r) +
+            read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int mid_inherited =
+            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        write_scaler_shift(D, down_scaler, r, down_inherited);
+        write_scaler_shift(D, mid_scaler, r, mid_inherited);
+
         const unsigned int mask = D.d_tipmap[tipchars[site]];
         const double* Tmat = target_mat  + (size_t)r * states * states;
         const double* Thalf= target_mat_half + (size_t)r * states * states;
@@ -238,9 +339,8 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
         const double* Ppar = parent_down + (size_t)r * states;
         const double* Pup  = target_up ? (target_up + (size_t)r * states) : nullptr;
         double*       Pout = target_down + (size_t)r * states;
-        double*       Pmid = (target_up && D.d_clv_mid)
-            ? (D.d_clv_mid + (size_t)target_id * per_node + site_off + (size_t)r * states)
-            : nullptr;
+        double*       Pmid = (target_up && target_mid) ? (target_mid + (size_t)r * states) : nullptr;
+        double*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
 
         double sib_to_parent[64];
         for (unsigned int j = 0; j < states; ++j) {
@@ -262,11 +362,16 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
         }
 
         if (Pmid) {
+            if (Pbase) {
+                for (unsigned int j = 0; j < states; ++j) {
+                    Pbase[j] = Ppar[j] * sib_to_parent[j];
+                }
+            }
             for (unsigned int i = 0; i < states; ++i) {
                 const double* Throw = Thalf + i * states;
                 double par_acc = 0.0, tgt_acc = 0.0;
                 for (unsigned int j = 0; j < states; ++j) {
-                    const double pj = (mask & (1u << j)) ? (Ppar[j] * sib_to_parent[j]) : 0.0;
+                    const double pj = Pbase ? Pbase[j] : (Ppar[j] * sib_to_parent[j]);
                     par_acc += Throw[j] * pj;
                     tgt_acc += Throw[j] * Pup[j];
                 }
@@ -274,17 +379,21 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
             }
         }
 
-        if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            const unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, down_scaler, r, shift);
+            add_scaler_shift(D, mid_scaler, r, shift);
+            for (unsigned int j = 0; j < states; ++j)
+                scale_double_pow2(Pout[j], shift);
+            if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                if (Pmid) {
-                    for (unsigned int j = 0; j < states; ++j)
-                        scale_double_pow2(Pmid[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                }
+                    scale_double_pow2(Pbase[j], shift);
+            }
+            if (Pmid) {
+                for (unsigned int j = 0; j < states; ++j)
+                    scale_double_pow2(Pmid[j], shift);
             }
         }
     }
@@ -317,12 +426,31 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
         ? (D.d_pmat_mid + (size_t)(target_is_left ? op.left_id : op.right_id) * rate_cats * states * states)
         : target_mat;
     const double* sibling_mat = D.d_pmat + (size_t)sibling_id * rate_cats * states * states;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, rate_cats);
+    double*       target_mid  = D.d_clv_mid
+        ? (D.d_clv_mid + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off)
+        : nullptr;
+    double*       mid_base    = D.d_clv_mid_base
+        ? (D.d_clv_mid_base + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off)
+        : nullptr;
+    const int target_id       = target_is_left ? op.left_id : op.right_id;
+    unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
+    unsigned int* sibling_scaler = up_scaler_ptr(D, sibling_id, site);
+    unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)target_tip_idx * D.sites;
     const unsigned int tmask = D.d_tipmap[tipchars[site]];
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
+        const unsigned int down_inherited =
+            read_scaler_shift(D, parent_scaler, r) +
+            read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int mid_inherited =
+            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        write_scaler_shift(D, down_scaler, r, down_inherited);
+        write_scaler_shift(D, mid_scaler, r, mid_inherited);
+
         const double* Tmat = target_mat  + (size_t)r * states * states;
         const double* Thalf= target_mat_half + (size_t)r * states * states;
         const double* Smat = sibling_mat + (size_t)r * states * states;
@@ -330,9 +458,8 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
         const double* Psib = sibling_up  + (size_t)r * states;
         const double* Pup  = target_up ? (target_up + (size_t)r * states) : nullptr;
         double*       Pout = target_down + (size_t)r * states;
-        double*       Pmid = (target_up && D.d_clv_mid)
-            ? (D.d_clv_mid + (size_t)(target_is_left ? op.left_id : op.right_id) * per_node + site_off + (size_t)r * states)
-            : nullptr;
+        double*       Pmid = (target_up && target_mid) ? (target_mid + (size_t)r * states) : nullptr;
+        double*       Pbase = mid_base ? (mid_base + (size_t)r * states) : nullptr;
 
         double sib_to_parent[64];
         for (unsigned int j = 0; j < states; ++j) {
@@ -353,11 +480,16 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
         }
 
         if (Pmid) {
+            if (Pbase) {
+                for (unsigned int j = 0; j < states; ++j) {
+                    Pbase[j] = Ppar[j] * sib_to_parent[j];
+                }
+            }
             for (unsigned int i = 0; i < states; ++i) {
                 const double* Throw = Thalf + i * states;
                 double par_acc = 0.0, tgt_acc = 0.0;
                 for (unsigned int j = 0; j < states; ++j) {
-                    const double pj = Ppar[j] * sib_to_parent[j];
+                    const double pj = Pbase ? Pbase[j] : (Ppar[j] * sib_to_parent[j]);
                     par_acc += Throw[j] * pj;
                     tgt_acc += Throw[j] * Pup[j];
                 }
@@ -365,17 +497,21 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
             }
         }
 
-        if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            const unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, down_scaler, r, shift);
+            add_scaler_shift(D, mid_scaler, r, shift);
+            for (unsigned int j = 0; j < states; ++j)
+                scale_double_pow2(Pout[j], shift);
+            if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                if (Pmid) {
-                    for (unsigned int j = 0; j < states; ++j)
-                        scale_double_pow2(Pmid[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                }
+                    scale_double_pow2(Pbase[j], shift);
+            }
+            if (Pmid) {
+                for (unsigned int j = 0; j < states; ++j)
+                    scale_double_pow2(Pmid[j], shift);
             }
         }
     }
@@ -405,17 +541,29 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
     double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
     double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
     const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
-    if (!parent_down || !target_down || !sibling_up) return;
+    if (!parent_down || !target_down || !sibling_up || !target_up) return;
 
     const double* target_mat  = D.d_pmat + (size_t)target_id  * (size_t)RATE_CATS * 16;
     const double* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16)
         : target_mat;
     const double* sibling_mat = D.d_pmat + (size_t)sibling_id * (size_t)RATE_CATS * 16;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, (unsigned int)RATE_CATS);
+    unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
+    unsigned int* sibling_scaler = up_scaler_ptr(D, sibling_id, site);
+    unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
+        const unsigned int down_inherited =
+            read_scaler_shift(D, parent_scaler, r) +
+            read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int mid_inherited =
+            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        write_scaler_shift(D, down_scaler, r, down_inherited);
+        write_scaler_shift(D, mid_scaler, r, mid_inherited);
+
         const double* Tmat = target_mat  + (size_t)r * 16;
         const double* Thalf= target_mat_half + (size_t)r * 16;
         const double* Smat = sibling_mat + (size_t)r * 16;
@@ -438,7 +586,6 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
         Pout[2] = Tmat[2] * p0 + Tmat[6] * p1 + Tmat[10] * p2 + Tmat[14] * p3;
         Pout[3] = Tmat[3] * p0 + Tmat[7] * p1 + Tmat[11] * p2 + Tmat[15] * p3;
-
         if (mid_base) {
             double* Pbase = mid_base + (size_t)r * 4;
             Pbase[0] = p0;
@@ -449,37 +596,46 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
 
         if (target_mid) {
             double* Pmid = target_mid + (size_t)r * 4;
-            // // half-branch for parent_down (already includes sibling) and half-branch for target_up, then elementwise multiply.
-            // const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
-            // const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
-            // const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
-            // const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
+            const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
+            const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
+            const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
+            const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
 
-            // const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
-            // const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
-            // const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
-            // const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
+            const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
+            const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
+            const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
+            const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
 
-            // Pmid[0] = par0 * tgt0;
-            // Pmid[1] = par1 * tgt1;
-            // Pmid[2] = par2 * tgt2;
-            // Pmid[3] = par3 * tgt3;
-
-            Pmid[0] = p0;
-            Pmid[1] = p1;
-            Pmid[2] = p2;
-            Pmid[3] = p3;
+            Pmid[0] = par0 * tgt0;
+            Pmid[1] = par1 * tgt1;
+            Pmid[2] = par2 * tgt2;
+            Pmid[3] = par3 * tgt3;
         }
 
         double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
-        if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, down_scaler, r, shift);
+            add_scaler_shift(D, mid_scaler, r, shift);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                scale_double_pow2(Pout[j], shift);
+            }
+            if (mid_base) {
+                double* Pbase = mid_base + (size_t)r * 4;
                 #pragma unroll
-                for (int j = 0; j < 4; ++j)
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                for (int j = 0; j < 4; ++j) {
+                    scale_double_pow2(Pbase[j], shift);
+                }
+            }
+            if (target_mid) {
+                double* Pmid = target_mid + (size_t)r * 4;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    scale_double_pow2(Pmid[j], shift);
+                }
             }
         }
     }
@@ -505,19 +661,31 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
     double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
     double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
     const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
-    if (!parent_down || !target_down) return;
+    if (!parent_down || !target_down || !target_up) return;
 
     const double* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
     const double* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16)
         : target_mat;
     const double* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * (size_t)RATE_CATS * 16;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, (unsigned int)RATE_CATS);
+    unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
+    unsigned int* sibling_scaler = up_scaler_ptr(D, target_is_left ? op.right_id : op.left_id, site);
+    unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)sibling_tip_idx * D.sites;
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
+        const unsigned int down_inherited =
+            read_scaler_shift(D, parent_scaler, r) +
+            read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int mid_inherited =
+            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        write_scaler_shift(D, down_scaler, r, down_inherited);
+        write_scaler_shift(D, mid_scaler, r, mid_inherited);
+
         const unsigned int mask = D.d_tipmap[tipchars[site]];
         const double* Tmat = target_mat  + (size_t)r * 16;
         const double* Thalf= target_mat_half + (size_t)r * 16;
@@ -540,7 +708,6 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
         Pout[2] = Tmat[2] * p0 + Tmat[6] * p1 + Tmat[10] * p2 + Tmat[14] * p3;
         Pout[3] = Tmat[3] * p0 + Tmat[7] * p1 + Tmat[11] * p2 + Tmat[15] * p3;
-
         if (mid_base) {
             double* Pbase = mid_base + (size_t)r * 4;
             Pbase[0] = p0;
@@ -551,41 +718,45 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
 
         if (target_mid) {
             double* Pmid = target_mid + (size_t)r * 4;
-            // half-branch parent_down (includes sibling) and half-branch target_up, then elementwise product.
-            // const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
-            // const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
-            // const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
-            // const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
+            const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
+            const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
+            const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
+            const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
 
-            // const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
-            // const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
-            // const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
-            // const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
+            const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
+            const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
+            const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
+            const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
 
-            // Pmid[0] = par0 * tgt0;
-            // Pmid[1] = par1 * tgt1;
-            // Pmid[2] = par2 * tgt2;
-            // Pmid[3] = par3 * tgt3;
-
-            Pmid[0] = p0;
-            Pmid[1] = p1;
-            Pmid[2] = p2;
-            Pmid[3] = p3;
+            Pmid[0] = par0 * tgt0;
+            Pmid[1] = par1 * tgt1;
+            Pmid[2] = par2 * tgt2;
+            Pmid[3] = par3 * tgt3;
         }
 
         double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
-        if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, down_scaler, r, shift);
+            add_scaler_shift(D, mid_scaler, r, shift);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                scale_double_pow2(Pout[j], shift);
+            }
+            if (mid_base) {
+                double* Pbase = mid_base + (size_t)r * 4;
                 #pragma unroll
-                for (int j = 0; j < 4; ++j)
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                if (target_mid) {
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++j)
-                        scale_double_pow2(target_mid[(size_t)r * 4 + j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                for (int j = 0; j < 4; ++j) {
+                    scale_double_pow2(Pbase[j], shift);
+                }
+            }
+            if (target_mid) {
+                double* Pmid = target_mid + (size_t)r * 4;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    scale_double_pow2(Pmid[j], shift);
                 }
             }
         }
@@ -614,20 +785,32 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
     double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
     double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
     const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
-    if (!parent_down || !target_down || !sibling_up) return;
+    if (!parent_down || !target_down || !sibling_up || !target_up) return;
 
     const double* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
     const double* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16)
         : target_mat;
     const double* sibling_mat = D.d_pmat + (size_t)sibling_id * (size_t)RATE_CATS * 16;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, (unsigned int)RATE_CATS);
+    unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
+    unsigned int* sibling_scaler = up_scaler_ptr(D, sibling_id, site);
+    unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)target_tip_idx * D.sites;
     const unsigned int tmask = D.d_tipmap[tipchars[site]];
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
+        const unsigned int down_inherited =
+            read_scaler_shift(D, parent_scaler, r) +
+            read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int mid_inherited =
+            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        write_scaler_shift(D, down_scaler, r, down_inherited);
+        write_scaler_shift(D, mid_scaler, r, mid_inherited);
+
         const double* Tmat  = target_mat  + (size_t)r * 16;
         const double* Thalf = target_mat_half + (size_t)r * 16;
         const double* Smat  = sibling_mat + (size_t)r * 16;
@@ -651,6 +834,10 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
         Pout[2] = Tmat[2] * p0 + Tmat[6] * p1 + Tmat[10] * p2 + Tmat[14] * p3;
         Pout[3] = Tmat[3] * p0 + Tmat[7] * p1 + Tmat[11] * p2 + Tmat[15] * p3;
+        if (!(tmask & 1u)) Pout[0] = 0.0;
+        if (!(tmask & 2u)) Pout[1] = 0.0;
+        if (!(tmask & 4u)) Pout[2] = 0.0;
+        if (!(tmask & 8u)) Pout[3] = 0.0;
 
         if (mid_base) {
             double* Pbase = mid_base + (size_t)r * 4;
@@ -662,40 +849,49 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
 
         if (target_mid) {
             double* Pmid = target_mid + (size_t)r * 4;
-            // Half-branch parent_down (with sibling) and half-branch target_up, then mask and multiply.
-            // const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
-            // const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
-            // const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
-            // const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
+            const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
+            const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
+            const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
+            const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
 
-            // const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
-            // const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
-            // const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
-            // const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
+            const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
+            const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
+            const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
+            const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
 
-            // Pmid[0] = par0 * tgt0;
-            // Pmid[1] = par1 * tgt1;
-            // Pmid[2] = par2 * tgt2;
-            // Pmid[3] = par3 * tgt3;
-            Pmid[0] = p0;
-            Pmid[1] = p1;
-            Pmid[2] = p2;
-            Pmid[3] = p3;
+            Pmid[0] = par0 * tgt0;
+            Pmid[1] = par1 * tgt1;
+            Pmid[2] = par2 * tgt2;
+            Pmid[3] = par3 * tgt3;
+            if (!(tmask & 1u)) Pmid[0] = 0.0;
+            if (!(tmask & 2u)) Pmid[1] = 0.0;
+            if (!(tmask & 4u)) Pmid[2] = 0.0;
+            if (!(tmask & 8u)) Pmid[3] = 0.0;
         }
 
         double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
-        if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, down_scaler, r, shift);
+            add_scaler_shift(D, mid_scaler, r, shift);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                scale_double_pow2(Pout[j], shift);
+            }
+            if (mid_base) {
+                double* Pbase = mid_base + (size_t)r * 4;
                 #pragma unroll
-                for (int j = 0; j < 4; ++j)
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                if (target_mid) {
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++j)
-                        scale_double_pow2(target_mid[(size_t)r * 4 + j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                for (int j = 0; j < 4; ++j) {
+                    scale_double_pow2(Pbase[j], shift);
+                }
+            }
+            if (target_mid) {
+                double* Pmid = target_mid + (size_t)r * 4;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    scale_double_pow2(Pmid[j], shift);
                 }
             }
         }
@@ -724,19 +920,31 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
     double*       target_mid  = D.d_clv_mid ? (D.d_clv_mid + (size_t)target_id * per_node + site_off) : nullptr;
     double*       mid_base    = D.d_clv_mid_base ? (D.d_clv_mid_base + (size_t)target_id * per_node + site_off) : nullptr;
     const double* target_up   = D.d_clv_up   + (size_t)target_id * per_node + site_off;
-    if (!parent_down || !target_down) return;
+    if (!parent_down || !target_down || !target_up) return;
 
     const double* target_mat  = D.d_pmat + (size_t)target_id * (size_t)RATE_CATS * 16;
     const double* target_mat_half = D.d_pmat_mid
         ? (D.d_pmat_mid + (size_t)target_id * (size_t)RATE_CATS * 16)
         : target_mat;
     const double* sibling_mat = D.d_pmat + (size_t)(target_is_left ? op.right_id : op.left_id) * (size_t)RATE_CATS * 16;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, (unsigned int)RATE_CATS);
+    unsigned int* parent_scaler = down_scaler_ptr(D, op.parent_id, site);
+    unsigned int* sibling_scaler = up_scaler_ptr(D, target_is_left ? op.right_id : op.left_id, site);
+    unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)sibling_tip_idx * D.sites;
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
+        const unsigned int down_inherited =
+            read_scaler_shift(D, parent_scaler, r) +
+            read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int mid_inherited =
+            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        write_scaler_shift(D, down_scaler, r, down_inherited);
+        write_scaler_shift(D, mid_scaler, r, mid_inherited);
+
         const unsigned int mask = D.d_tipmap[tipchars[site]];
         const double* Tmat  = target_mat  + (size_t)r * 16;
         const double* Thalf = target_mat_half + (size_t)r * 16;
@@ -770,38 +978,45 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
 
         if (target_mid) {
             double* Pmid = target_mid + (size_t)r * 4;
-            // const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
-            // const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
-            // const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
-            // const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
+            const double par0 = Thalf[0] * p0 + Thalf[4] * p1 + Thalf[8]  * p2 + Thalf[12] * p3;
+            const double par1 = Thalf[1] * p0 + Thalf[5] * p1 + Thalf[9]  * p2 + Thalf[13] * p3;
+            const double par2 = Thalf[2] * p0 + Thalf[6] * p1 + Thalf[10] * p2 + Thalf[14] * p3;
+            const double par3 = Thalf[3] * p0 + Thalf[7] * p1 + Thalf[11] * p2 + Thalf[15] * p3;
 
-            // const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
-            // const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
-            // const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
-            // const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
-            Pmid[0] = p0;
-            Pmid[1] = p1;
-            Pmid[2] = p2;
-            Pmid[3] = p3;
-            // Pmid[0] = par0 * tgt0;
-            // Pmid[1] = par1 * tgt1;
-            // Pmid[2] = par2 * tgt2;
-            // Pmid[3] = par3 * tgt3;
+            const double tgt0 = Thalf[0]*Pup.x + Thalf[4]*Pup.y + Thalf[8]*Pup.z  + Thalf[12]*Pup.w;
+            const double tgt1 = Thalf[1]*Pup.x + Thalf[5]*Pup.y + Thalf[9]*Pup.z  + Thalf[13]*Pup.w;
+            const double tgt2 = Thalf[2]*Pup.x + Thalf[6]*Pup.y + Thalf[10]*Pup.z + Thalf[14]*Pup.w;
+            const double tgt3 = Thalf[3]*Pup.x + Thalf[7]*Pup.y + Thalf[11]*Pup.z + Thalf[15]*Pup.w;
+
+            Pmid[0] = par0 * tgt0;
+            Pmid[1] = par1 * tgt1;
+            Pmid[2] = par2 * tgt2;
+            Pmid[3] = par3 * tgt3;
         }
 
-        if (site_scaler_ptr) {
-            double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        double col_scale_max_val = fmax(fmax(Pout[0], Pout[1]), fmax(Pout[2], Pout[3]));
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, down_scaler, r, shift);
+            add_scaler_shift(D, mid_scaler, r, shift);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                scale_double_pow2(Pout[j], shift);
+            }
+            if (mid_base) {
+                double* Pbase = mid_base + (size_t)r * 4;
                 #pragma unroll
-                for (int j = 0; j < 4; ++j)
-                    scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
-                if (target_mid) {
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++j)
-                        scale_double_pow2(target_mid[(size_t)r * 4 + j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                for (int j = 0; j < 4; ++j) {
+                    scale_double_pow2(Pbase[j], shift);
+                }
+            }
+            if (target_mid) {
+                double* Pmid = target_mid + (size_t)r * 4;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    scale_double_pow2(Pmid[j], shift);
                 }
             }
         }
@@ -861,6 +1076,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
+        write_scaler_shift(D, site_scaler_ptr, r, 0u);
         const double* Lmat = Lbase + (size_t)r * 16;
         const double* Rmat = Rbase + (size_t)r * 16;
         double* pout = parent_pool + parent_off + (size_t)r * 4;
@@ -891,7 +1107,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
             frexp(maxv, &expv);
             if (expv < SCALE_THRESHOLD_EXPONENT) {
                 unsigned int shift = SCALE_THRESHOLD_EXPONENT - expv;
-                site_scaler_ptr[r] += shift;
+                add_scaler_shift(D, site_scaler_ptr, r, shift);
 
                 #pragma unroll
                 for (int s = 0; s < 4; ++s) {
@@ -963,6 +1179,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
+        write_scaler_shift(D, site_scaler_ptr, r, 0u);
         const double* __restrict__ jmat = jmat_base + (size_t)r * 4 * 4;
         const double* __restrict__ kmat = kmat_base + (size_t)r * 4 * 4;
         double* __restrict__ Pout = dst + (size_t)r * 4;
@@ -1001,7 +1218,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
             frexp(maxv, &expv);
             if (expv < SCALE_THRESHOLD_EXPONENT) {
                 unsigned int shift = SCALE_THRESHOLD_EXPONENT - expv;
-                site_scaler_ptr[r] += shift;
+                add_scaler_shift(D, site_scaler_ptr, r, shift);
 
                 #pragma unroll
                 for (int s = 0; s < 4; ++s)
@@ -1067,6 +1284,7 @@ __device__ __forceinline__ void compute_tip_tip_site_4_generic(
         site_scaler_ptr_base(D, op, site, (unsigned int)D.rate_cats);
 
     for (int r = 0; r < D.rate_cats; ++r) {
+        write_scaler_shift(D, site_scaler_ptr, r, 0u);
         const double* __restrict__ jmat = jmat_base + (size_t)r * 4 * 4;
         const double* __restrict__ kmat = kmat_base + (size_t)r * 4 * 4;
         double* __restrict__ Pout = dst + (size_t)r * 4;
@@ -1231,8 +1449,11 @@ __device__ __forceinline__ void compute_tip_inner_site_ratecat(
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, RATE_CATS);
+    unsigned int* inner_scaler =
+        scaler_ptr_for_pool(D, op.clv_pool, inner_id, site);
 
     for (int r = 0; r < RATE_CATS; ++r) {
+        write_scaler_shift(D, site_scaler_ptr, r, read_scaler_shift(D, inner_scaler, r));
         const double* Lmat = d_Lmat + (size_t)r * 4 * 4;
         const double* Rmat = d_Rmat + (size_t)r * 4 * 4;
         const double* Rclv = d_right_clv + site_off + (size_t)r * 4;
@@ -1265,7 +1486,7 @@ __device__ __forceinline__ void compute_tip_inner_site_ratecat(
             int scaling_exponent;
             frexp(col_scale_max_val, &scaling_exponent);
             if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+                add_scaler_shift(D, site_scaler_ptr, r, SCALE_THRESHOLD_EXPONENT - scaling_exponent);
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     scale_double_pow2(Pout[i], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
@@ -1314,8 +1535,11 @@ __device__ __forceinline__ void compute_tip_inner_site_generic(
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, rate_cats);
+    unsigned int* inner_scaler =
+        scaler_ptr_for_pool(D, op.clv_pool, inner_id, site);
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
+        write_scaler_shift(D, site_scaler_ptr, r, read_scaler_shift(D, inner_scaler, r));
         double col_scale_max_val = 0.0;
         int scaling_exponent;
         const double* Lmat = d_Lmat + (size_t)r * states * states;
@@ -1370,8 +1594,18 @@ __device__ __forceinline__ void compute_inner_inner_site_ratecat(
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, RATE_CATS);
+    unsigned int* left_scaler =
+        scaler_ptr_for_pool(D, op.clv_pool, op.left_id, site);
+    unsigned int* right_scaler =
+        scaler_ptr_for_pool(D, op.clv_pool, op.right_id, site);
 
     for (int r = 0; r < RATE_CATS; ++r) {
+        write_scaler_shift(
+            D,
+            site_scaler_ptr,
+            r,
+            read_scaler_shift(D, left_scaler, r) +
+            read_scaler_shift(D, right_scaler, r));
         const double* Lclv = d_left_clv  + site_off + (size_t)r * 4;
         const double* Rclv = d_right_clv + site_off + (size_t)r * 4;
 
@@ -1413,7 +1647,7 @@ __device__ __forceinline__ void compute_inner_inner_site_ratecat(
             int scaling_exponent;
             frexp(col_scale_max_val, &scaling_exponent);
             if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+                add_scaler_shift(D, site_scaler_ptr, r, SCALE_THRESHOLD_EXPONENT - scaling_exponent);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     scale_double_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
@@ -1480,10 +1714,18 @@ __device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
         // Avoid using full-length pmats on parent side in proximal mode.
         parent_mat = nullptr;
     }
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, RATE_CATS);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* target_up_scaler = proximal_mode ? nullptr : up_scaler_ptr(D, target_id, site);
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
+        unsigned int inherited_shift = read_scaler_shift(D, down_scaler, r);
+        if (target_up_scaler) {
+            inherited_shift += read_scaler_shift(D, target_up_scaler, r);
+        }
+        write_scaler_shift(D, mid_scaler, r, inherited_shift);
+
         const double* Mtarget = target_mat + (size_t)r * 16;
         const double* Mparent = parent_mat + (size_t)r * 16;
         const double4 Pup   = reinterpret_cast<const double4*>(target_up   + (size_t)r * 4)[0];
@@ -1512,18 +1754,16 @@ __device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
         Pmid[2] = par2 * tgt2;
         Pmid[3] = par3 * tgt3;
         
-        if (site_scaler_ptr) {
-            double col_scale_max_val = fmax(fmax(Pmid[0], Pmid[1]), fmax(Pmid[2], Pmid[3]));
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-                site_scaler_ptr[r] += shift;
-                Pmid[0] = ldexp(Pmid[0], shift);
-                Pmid[1] = ldexp(Pmid[1], shift);
-                Pmid[2] = ldexp(Pmid[2], shift);
-                Pmid[3] = ldexp(Pmid[3], shift);
-            }
+        double col_scale_max_val = fmax(fmax(Pmid[0], Pmid[1]), fmax(Pmid[2], Pmid[3]));
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, mid_scaler, r, shift);
+            Pmid[0] = ldexp(Pmid[0], shift);
+            Pmid[1] = ldexp(Pmid[1], shift);
+            Pmid[2] = ldexp(Pmid[2], shift);
+            Pmid[3] = ldexp(Pmid[3], shift);
         }
 
     }
@@ -1571,7 +1811,7 @@ __device__ __forceinline__ void combine_query_midpoint_ratecat(
     double*       target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
     const double* query_clv  = D.d_query_clv + site_off;
     const double* query_mat  = D.d_query_pmat + (size_t)op_idx * per_query;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, (unsigned int)RATE_CATS);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
@@ -1590,18 +1830,16 @@ __device__ __forceinline__ void combine_query_midpoint_ratecat(
         Pmid[2] *= t2;
         Pmid[3] *= t3;
 
-        if (site_scaler_ptr) {
-            double col_scale_max_val = fmax(fmax(Pmid[0], Pmid[1]), fmax(Pmid[2], Pmid[3]));
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-                site_scaler_ptr[r] += shift;
-                Pmid[0] = ldexp(Pmid[0], shift);
-                Pmid[1] = ldexp(Pmid[1], shift);
-                Pmid[2] = ldexp(Pmid[2], shift);
-                Pmid[3] = ldexp(Pmid[3], shift);
-            }
+        double col_scale_max_val = fmax(fmax(Pmid[0], Pmid[1]), fmax(Pmid[2], Pmid[3]));
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, mid_scaler, r, shift);
+            Pmid[0] = ldexp(Pmid[0], shift);
+            Pmid[1] = ldexp(Pmid[1], shift);
+            Pmid[2] = ldexp(Pmid[2], shift);
+            Pmid[3] = ldexp(Pmid[3], shift);
         }
     }
 }
@@ -1629,7 +1867,7 @@ __device__ __forceinline__ void combine_query_midpoint_generic(
     double*       target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
     const double* query_clv  = D.d_query_clv + site_off;
     const double* query_mat  = D.d_query_pmat + (size_t)op_idx * per_query;
-    unsigned int* site_scaler_ptr = site_scaler_ptr_base(D, op, site, rate_cats);
+    unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
         const double* M = query_mat + (size_t)r * states * states;
@@ -1646,15 +1884,13 @@ __device__ __forceinline__ void combine_query_midpoint_generic(
             if (Pmid[i] > col_scale_max_val) col_scale_max_val = Pmid[i];
         }
 
-        if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-                site_scaler_ptr[r] += shift;
-                for (unsigned int j = 0; j < states; ++j) {
-                    Pmid[j] = ldexp(Pmid[j], shift);
-                }
+        int scaling_exponent;
+        frexp(col_scale_max_val, &scaling_exponent);
+        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
+            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            add_scaler_shift(D, mid_scaler, r, shift);
+            for (unsigned int j = 0; j < states; ++j) {
+                Pmid[j] = ldexp(Pmid[j], shift);
             }
         }
     }
@@ -1707,8 +1943,18 @@ __device__ __forceinline__ void compute_inner_inner_site_generic(
 
     unsigned int* site_scaler_ptr =
         site_scaler_ptr_base(D, op, site, rate_cats);
+    unsigned int* left_scaler =
+        scaler_ptr_for_pool(D, op.clv_pool, op.left_id, site);
+    unsigned int* right_scaler =
+        scaler_ptr_for_pool(D, op.clv_pool, op.right_id, site);
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
+        write_scaler_shift(
+            D,
+            site_scaler_ptr,
+            r,
+            read_scaler_shift(D, left_scaler, r) +
+            read_scaler_shift(D, right_scaler, r));
         const double* Lclv = d_left_clv  + site_off + (size_t)r * states;
         const double* Rclv = d_right_clv + site_off + (size_t)r * states;
 
@@ -2170,7 +2416,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Upward_Kernel(
             const NodeOpInfo& op = ops[i];
             switch (op.op_type) {
                 case OP_TIP_TIP:
-                    if (D.states == 4) {
+                    if (D.states == 4 && !D.force_generic_upward) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_tip_tip_site_ratecat_nolookup<1>(D, op, site);
@@ -2190,7 +2436,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Upward_Kernel(
                     }
                     break;
                 case OP_TIP_INNER:
-                    if (D.states == 4) {
+                    if (D.states == 4 && !D.force_generic_upward) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_tip_inner_site_ratecat<1>(D, op, site);
@@ -2210,7 +2456,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Upward_Kernel(
                     }
                     break;
                 case OP_INNER_INNER:
-                    if (D.states == 4) {
+                    if (D.states == 4 && !D.force_generic_upward) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_inner_inner_site_ratecat<1>(D, op, site);
@@ -2252,7 +2498,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Downward_Kernel(
             const NodeOpInfo& op = ops[i];
             switch (op.op_type) {
                 case OP_DOWN_INNER_INNER:
-                    if (D.states == 4) {
+                    if (D.states == 4 && !D.force_generic_downward) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_downward_inner_inner_ratecat<1>(D, op, site);
@@ -2272,7 +2518,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Downward_Kernel(
                     }
                     break;
                 case OP_DOWN_INNER_TIP:
-                    if (D.states == 4) {
+                    if (D.states == 4 && !D.force_generic_downward) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_downward_inner_tip_ratecat<1>(D, op, site);
@@ -2292,7 +2538,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Downward_Kernel(
                     }
                     break;
                 case OP_DOWN_TIP_INNER:
-                    if (D.states == 4) {
+                    if (D.states == 4 && !D.force_generic_downward) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_downward_tip_inner_ratecat<1>(D, op, site);
@@ -2312,7 +2558,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Downward_Kernel(
                     }
                     break;
                 case OP_DOWN_TIP_TIP:
-                    if (D.states == 4) {
+                    if (D.states == 4 && !D.force_generic_downward) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_downward_tip_tip_ratecat<1>(D, op, site);

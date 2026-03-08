@@ -11,6 +11,7 @@
 
 #include "../pmatrix/pmat.h"
 
+struct PlacementResult;
 
 // ===== CUDA error helper =====
 #ifndef CUDA_CHECK
@@ -92,6 +93,8 @@ struct DeviceTree {
     // Cached helper for tipmap indexing (ceil_log2(states+1)).
     unsigned int log2_stride = 0;
     bool    per_rate_scaling = false;
+    bool    force_generic_downward = false;
+    bool    force_generic_upward = false;
 
     double *d_lambdas  = nullptr;  // [rate_cats * states]
     double *d_V        = nullptr;  // [states*states]  row-major
@@ -134,8 +137,14 @@ struct DeviceTree {
     size_t   sumtable_capacity_ops = 0;
     size_t   likelihood_capacity_ops = 0;
 
-    // scaler pool (site or site*rate)
-    unsigned *d_site_scaler = nullptr;          // [sites] or [sites*rate_cats]
+    // scaler pool storage.
+    // `down` and `mid_base` share one history; `mid` diverges after midpoint/query updates.
+    unsigned *d_site_scaler = nullptr;          // legacy alias for UP/root likelihood path
+    unsigned *d_site_scaler_storage = nullptr;  // base allocation
+    unsigned *d_site_scaler_up = nullptr;
+    unsigned *d_site_scaler_down = nullptr;
+    unsigned *d_site_scaler_mid = nullptr;
+    unsigned *d_site_scaler_mid_base = nullptr;
 
     double* d_pmat = nullptr;
     double* d_pmat_mid = nullptr;             // half-branch pmats for midpoint calculations
@@ -157,6 +166,12 @@ struct DeviceTree {
     }
     size_t scaler_elems() const {
         return per_rate_scaling ? (sites * (size_t)rate_cats) : sites;
+    }
+    size_t scaler_pool_elems() const {
+        return (size_t)capacity_N * scaler_elems();
+    }
+    size_t scaler_storage_elems() const {
+        return scaler_pool_elems() * 3;
     }
     size_t pmat_per_node_elems() const {
         return (size_t)rate_cats * (size_t)states * (size_t)states;
@@ -300,6 +315,7 @@ void UpdateTreeLogLikelihood_device(
     PlacementQueryBatch& Q,
     const std::vector<double>& rate_multipliers,
     const std::vector<NewPlacementQuery>* queries = nullptr,
+    std::vector<struct PlacementResult>* placement_results_out = nullptr,
     const std::vector<double>* pi_debug = nullptr,
     const std::vector<double>* rate_weights_debug = nullptr,
     double baseline_loglik = 0.0,

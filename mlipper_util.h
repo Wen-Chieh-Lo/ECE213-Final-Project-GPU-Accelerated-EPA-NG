@@ -4,6 +4,11 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cmath>
+#include <fstream>
+#include <filesystem>
+#include <functional>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <stdexcept>
 #include <cstddef>
@@ -122,9 +127,206 @@ inline void validate_states_rate(int states, int rate_cats, int max_states, int 
     if (rate_cats > max_rate_cats) throw std::runtime_error("rate_cats exceeds MAX_RATECATS.");
 }
 
+struct JplacePlacementRecord {
+    std::string query_name;
+    int edge_num = -1;
+    double likelihood = 0.0;
+    double like_weight_ratio = 1.0;
+    double distal_length = 0.0;
+    double pendant_length = 0.0;
+};
+
+inline std::string json_escape_string(const std::string& input) {
+    std::ostringstream out;
+    for (unsigned char ch : input) {
+        switch (ch) {
+            case '\"': out << "\\\""; break;
+            case '\\': out << "\\\\"; break;
+            case '\b': out << "\\b"; break;
+            case '\f': out << "\\f"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (ch < 0x20) {
+                    out << "\\u"
+                        << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(ch)
+                        << std::dec << std::setfill(' ');
+                } else {
+                    out << static_cast<char>(ch);
+                }
+                break;
+        }
+    }
+    return out.str();
+}
+
+struct JplaceTreeExport {
+    std::string tree;
+    std::vector<int> edge_num_by_node;
+};
+
+inline JplaceTreeExport build_jplace_tree_export(const TreeBuildResult& tree) {
+    if (tree.root_id < 0 || tree.root_id >= static_cast<int>(tree.nodes.size())) {
+        throw std::runtime_error("build_jplace_tree: invalid root_id.");
+    }
+
+    JplaceTreeExport result;
+    result.edge_num_by_node.assign(tree.nodes.size(), -1);
+    int next_edge_num = 0;
+
+    std::function<std::string(int, bool)> emit_node = [&](int node_id, bool suppress_parent_edge) -> std::string {
+        if (node_id < 0 || node_id >= static_cast<int>(tree.nodes.size())) {
+            throw std::runtime_error("build_jplace_tree: invalid node id.");
+        }
+
+        const TreeNode& node = tree.nodes[node_id];
+        std::ostringstream out;
+        if (node.is_tip) {
+            out << node.name;
+        } else {
+            out << "(" << emit_node(node.left, false) << "," << emit_node(node.right, false) << ")";
+        }
+
+        if (node.parent >= 0 && !suppress_parent_edge) {
+            const int edge_num = next_edge_num++;
+            result.edge_num_by_node[node.id] = edge_num;
+            out << ":" << std::setprecision(17) << node.branch_length_to_parent
+                << "{" << edge_num << "}";
+        }
+        return out.str();
+    };
+
+    const TreeNode& root = tree.nodes[tree.root_id];
+    const auto should_flatten_root_child = [&](int child_id) -> bool {
+        if (child_id < 0 || child_id >= static_cast<int>(tree.nodes.size())) return false;
+        const TreeNode& child = tree.nodes[child_id];
+        return !child.is_tip && child.parent == tree.root_id && std::abs(child.branch_length_to_parent) <= 1e-15;
+    };
+
+    std::ostringstream out;
+    if (!root.is_tip && should_flatten_root_child(root.left) != should_flatten_root_child(root.right)) {
+        const int flat_child = should_flatten_root_child(root.left) ? root.left : root.right;
+        const int other_child = (flat_child == root.left) ? root.right : root.left;
+        out << "(" << emit_node(flat_child, true) << "," << emit_node(other_child, false) << ")";
+    } else {
+        out << emit_node(tree.root_id, false);
+    }
+
+    result.tree = out.str() + ";";
+    return result;
+}
+
+inline std::string build_jplace_tree(const TreeBuildResult& tree) {
+    return build_jplace_tree_export(tree).tree;
+}
+
+inline void write_jplace(
+    const std::string& out_path,
+    const std::string& tree_string,
+    const std::vector<JplacePlacementRecord>& placements,
+    const std::string& invocation)
+{
+    std::filesystem::path output_path(out_path);
+    if (output_path.has_parent_path()) {
+        std::filesystem::create_directories(output_path.parent_path());
+    }
+
+    std::ofstream out(out_path);
+    if (!out) {
+        throw std::runtime_error("Cannot open jplace output: " + out_path);
+    }
+
+    out << "{\n";
+    out << "  \"tree\": \"" << json_escape_string(tree_string) << "\",\n";
+    out << "  \"placements\": [\n";
+    for (size_t i = 0; i < placements.size(); ++i) {
+        const JplacePlacementRecord& rec = placements[i];
+        out << "    {\n";
+        out << "      \"p\": [["
+            << rec.edge_num << ", "
+            << std::setprecision(17) << rec.likelihood << ", "
+            << std::setprecision(17) << rec.like_weight_ratio << ", "
+            << std::setprecision(17) << rec.distal_length << ", "
+            << std::setprecision(17) << rec.pendant_length << "]],\n";
+        out << "      \"n\": [\"" << json_escape_string(rec.query_name) << "\"]\n";
+        out << "    }";
+        if (i + 1 < placements.size()) out << ",";
+        out << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"metadata\": {\n";
+    out << "    \"invocation\": \"" << json_escape_string(invocation) << "\"\n";
+    out << "  },\n";
+    out << "  \"version\": 3,\n";
+    out << "  \"fields\": [\"edge_num\", \"likelihood\", \"like_weight_ratio\", \"distal_length\", \"pendant_length\"]\n";
+    out << "}\n";
+}
+
 // ===== Device-side CLV helpers (inlined for reuse across CUDA units) =====
 __device__ __forceinline__ size_t per_node_span(const DeviceTree& D) {
     return (size_t)D.sites * (size_t)D.rate_cats * (size_t)D.states;
+}
+
+__device__ __forceinline__ size_t scaler_span(const DeviceTree& D) {
+    if (D.per_rate_scaling) {
+        return (size_t)D.sites * (size_t)D.rate_cats;
+    }
+    return (size_t)D.sites;
+}
+
+__device__ __forceinline__ size_t scaler_site_offset(
+    const DeviceTree& D,
+    unsigned int site)
+{
+    if (D.per_rate_scaling) {
+        return (size_t)site * (size_t)D.rate_cats;
+    }
+    return (size_t)site;
+}
+
+__device__ __forceinline__ unsigned int* scaler_ptr_for_node(
+    unsigned int* base,
+    const DeviceTree& D,
+    int node_id,
+    unsigned int site)
+{
+    if (!base) return nullptr;
+    if (node_id < 0 || node_id >= D.capacity_N) return nullptr;
+    return base + (size_t)node_id * scaler_span(D) + scaler_site_offset(D, site);
+}
+
+__device__ __forceinline__ unsigned int* up_scaler_ptr(
+    const DeviceTree& D,
+    int node_id,
+    unsigned int site)
+{
+    return scaler_ptr_for_node(D.d_site_scaler_up, D, node_id, site);
+}
+
+__device__ __forceinline__ unsigned int* down_scaler_ptr(
+    const DeviceTree& D,
+    int node_id,
+    unsigned int site)
+{
+    return scaler_ptr_for_node(D.d_site_scaler_down, D, node_id, site);
+}
+
+__device__ __forceinline__ unsigned int* mid_scaler_ptr(
+    const DeviceTree& D,
+    int node_id,
+    unsigned int site)
+{
+    return scaler_ptr_for_node(D.d_site_scaler_mid, D, node_id, site);
+}
+
+__device__ __forceinline__ unsigned int* mid_base_scaler_ptr(
+    const DeviceTree& D,
+    int node_id,
+    unsigned int site)
+{
+    return scaler_ptr_for_node(D.d_site_scaler_mid_base, D, node_id, site);
 }
 
 template <typename T>
@@ -166,7 +368,9 @@ __device__ __forceinline__ unsigned int* site_scaler_ptr_base(
     unsigned int site,
     unsigned int rate_cats)
 {
-    return D.d_site_scaler
-        ? D.d_site_scaler + (size_t)site * (size_t)rate_cats
-        : nullptr;
+    (void)rate_cats;
+    if (op.clv_pool == static_cast<uint8_t>(CLV_POOL_DOWN)) {
+        return down_scaler_ptr(D, op.parent_id, site);
+    }
+    return up_scaler_ptr(D, op.parent_id, site);
 }

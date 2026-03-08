@@ -13,7 +13,9 @@
 #include <libpll/pll.h>
 
 #include "tree.hpp"
+#include "tree_placement.cuh"
 #include "parse_file.hpp"
+#include "../mlipper_util.h"
 
 static std::string read_file_to_string(const std::string& path) {
     std::ifstream ifs(path);
@@ -199,6 +201,7 @@ int main(int argc, char** argv) {
 
     // ---- Input (files/tree) ----
     std::string tree_newick;
+    std::string jplace_out;
 
     auto* opt_tree_alignment = app.add_option("--tree-alignment", config.files.tree_alignment, "Reference alignment (tree MSA)")
                                   ->group("Input")
@@ -212,6 +215,8 @@ int main(int argc, char** argv) {
                               ->check(CLI::ExistingFile);
     auto* opt_tree_newick = app.add_option("--tree-newick", tree_newick, "Reference tree topology (Newick string)")
                                 ->group("Input");
+    app.add_option("--jplace-out", jplace_out, "Optional output path for a single-best-placement jplace file")
+        ->group("Output");
     opt_tree_file->excludes(opt_tree_newick);
     opt_tree_newick->excludes(opt_tree_file);
 
@@ -378,6 +383,7 @@ int main(int argc, char** argv) {
         0
     );
     printf("Initial tree log-likelihood = %.12f\n", logL);
+    std::vector<PlacementResult> placement_results;
     UpdateTreeLogLikelihood_device(
         res.dev,
         res.tree,
@@ -386,12 +392,59 @@ int main(int argc, char** argv) {
         res.queries,
         rate_multipliers,
         &placement_queries,
+        &placement_results,
         &pi,
         &rate_weights,
         logL,
         /*debug_mid=*/true,
         1,
         0);
+
+    if (!jplace_out.empty()) {
+        if (placement_results.size() != placement_queries.size()) {
+            std::cerr << "placement result count mismatch before jplace export: got "
+                      << placement_results.size() << ", expected " << placement_queries.size()
+                      << ". Exporting available prefix only.\n";
+        }
+
+        const JplaceTreeExport jplace_tree = build_jplace_tree_export(res.tree);
+        std::vector<JplacePlacementRecord> jplace_records;
+        const size_t export_count = std::min(placement_results.size(), placement_queries.size());
+        jplace_records.reserve(export_count);
+        for (size_t i = 0; i < export_count; ++i) {
+            const PlacementResult& pres = placement_results[i];
+            if (pres.target_id < 0 || pres.target_id >= (int)res.tree.nodes.size()) {
+                throw std::runtime_error("Invalid target_id while exporting jplace.");
+            }
+
+            const TreeNode& target = res.tree.nodes[pres.target_id];
+            if (target.parent < 0) {
+                throw std::runtime_error("Best placement landed on root edge, which jplace writer does not support.");
+            }
+
+            JplacePlacementRecord rec;
+            rec.query_name = placement_queries[i].msa_name.empty()
+                ? ("query_" + std::to_string(i))
+                : placement_queries[i].msa_name;
+            rec.edge_num = jplace_tree.edge_num_by_node[pres.target_id];
+            if (rec.edge_num < 0) {
+                throw std::runtime_error("Could not map placement edge to jplace edge number.");
+            }
+            rec.likelihood = pres.loglikelihood;
+            rec.like_weight_ratio = 1.0;
+            rec.distal_length = pres.proximal_length;
+            rec.pendant_length = pres.pendant_length;
+            jplace_records.push_back(std::move(rec));
+        }
+
+        std::ostringstream invocation;
+        for (int i = 0; i < argc; ++i) {
+            if (i) invocation << ' ';
+            invocation << argv[i];
+        }
+        write_jplace(jplace_out, jplace_tree.tree, jplace_records, invocation.str());
+        std::cout << "Wrote jplace to " << jplace_out << "\n";
+    }
 
     
     cudaEventRecord(stop);

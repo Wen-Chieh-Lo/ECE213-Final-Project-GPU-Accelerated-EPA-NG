@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cassert>
+#include <tuple>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <cstdio>
@@ -64,6 +65,222 @@ static void print_query_pmat(const DeviceTree& D, int op_idx, cudaStream_t strea
             fprintf(stderr, "\n");
         }
     }
+}
+
+int get_env_int_or(const char* name, int fallback) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    return std::atoi(raw);
+}
+
+double get_env_double_or(const char* name, double fallback) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) return fallback;
+    return std::atof(raw);
+}
+
+void dump_node_scaler_and_clv_snapshot(
+    const DeviceTree& D,
+    int node_id,
+    int max_sites,
+    cudaStream_t stream,
+    const char* tag)
+{
+    if (node_id < 0 || node_id >= D.N) {
+        std::fprintf(stderr, "[scaler-debug %s] invalid node_id=%d\n", tag ? tag : "", node_id);
+        return;
+    }
+    const int site_count = std::max(0, std::min<int>(D.sites, max_sites));
+    if (site_count <= 0) return;
+
+    const size_t scaler_site_width = D.per_rate_scaling ? (size_t)D.rate_cats : 1u;
+    const size_t scaler_count = (size_t)site_count * scaler_site_width;
+    const size_t clv_count = (size_t)site_count * (size_t)D.rate_cats * (size_t)D.states;
+    const size_t scaler_node_offset = (size_t)node_id * D.scaler_elems();
+    const size_t clv_node_offset = (size_t)node_id * D.per_node_elems();
+
+    std::vector<unsigned> up_scaler(scaler_count, 0);
+    std::vector<unsigned> down_scaler(scaler_count, 0);
+    std::vector<unsigned> mid_scaler(scaler_count, 0);
+    std::vector<unsigned> mid_base_scaler(scaler_count, 0);
+    std::vector<double> up_clv(clv_count, 0.0);
+    std::vector<double> down_clv(clv_count, 0.0);
+    std::vector<double> mid_clv(clv_count, 0.0);
+    std::vector<double> mid_base_clv(clv_count, 0.0);
+    std::vector<double> query_clv(clv_count, 0.0);
+
+    auto copy_scaler = [&](unsigned* src, std::vector<unsigned>& dst) {
+        if (!src || dst.empty()) return;
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst.data(),
+            src + scaler_node_offset,
+            sizeof(unsigned) * dst.size(),
+            cudaMemcpyDeviceToHost,
+            stream));
+    };
+    auto copy_clv = [&](double* src, std::vector<double>& dst, bool per_node) {
+        if (!src || dst.empty()) return;
+        const double* base = per_node ? (src + clv_node_offset) : src;
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst.data(),
+            base,
+            sizeof(double) * dst.size(),
+            cudaMemcpyDeviceToHost,
+            stream));
+    };
+
+    copy_scaler(D.d_site_scaler_up, up_scaler);
+    copy_scaler(D.d_site_scaler_down, down_scaler);
+    copy_scaler(D.d_site_scaler_mid, mid_scaler);
+    copy_scaler(D.d_site_scaler_mid_base, mid_base_scaler);
+    copy_clv(D.d_clv_up, up_clv, true);
+    copy_clv(D.d_clv_down, down_clv, true);
+    copy_clv(D.d_clv_mid, mid_clv, true);
+    copy_clv(D.d_clv_mid_base, mid_base_clv, true);
+    copy_clv(D.d_query_clv, query_clv, false);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    auto scaler_at = [&](const std::vector<unsigned>& buf, int site, int rc) -> unsigned {
+        if (buf.empty()) return 0;
+        if (D.per_rate_scaling) return buf[(size_t)site * (size_t)D.rate_cats + (size_t)rc];
+        return buf[(size_t)site];
+    };
+    auto clv_max_at = [&](const std::vector<double>& buf, int site, int rc) -> double {
+        if (buf.empty()) return 0.0;
+        const size_t base = ((size_t)site * (size_t)D.rate_cats + (size_t)rc) * (size_t)D.states;
+        double vmax = 0.0;
+        for (int s = 0; s < D.states; ++s) {
+            const double v = buf[base + (size_t)s];
+            if (v > vmax) vmax = v;
+        }
+        return vmax;
+    };
+
+    std::fprintf(stderr,
+        "[scaler-debug %s] node=%d sites=%d rate_cats=%d states=%d per_rate=%d\n",
+        tag ? tag : "", node_id, site_count, D.rate_cats, D.states, D.per_rate_scaling ? 1 : 0);
+    for (int site = 0; site < site_count; ++site) {
+        std::fprintf(stderr, "[scaler-debug %s] site=%d", tag ? tag : "", site);
+        for (int rc = 0; rc < D.rate_cats; ++rc) {
+            std::fprintf(stderr,
+                " rc=%d up=%u down=%u mid=%u midb=%u qmax=%.3e upmax=%.3e downmax=%.3e midmax=%.3e midbmax=%.3e",
+                rc,
+                scaler_at(up_scaler, site, rc),
+                scaler_at(down_scaler, site, rc),
+                scaler_at(mid_scaler, site, rc),
+                scaler_at(mid_base_scaler, site, rc),
+                clv_max_at(query_clv, site, rc),
+                clv_max_at(up_clv, site, rc),
+                clv_max_at(down_clv, site, rc),
+                clv_max_at(mid_clv, site, rc),
+                clv_max_at(mid_base_clv, site, rc));
+        }
+        std::fprintf(stderr, "\n");
+    }
+}
+
+static void print_top_ops_summary(
+    const std::vector<NodeOpInfo>& h_ops,
+    const std::vector<double>& h_loglk,
+    const std::vector<double>& h_pendant,
+    const std::vector<double>& h_proximal,
+    int query_idx,
+    int pass,
+    int topk)
+{
+    if (topk <= 0 || h_ops.empty() || h_loglk.empty()) return;
+    std::vector<std::tuple<double, int, int>> ranked;
+    ranked.reserve(h_loglk.size());
+    for (int op_i = 0; op_i < (int)h_loglk.size(); ++op_i) {
+        const NodeOpInfo& op = h_ops[(size_t)op_i];
+        const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
+        const bool target_is_right = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
+        const int target_id = target_is_left ? op.left_id : (target_is_right ? op.right_id : op.parent_id);
+        ranked.emplace_back(h_loglk[(size_t)op_i], op_i, target_id);
+    }
+    std::partial_sort(
+        ranked.begin(),
+        ranked.begin() + std::min<int>(topk, ranked.size()),
+        ranked.end(),
+        [](const auto& a, const auto& b) { return std::get<0>(a) > std::get<0>(b); });
+
+    for (int rank = 0; rank < std::min<int>(topk, ranked.size()); ++rank) {
+        const double ll = std::get<0>(ranked[(size_t)rank]);
+        const int op_i = std::get<1>(ranked[(size_t)rank]);
+        const int target_id = std::get<2>(ranked[(size_t)rank]);
+        double pendant = 0.0;
+        double proximal = 0.0;
+        if (target_id >= 0 && target_id < (int)h_pendant.size()) pendant = h_pendant[(size_t)target_id];
+        if (target_id >= 0 && target_id < (int)h_proximal.size()) proximal = h_proximal[(size_t)target_id];
+        std::fprintf(stderr,
+            "[topops] query=%d pass=%d rank=%d op=%d target=%d ll=%.12f pendant=%.12f proximal=%.12f\n",
+            query_idx, pass, rank + 1, op_i, target_id, ll, pendant, proximal);
+    }
+}
+
+static void print_selected_op_summary(
+    const std::vector<NodeOpInfo>& h_ops,
+    const std::vector<double>& h_loglk,
+    const std::vector<double>& h_pendant,
+    const std::vector<double>& h_proximal,
+    int query_idx,
+    int pass,
+    int op_idx)
+{
+    if (op_idx < 0 || op_idx >= (int)h_ops.size() || op_idx >= (int)h_loglk.size()) return;
+    const NodeOpInfo& op = h_ops[(size_t)op_idx];
+    const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
+    const bool target_is_right = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
+    const int target_id = target_is_left ? op.left_id : (target_is_right ? op.right_id : op.parent_id);
+    const double pendant =
+        (target_id >= 0 && target_id < (int)h_pendant.size()) ? h_pendant[(size_t)target_id] : 0.0;
+    const double proximal =
+        (target_id >= 0 && target_id < (int)h_proximal.size()) ? h_proximal[(size_t)target_id] : 0.0;
+    std::fprintf(stderr,
+        "[op-debug] query=%d pass=%d op=%d target=%d ll=%.12f pendant=%.12f proximal=%.12f dir=%u type=%d parent=%d left=%d right=%d\n",
+        query_idx,
+        pass,
+        op_idx,
+        target_id,
+        h_loglk[(size_t)op_idx],
+        pendant,
+        proximal,
+        static_cast<unsigned>(op.dir_tag),
+        op.op_type,
+        op.parent_id,
+        op.left_id,
+        op.right_id);
+}
+
+static void print_selected_op_transition(
+    const std::vector<NodeOpInfo>& h_ops,
+    const std::vector<double>& h_prev_loglk,
+    const std::vector<double>& h_curr_loglk,
+    int query_idx,
+    int pass,
+    int op_idx)
+{
+    if (op_idx < 0 || op_idx >= (int)h_ops.size()) return;
+    const NodeOpInfo& op = h_ops[(size_t)op_idx];
+    const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
+    const bool target_is_right = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
+    const int target_id = target_is_left ? op.left_id : (target_is_right ? op.right_id : op.parent_id);
+    const double prev = (op_idx < (int)h_prev_loglk.size()) ? h_prev_loglk[(size_t)op_idx] : 0.0;
+    const double curr = (op_idx < (int)h_curr_loglk.size()) ? h_curr_loglk[(size_t)op_idx] : 0.0;
+    std::fprintf(stderr,
+        "[op-transition] query=%d pass=%d op=%d target=%d prev=%.12f curr=%.12f delta=%.12f dir=%u type=%d parent=%d left=%d right=%d\n",
+        query_idx,
+        pass,
+        op_idx,
+        target_id,
+        prev,
+        curr,
+        curr - prev,
+        static_cast<unsigned>(op.dir_tag),
+        op.op_type,
+        op.parent_id,
+        op.left_id,
+        op.right_id);
 }
 
 __global__ void BuildOpPendantLengthsKernel(
@@ -392,7 +609,8 @@ PlacementResult PlacementEvaluationKernel (
     const NodeOpInfo* d_ops,
     int num_ops,
     int smoothing,
-    cudaStream_t stream
+    cudaStream_t stream,
+    int debug_query_idx
 ){
     PlacementResult result;
     // Debug: enforce device-pointer sanity before running placement reductions.
@@ -572,7 +790,304 @@ PlacementResult PlacementEvaluationKernel (
         stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    for (int pass = 0; pass < 2; ++pass) {
+    const bool debug_passes = (debug_query_idx >= 0);
+    const int debug_topk = get_env_int_or("MLIPPER_DEBUG_TOPK", 5);
+    const int debug_selected_op = get_env_int_or("MLIPPER_DEBUG_OP", -1);
+    const int debug_selected_op2 = get_env_int_or("MLIPPER_DEBUG_OP2", -1);
+    const int debug_midpoint_score_op = get_env_int_or("MLIPPER_DEBUG_MIDPOINT_SCORE_OP", -1);
+    const int debug_midpoint_score_sites = get_env_int_or("MLIPPER_DEBUG_MIDPOINT_SCORE_SITES", 0);
+    const int debug_shift_site = get_env_int_or("MLIPPER_DEBUG_SHIFT_SITE", -1);
+    const int debug_fixed_op = get_env_int_or("MLIPPER_DEBUG_FIXED_OP", -1);
+    const double debug_fixed_pendant = get_env_double_or("MLIPPER_DEBUG_FIXED_PENDANT", -1.0);
+    const double debug_fixed_proximal = get_env_double_or("MLIPPER_DEBUG_FIXED_PROXIMAL", -1.0);
+    const bool disable_opt = (get_env_int_or("MLIPPER_DISABLE_OPT", 0) != 0);
+    const int opt_passes = std::max(0, get_env_int_or("MLIPPER_OPT_PASSES", std::max(4, smoothing)));
+    if (debug_fixed_op >= 0 &&
+        debug_fixed_op < num_ops &&
+        debug_fixed_pendant >= 0.0 &&
+        debug_fixed_proximal >= 0.0) {
+        const NodeOpInfo fixed_op = h_ops[(size_t)debug_fixed_op];
+        const bool target_is_left =
+            (fixed_op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
+        const bool target_is_right =
+            (fixed_op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
+        const int target_id = target_is_left
+            ? fixed_op.left_id
+            : (target_is_right ? fixed_op.right_id : fixed_op.parent_id);
+        if (target_id >= 0 && target_id < D.N) {
+            std::vector<double> h_dbg_pendant((size_t)D.N, DEFAULT_BRANCH_LENGTH);
+            std::vector<double> h_dbg_proximal((size_t)D.N, DEFAULT_BRANCH_LENGTH);
+            CUDA_CHECK(cudaMemcpyAsync(
+                h_dbg_pendant.data(),
+                D.d_prev_pendant_length,
+                sizeof(double) * (size_t)D.N,
+                cudaMemcpyDeviceToHost,
+                stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                h_dbg_proximal.data(),
+                D.d_prev_proximal_length,
+                sizeof(double) * (size_t)D.N,
+                cudaMemcpyDeviceToHost,
+                stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            h_dbg_pendant[(size_t)target_id] = debug_fixed_pendant;
+            h_dbg_proximal[(size_t)target_id] = debug_fixed_proximal;
+
+            CUDA_CHECK(cudaMemcpyAsync(
+                D.d_new_pendant_length,
+                h_dbg_pendant.data(),
+                sizeof(double) * (size_t)D.N,
+                cudaMemcpyHostToDevice,
+                stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                D.d_new_proximal_length,
+                h_dbg_proximal.data(),
+                sizeof(double) * (size_t)D.N,
+                cudaMemcpyHostToDevice,
+                stream));
+
+            dim3 pmat_block(128);
+            dim3 pmat_grid((unsigned)((num_ops * D.rate_cats + pmat_block.x - 1) / pmat_block.x));
+            BuildPendantPMATPerOpKernel<<<pmat_grid, pmat_block, 0, stream>>>(
+                d_ops,
+                D.d_new_pendant_length,
+                D.d_Vinv,
+                D.d_V,
+                D.d_lambdas,
+                0.0,
+                D.d_query_pmat,
+                D.states,
+                D.rate_cats,
+                num_ops,
+                D.N,
+                OPT_BRANCH_LEN_MIN,
+                OPT_BRANCH_LEN_MAX,
+                DEFAULT_BRANCH_LENGTH);
+            CUDA_CHECK(cudaGetLastError());
+
+            dim3 node_grid((unsigned)((D.N * D.rate_cats + pmat_block.x - 1) / pmat_block.x));
+            BuildNodeProximalPMATKernel<<<node_grid, pmat_block, 0, stream>>>(
+                D.d_new_proximal_length,
+                D.d_Vinv,
+                D.d_V,
+                D.d_lambdas,
+                0.0,
+                D.d_pmat_mid_prox,
+                D.states,
+                D.rate_cats,
+                D.N,
+                D.root_id,
+                OPT_BRANCH_LEN_MIN,
+                OPT_BRANCH_LEN_MAX,
+                DEFAULT_BRANCH_LENGTH);
+            CUDA_CHECK(cudaGetLastError());
+
+            BuildNodeDistalPMATKernel<<<node_grid, pmat_block, 0, stream>>>(
+                D.d_blen,
+                D.d_new_proximal_length,
+                D.d_Vinv,
+                D.d_V,
+                D.d_lambdas,
+                0.0,
+                D.d_pmat_mid_dist,
+                D.states,
+                D.rate_cats,
+                D.N,
+                D.root_id,
+                OPT_BRANCH_LEN_MIN,
+                OPT_BRANCH_LEN_MAX,
+                DEFAULT_BRANCH_LENGTH);
+            CUDA_CHECK(cudaGetLastError());
+
+            root_likelihood::compute_combined_loglik_per_op_device(
+                D,
+                d_ops,
+                num_ops,
+                D.d_query_pmat,
+                D.d_pmat_mid_dist,
+                D.d_pmat_mid_prox,
+                d_likelihoods,
+                stream);
+            std::vector<double> h_fixed_loglk((size_t)num_ops, 0.0);
+            CUDA_CHECK(cudaMemcpyAsync(
+                h_fixed_loglk.data(),
+                d_likelihoods,
+                sizeof(double) * (size_t)num_ops,
+                cudaMemcpyDeviceToHost,
+                stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::fprintf(stderr,
+                "[fixed-branch-debug] op=%d target=%d pendant=%.12f proximal=%.12f ll=%.12f\n",
+                debug_fixed_op,
+                target_id,
+                debug_fixed_pendant,
+                debug_fixed_proximal,
+                h_fixed_loglk[(size_t)debug_fixed_op]);
+        }
+    }
+    if (debug_midpoint_score_op >= 0 && debug_midpoint_score_op < num_ops) {
+        const NodeOpInfo debug_op = h_ops[(size_t)debug_midpoint_score_op];
+        const bool target_is_left =
+            (debug_op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
+        const bool target_is_right =
+            (debug_op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
+        const int target_id = target_is_left
+            ? debug_op.left_id
+            : (target_is_right ? debug_op.right_id : debug_op.parent_id);
+        DeviceTree Dmid = D;
+        if (target_id >= 0 && target_id < D.N && D.d_site_scaler_mid) {
+            Dmid.d_site_scaler = D.d_site_scaler_mid + (size_t)target_id * D.scaler_elems();
+        } else {
+            Dmid.d_site_scaler = nullptr;
+        }
+        CUDA_CHECK(cudaMemsetAsync(Dmid.d_placement_clv, 0, sizeof(double) * Dmid.sites, stream));
+        dim3 dbg_grid((unsigned)((D.sites + placement_block.x - 1) / placement_block.x));
+        UpdateMidpointWithQueryKernel<<<dbg_grid, placement_block, 0, stream>>>(
+            Dmid,
+            d_ops,
+            debug_midpoint_score_op);
+        CUDA_CHECK(cudaGetLastError());
+        ComputeRootLikelihoodKernel<<<dbg_grid, placement_block, 0, stream>>>(
+            Dmid,
+            d_ops,
+            debug_midpoint_score_op);
+        CUDA_CHECK(cudaGetLastError());
+        std::vector<double> h_midpoint_site((size_t)Dmid.sites, 0.0);
+        std::vector<double> h_combined((size_t)num_ops, 0.0);
+        CUDA_CHECK(cudaMemcpyAsync(
+            h_midpoint_site.data(),
+            Dmid.d_placement_clv,
+            sizeof(double) * (size_t)Dmid.sites,
+            cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            h_combined.data(),
+            d_prev_loglk,
+            sizeof(double) * (size_t)num_ops,
+            cudaMemcpyDeviceToHost,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        double midpoint_total = 0.0;
+        for (double v : h_midpoint_site) midpoint_total += v;
+        std::fprintf(stderr,
+            "[midpoint-score-debug] op=%d combined=%.12f midpoint_root=%.12f delta=%.12f\n",
+            debug_midpoint_score_op,
+            h_combined[(size_t)debug_midpoint_score_op],
+            midpoint_total,
+            midpoint_total - h_combined[(size_t)debug_midpoint_score_op]);
+        if (debug_shift_site >= 0 && debug_shift_site < (int)D.sites) {
+            if (target_id >= 0 && target_id < D.N && D.per_rate_scaling) {
+                const size_t per_node_scalers = D.sites * (size_t)D.rate_cats;
+                const size_t site_off = (size_t)debug_shift_site * (size_t)D.rate_cats;
+                std::vector<unsigned> h_down((size_t)D.rate_cats, 0u);
+                std::vector<unsigned> h_up((size_t)D.rate_cats, 0u);
+                std::vector<unsigned> h_mid((size_t)D.rate_cats, 0u);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    h_down.data(),
+                    D.d_site_scaler_down + (size_t)target_id * per_node_scalers + site_off,
+                    sizeof(unsigned) * (size_t)D.rate_cats,
+                    cudaMemcpyDeviceToHost,
+                    stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    h_up.data(),
+                    D.d_site_scaler_up + (size_t)target_id * per_node_scalers + site_off,
+                    sizeof(unsigned) * (size_t)D.rate_cats,
+                    cudaMemcpyDeviceToHost,
+                    stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    h_mid.data(),
+                    D.d_site_scaler_mid + (size_t)target_id * per_node_scalers + site_off,
+                    sizeof(unsigned) * (size_t)D.rate_cats,
+                    cudaMemcpyDeviceToHost,
+                    stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::fprintf(stderr,
+                    "[midpoint-shift-debug] op=%d target=%d site=%d",
+                    debug_midpoint_score_op,
+                    target_id,
+                    debug_shift_site);
+                for (int rc = 0; rc < D.rate_cats; ++rc) {
+                    std::fprintf(stderr,
+                        " rc%d(down=%u up=%u sum=%u mid=%u)",
+                        rc,
+                        h_down[(size_t)rc],
+                        h_up[(size_t)rc],
+                        h_down[(size_t)rc] + h_up[(size_t)rc],
+                        h_mid[(size_t)rc]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        if (debug_midpoint_score_sites > 0) {
+            const int limit = std::min<int>(debug_midpoint_score_sites, (int)h_midpoint_site.size());
+            for (int site_i = 0; site_i < limit; ++site_i) {
+                std::fprintf(stderr,
+                    "[midpoint-site-debug] op=%d site=%d log=%.12f\n",
+                    debug_midpoint_score_op,
+                    site_i,
+                    h_midpoint_site[(size_t)site_i]);
+            }
+        }
+    }
+    if (disable_opt) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            d_likelihoods,
+            d_prev_loglk,
+            sizeof(double) * (size_t)num_ops,
+            cudaMemcpyDeviceToDevice,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (debug_passes) {
+            std::vector<double> h_best_loglk((size_t)num_ops, 0.0);
+            std::vector<double> h_prev_pendant((size_t)D.N, 0.0);
+            std::vector<double> h_prev_proximal((size_t)D.N, 0.0);
+            CUDA_CHECK(cudaMemcpy(
+                h_best_loglk.data(),
+                d_prev_loglk,
+                sizeof(double) * (size_t)num_ops,
+                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(
+                h_prev_pendant.data(),
+                D.d_prev_pendant_length,
+                sizeof(double) * (size_t)D.N,
+                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(
+                h_prev_proximal.data(),
+                D.d_prev_proximal_length,
+                sizeof(double) * (size_t)D.N,
+                cudaMemcpyDeviceToHost));
+            print_top_ops_summary(
+                h_ops,
+                h_best_loglk,
+                h_prev_pendant,
+                h_prev_proximal,
+                debug_query_idx,
+                0,
+                debug_topk);
+            if (debug_selected_op >= 0) {
+                print_selected_op_summary(
+                    h_ops,
+                    h_best_loglk,
+                    h_prev_pendant,
+                    h_prev_proximal,
+                    debug_query_idx,
+                    0,
+                    debug_selected_op);
+            }
+            if (debug_selected_op2 >= 0) {
+                print_selected_op_summary(
+                    h_ops,
+                    h_best_loglk,
+                    h_prev_pendant,
+                    h_prev_proximal,
+                    debug_query_idx,
+                    0,
+                    debug_selected_op2);
+            }
+        }
+    }
+    for (int pass = 0; !disable_opt && pass < opt_passes; ++pass) {
         // Reset shared workspaces before each pendant pass.
 
         // Pendant branch: build midpoints for all placements then optimize per block.
@@ -712,6 +1227,40 @@ PlacementResult PlacementEvaluationKernel (
             d_likelihoods,
             stream);
 
+        if (debug_passes && (debug_selected_op >= 0 || debug_selected_op2 >= 0)) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<double> h_curr_loglk((size_t)num_ops, 0.0);
+            std::vector<double> h_prev_before_keep((size_t)num_ops, 0.0);
+            CUDA_CHECK(cudaMemcpy(
+                h_curr_loglk.data(),
+                d_likelihoods,
+                sizeof(double) * (size_t)num_ops,
+                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(
+                h_prev_before_keep.data(),
+                d_prev_loglk,
+                sizeof(double) * (size_t)num_ops,
+                cudaMemcpyDeviceToHost));
+            if (debug_selected_op >= 0) {
+                print_selected_op_transition(
+                    h_ops,
+                    h_prev_before_keep,
+                    h_curr_loglk,
+                    debug_query_idx,
+                    pass + 1,
+                    debug_selected_op);
+            }
+            if (debug_selected_op2 >= 0) {
+                print_selected_op_transition(
+                    h_ops,
+                    h_prev_before_keep,
+                    h_curr_loglk,
+                    debug_query_idx,
+                    pass + 1,
+                    debug_selected_op2);
+            }
+        }
+
         dim3 keep_block(256);
         dim3 keep_grid((unsigned)((num_ops + keep_block.x - 1) / keep_block.x));
         KeepBestBranchLengthsKernel<<<keep_grid, keep_block, 0, stream>>>(
@@ -726,6 +1275,85 @@ PlacementResult PlacementEvaluationKernel (
             num_ops,
             D.N);
         CUDA_CHECK(cudaGetLastError());
+
+        if (debug_passes) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<double> h_best_loglk((size_t)num_ops, 0.0);
+            std::vector<int> h_active((size_t)num_ops, 0);
+            std::vector<double> h_prev_pendant((size_t)D.N, 0.0);
+            std::vector<double> h_prev_proximal((size_t)D.N, 0.0);
+            CUDA_CHECK(cudaMemcpy(
+                h_best_loglk.data(),
+                d_prev_loglk,
+                sizeof(double) * (size_t)num_ops,
+                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(
+                h_active.data(),
+                d_active_ops,
+                sizeof(int) * (size_t)num_ops,
+                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(
+                h_prev_pendant.data(),
+                D.d_prev_pendant_length,
+                sizeof(double) * (size_t)D.N,
+                cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(
+                h_prev_proximal.data(),
+                D.d_prev_proximal_length,
+                sizeof(double) * (size_t)D.N,
+                cudaMemcpyDeviceToHost));
+
+            int active_count = 0;
+            int best_op_idx = -1;
+            int best_target_id = -1;
+            double best_ll = -std::numeric_limits<double>::infinity();
+            double best_pendant = 0.0;
+            double best_proximal = 0.0;
+            for (int op_i = 0; op_i < num_ops; ++op_i) {
+                if (h_active[(size_t)op_i] != 0) ++active_count;
+                const double ll = h_best_loglk[(size_t)op_i];
+                if (ll > best_ll) {
+                    best_ll = ll;
+                    best_op_idx = op_i;
+                    const NodeOpInfo& op = h_ops[(size_t)op_i];
+                    const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
+                    best_target_id = target_is_left ? op.left_id : op.right_id;
+                    if (best_target_id >= 0 && best_target_id < D.N) {
+                        best_pendant = h_prev_pendant[(size_t)best_target_id];
+                        best_proximal = h_prev_proximal[(size_t)best_target_id];
+                    }
+                }
+            }
+            std::printf(
+                "[pass-debug] query=%d batch_ops=%d pass=%d active_ops=%d best_op=%d target=%d best_ll=%.12f pendant=%.12f proximal=%.12f\n",
+                debug_query_idx,
+                num_ops,
+                pass + 1,
+                active_count,
+                best_op_idx,
+                best_target_id,
+                best_ll,
+                best_pendant,
+                best_proximal);
+            print_top_ops_summary(
+                h_ops,
+                h_best_loglk,
+                h_prev_pendant,
+                h_prev_proximal,
+                debug_query_idx,
+                pass + 1,
+                debug_topk);
+            if (debug_selected_op >= 0) {
+                print_selected_op_summary(
+                    h_ops,
+                    h_best_loglk,
+                    h_prev_pendant,
+                    h_prev_proximal,
+                    debug_query_idx,
+                    pass + 1,
+                    debug_selected_op);
+            }
+        }
     }
     
     // Argmax on device to get best op index.
@@ -803,7 +1431,8 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
     int smoothing,
     const PlacementPruneConfig& prune_cfg,
     cudaStream_t stream,
-    int pseudo_root_id)
+    int pseudo_root_id,
+    int debug_query_idx)
 {
     if (!prune_cfg.enable_pruning || T.root_id < 0 || T.preorder.empty()) {
         return PlacementEvaluationKernel(
@@ -813,7 +1442,8 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
             d_ops,
             num_ops,
             smoothing,
-            stream);
+            stream,
+            debug_query_idx);
     }
     if (!d_ops || num_ops <= 0) {
         return PlacementResult{};
@@ -920,7 +1550,8 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
                 d_ops,
                 num_ops,
                 smoothing,
-                stream);
+                stream,
+                debug_query_idx);
         }
 
         CUDA_CHECK(cudaMemcpyAsync(
@@ -937,7 +1568,8 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
             d_batch_ops,
             batch_n,
             smoothing,
-            stream);
+            stream,
+            debug_query_idx);
 
         batch_ll.resize((size_t)batch_n);
         CUDA_CHECK(cudaMemcpyAsync(
@@ -992,7 +1624,8 @@ PlacementResult PlacementEvaluationKernelPreorderPruned(
             d_ops,
             num_ops,
             smoothing,
-            stream);
+            stream,
+            debug_query_idx);
     }
     if (best.target_id >= 0 && best.target_id < D.N) {
         CUDA_CHECK(cudaMemcpyAsync(
