@@ -17,6 +17,7 @@ bin/*
 build/
 data/*
 MLIPPER
+output/
 !data/aln.fasta
 !data/query.fasta
 !data/ref.tre
