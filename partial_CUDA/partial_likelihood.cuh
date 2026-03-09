@@ -149,12 +149,15 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(const DeviceT
 
 // Midpoint helper (states=4) used by placement.
 template<int RATE_CATS>
-__device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
+__device__ void compute_midpoint_inner_inner_ratecat(
     const DeviceTree& D,
     const NodeOpInfo& op,
     unsigned int site,
     bool proximal_mode = false,
-    int op_idx = 0);
+    int op_pmat_idx = 0,
+    bool active_thread = true,
+    fp_t* shared_target_mat = nullptr,
+    fp_t* shared_parent_mat = nullptr);
 
 // Generic downward helpers.
 __device__ void compute_downward_inner_inner_generic(const DeviceTree& D, const NodeOpInfo& op, unsigned int site);

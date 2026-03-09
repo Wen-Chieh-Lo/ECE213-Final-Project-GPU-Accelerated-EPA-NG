@@ -94,8 +94,6 @@ struct DeviceTree {
     // Cached helper for tipmap indexing (ceil_log2(states+1)).
     unsigned int log2_stride = 0;
     bool    per_rate_scaling = false;
-    bool    force_generic_downward = false;
-    bool    force_generic_upward = false;
 
     fp_t   *d_lambdas  = nullptr;  // [rate_cats * states]
     fp_t   *d_V        = nullptr;  // [states*states]  row-major
@@ -130,7 +128,7 @@ struct DeviceTree {
     fp_t    *d_clv_mid_base = nullptr;          // [sites * rate_cats * states]
     // Persistent workspace for downward convergence updates (same span as one CLV pool).
     fp_t    *d_downward_scratch = nullptr;      // [capacity_N * sites * rate_cats * states]
-    // Midpoint debug accumulator
+    // Placement midpoint workspace reused across candidate edges.
     fp_t    *d_placement_clv = nullptr;
     // Workspace for derivative/sumtable calculations reused across placements.
     fp_t    *d_sumtable = nullptr;              // [sumtable_capacity_ops * sites * rate_cats * states]
@@ -317,9 +315,6 @@ void UpdateTreeLogLikelihood_device(
     std::vector<struct PlacementResult>* placement_results_out = nullptr,
     int smoothing = 1,
     cudaStream_t           stream = 0);
-
-// Debug helper: pretty-print tree structure (expects root_id to be set)
-void print_tree_structure(const TreeBuildResult& T);
 
 std::vector<NewPlacementQuery> build_placement_query(const std::string& msa_path);
 std::vector<NewPlacementQuery> build_placement_query(

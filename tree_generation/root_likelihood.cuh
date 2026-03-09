@@ -44,6 +44,7 @@ double compute_combined_placement_loglikelihood(
 void compute_combined_loglik_per_op(
     const DeviceTree& D,
     const NodeOpInfo* d_ops,
+    const int* d_op_indices,
     int num_ops,
     const fp_t* d_pendant_pmats, // [num_ops * rate_cats * states * states]
     const fp_t* d_distal_pmats,  // [N * rate_cats * states * states]
@@ -55,6 +56,7 @@ void compute_combined_loglik_per_op(
 void compute_combined_loglik_per_op_device(
     const DeviceTree& D,
     const NodeOpInfo* d_ops,
+    const int* d_op_indices,
     int num_ops,
     const fp_t* d_pendant_pmats, // [num_ops * rate_cats * states * states]
     const fp_t* d_distal_pmats,  // [N * rate_cats * states * states]

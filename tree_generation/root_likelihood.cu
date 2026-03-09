@@ -292,6 +292,7 @@ template<int RATE_CATS>
 __global__ void CombinedPlacementLoglikPerOpKernelStates4(
     DeviceTree D,
     const NodeOpInfo* __restrict__ d_ops,
+    const int* __restrict__ d_op_indices,
     const fp_t* __restrict__ d_pendant_pmats,
     const fp_t* __restrict__ d_distal_pmats,
     const fp_t* __restrict__ d_proximal_pmats,
@@ -299,7 +300,8 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
     size_t per_node_pmat,
     fp_t* __restrict__ d_out)
 {
-    const int op_idx = (int)blockIdx.y;
+    const int op_local = (int)blockIdx.y;
+    const int op_idx = d_op_indices ? d_op_indices[op_local] : op_local;
     if (!d_ops || op_idx < 0 || op_idx >= D.N) return;
     const NodeOpInfo op = d_ops[op_idx];
     const bool target_is_left  = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
@@ -414,6 +416,7 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
 __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
     DeviceTree D,
     const NodeOpInfo* __restrict__ d_ops,
+    const int* __restrict__ d_op_indices,
     const fp_t* __restrict__ d_pendant_pmats,
     const fp_t* __restrict__ d_distal_pmats,
     const fp_t* __restrict__ d_proximal_pmats,
@@ -421,7 +424,8 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
     size_t per_node_pmat,
     fp_t* __restrict__ d_out)
 {
-    const int op_idx = (int)blockIdx.y;
+    const int op_local = (int)blockIdx.y;
+    const int op_idx = d_op_indices ? d_op_indices[op_local] : op_local;
     if (!d_ops || op_idx < 0 || op_idx >= D.N) return;
     const NodeOpInfo op = d_ops[op_idx];
     const bool target_is_left  = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
@@ -524,6 +528,7 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
 void compute_combined_loglik_per_op(
     const DeviceTree& D,
     const NodeOpInfo* d_ops,
+    const int* d_op_indices,
     int num_ops,
     const fp_t* d_pendant_pmats,
     const fp_t* d_distal_pmats,
@@ -540,6 +545,7 @@ void compute_combined_loglik_per_op(
     compute_combined_loglik_per_op_device(
         D,
         d_ops,
+        d_op_indices,
         num_ops,
         d_pendant_pmats,
         d_distal_pmats,
@@ -551,6 +557,7 @@ void compute_combined_loglik_per_op(
 void compute_combined_loglik_per_op_device(
     const DeviceTree& D,
     const NodeOpInfo* d_ops,
+    const int* d_op_indices,
     int num_ops,
     const fp_t* d_pendant_pmats,
     const fp_t* d_distal_pmats,
@@ -579,6 +586,7 @@ void compute_combined_loglik_per_op_device(
             CombinedPlacementLoglikPerOpKernelStates4<4><<<grid, block, 0, stream>>>(
                 D,
                 d_ops,
+                d_op_indices,
                 d_pendant_pmats,
                 d_distal_pmats,
                 d_proximal_pmats,
@@ -589,6 +597,7 @@ void compute_combined_loglik_per_op_device(
             CombinedPlacementLoglikPerOpKernelStates4<1><<<grid, block, 0, stream>>>(
                 D,
                 d_ops,
+                d_op_indices,
                 d_pendant_pmats,
                 d_distal_pmats,
                 d_proximal_pmats,
@@ -599,6 +608,7 @@ void compute_combined_loglik_per_op_device(
             CombinedPlacementLoglikPerOpKernelStates4<8><<<grid, block, 0, stream>>>(
                 D,
                 d_ops,
+                d_op_indices,
                 d_pendant_pmats,
                 d_distal_pmats,
                 d_proximal_pmats,
@@ -609,6 +619,7 @@ void compute_combined_loglik_per_op_device(
             CombinedPlacementLoglikPerOpKernelGeneric<<<grid, block, 0, stream>>>(
                 D,
                 d_ops,
+                d_op_indices,
                 d_pendant_pmats,
                 d_distal_pmats,
                 d_proximal_pmats,
@@ -620,6 +631,7 @@ void compute_combined_loglik_per_op_device(
         CombinedPlacementLoglikPerOpKernelGeneric<<<grid, block, 0, stream>>>(
             D,
             d_ops,
+            d_op_indices,
             d_pendant_pmats,
             d_distal_pmats,
             d_proximal_pmats,

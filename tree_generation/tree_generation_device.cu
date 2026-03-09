@@ -387,8 +387,6 @@ DeviceTree upload_to_gpu(
     D.rate_cats = rate_cats;
     D.log2_stride = ceil_log2_u32((unsigned int)(D.states + 1));
     D.per_rate_scaling = per_rate_scaling;
-    D.force_generic_downward = (std::getenv("MLIPPER_FORCE_GENERIC_DOWNWARD") != nullptr);
-    D.force_generic_upward = (std::getenv("MLIPPER_FORCE_GENERIC_UPWARD") != nullptr);
     
     // --- alloc topology ---
     CUDA_CHECK(cudaMalloc(&D.d_lambdas, sizeof(fp_t) * (size_t)D.rate_cats * D.states));
@@ -738,8 +736,6 @@ double EvaluateTreeLogLikelihood_device(
         nullptr,
         0.0,
         stream);
-    printf("Root ID: %d\n", T.root_id);
-    printf("Tree loglikelihood = %.10f\n", total);
     return total;
 }
 
@@ -763,7 +759,7 @@ void UpdateTreeLogLikelihood_device(
 
     auto free_ops = [&]() {
         if (d_ops) {
-            CUDA_CHECK(cudaStreamSynchronize(stream)); // debug safety
+            CUDA_CHECK(cudaStreamSynchronize(stream));
             CUDA_CHECK(cudaFree(d_ops));
             d_ops = nullptr;
         }
@@ -949,16 +945,15 @@ void UpdateTreeLogLikelihood_device(
         placement_results_out->reserve((size_t)D.placement_queries);
     }
 
-    int max_debug_queries = D.placement_queries;
+    int queries_to_process = D.placement_queries;
     if (const char* env_max_queries = std::getenv("MLIPPER_MAX_QUERIES")) {
         const int parsed = std::atoi(env_max_queries);
         if (parsed > 0) {
-            max_debug_queries = std::min(D.placement_queries, parsed);
+            queries_to_process = std::min(D.placement_queries, parsed);
         }
     }
 
-    for (int qi = 0; qi < max_debug_queries; ++qi) {
-        // printf("Placing query %d \n", qi + 1);
+    for (int qi = 0; qi < queries_to_process; ++qi) {
 
         CUDA_CHECK(cudaMemset(D.d_new_pendant_length, 0, sizeof(double) * D.N));
         CUDA_CHECK(cudaMemset(D.d_new_proximal_length, 0, sizeof(double) * D.N));
@@ -981,16 +976,6 @@ void UpdateTreeLogLikelihood_device(
 	            prune_cfg,
 	            stream,
 	            T.root_id);
-
-        int best_edge_num = -1;
-        if (pres.target_id >= 0 && pres.target_id < (int)T.nodes.size()) {
-            const JplaceTreeExport jplace_tree = build_jplace_tree_export(T);
-            if (pres.target_id < (int)jplace_tree.edge_num_by_node.size()) {
-                best_edge_num = jplace_tree.edge_num_by_node[(size_t)pres.target_id];
-            }
-        }
-        // printf("Query %d -> insert in: %d edge=%d (loglik=%.6f) pendant=%.6f proximal=%.6f\n",
-        //        qi, pres.target_id, best_edge_num, pres.loglikelihood, pres.pendant_length, pres.proximal_length);
         if (placement_results_out) {
             placement_results_out->push_back(pres);
         }

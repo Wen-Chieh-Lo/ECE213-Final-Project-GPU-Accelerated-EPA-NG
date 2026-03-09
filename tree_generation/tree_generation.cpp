@@ -45,10 +45,8 @@ static PlacementQueryBatch make_query_batch(
     const size_t qcount = batch.count;
     batch.branch_lengths.assign(qcount, fp_t(0.5));
     batch.query_chars.resize(qcount * sites, 4);
-    printf("Preparing %zu placement queries on GPU (sites=%zu)\n", qcount, sites);
     for (size_t qi = 0; qi < qcount; ++qi) {
         const auto& q = placement_queries[qi];
-        printf("Q size: %zu\n", q.msa.size());
         if (q.pendant > fp_t(0)) batch.branch_lengths[qi] = q.pendant;
         if (q.msa.size() != sites) {
             throw std::runtime_error("Query sequence length mismatch.");

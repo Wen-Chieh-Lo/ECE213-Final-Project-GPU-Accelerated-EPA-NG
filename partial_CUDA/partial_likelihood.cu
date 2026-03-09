@@ -1654,33 +1654,44 @@ __device__ __forceinline__ void compute_inner_inner_site_ratecat(
     
 }
 
+template<int RATE_CATS>
+__device__ __forceinline__ void load_midpoint_pmat_pair_ratecat(
+    fp_t* shared_target_mat,
+    fp_t* shared_parent_mat,
+    const fp_t* target_mat,
+    const fp_t* parent_mat)
+{
+    const int total_mat_elems = RATE_CATS * 16;
+    for (int idx = threadIdx.x; idx < total_mat_elems; idx += blockDim.x) {
+        shared_target_mat[idx] = target_mat[idx];
+        shared_parent_mat[idx] = parent_mat[idx];
+    }
+    __syncthreads();
+}
+
 // Midpoint helper for down pass (states=4): parent.down + sibling.up -> mid CLV.
 template<int RATE_CATS>
-__device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
+__device__ void compute_midpoint_inner_inner_ratecat(
     const DeviceTree& D,
     const NodeOpInfo& op,
     unsigned int site,
     bool proximal_mode,
-    int op_idx)
+    int op_pmat_idx,
+    bool active_thread,
+    fp_t* shared_target_mat,
+    fp_t* shared_parent_mat)
 {
     if (!D.d_clv_mid) return;
     if (op.clv_pool != static_cast<uint8_t>(CLV_POOL_DOWN)) return;
 
     const bool target_is_left = (op.dir_tag == static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
     const int target_id  = target_is_left ? op.left_id  : op.right_id;
-    const int sibling_id = target_is_left ? op.right_id : op.left_id;
     if (op.parent_id < 0 || target_id < 0) return;
 
     const size_t per_node = per_node_span(D);
     const size_t site_off = (size_t)site * (size_t)RATE_CATS * 4;
 
     fp_t*         target_mid = D.d_clv_mid + (size_t)target_id * per_node + site_off;
-    const fp_t*   parent_down = D.d_clv_down
-        ? D.d_clv_down + (size_t)op.parent_id * per_node + site_off
-        : nullptr;
-    const fp_t*   sibling_up  = D.d_clv_up
-        ? D.d_clv_up + (size_t)sibling_id * per_node + site_off
-        : nullptr;
     const fp_t*   mid_base    = D.d_clv_mid_base
         ? D.d_clv_mid_base + (size_t)target_id * per_node + site_off
         : nullptr;
@@ -1688,10 +1699,10 @@ __device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
     const fp_t* target_up  = proximal_mode
         ? (D.d_query_clv ? (D.d_query_clv + site_off) : nullptr)
         : (D.d_clv_up    ? (D.d_clv_up   + (size_t)target_id * per_node + site_off) : nullptr);
-    if (!target_up || !parent_down || !sibling_up) return;
+    if (!target_up) return;
     const fp_t* target_mat = nullptr;
     if (proximal_mode && D.d_query_pmat) {
-        target_mat = D.d_query_pmat + (size_t)op_idx * (size_t)RATE_CATS * 16;
+        target_mat = D.d_query_pmat + (size_t)op_pmat_idx * (size_t)RATE_CATS * 16;
     } else if (D.d_pmat_mid_prox) {
         target_mat = D.d_pmat_mid_prox + (size_t)target_id * (size_t)RATE_CATS * 16;
     } else if (D.d_pmat_mid) {
@@ -1709,6 +1720,15 @@ __device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
         // Avoid using full-length pmats on parent side in proximal mode.
         parent_mat = nullptr;
     }
+    if (!target_mat || !parent_mat || !mid_base) return;
+
+    load_midpoint_pmat_pair_ratecat<RATE_CATS>(
+        shared_target_mat,
+        shared_parent_mat,
+        target_mat,
+        parent_mat);
+    if (!active_thread) return;
+
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* target_up_scaler = proximal_mode ? nullptr : up_scaler_ptr(D, target_id, site);
@@ -1721,33 +1741,25 @@ __device__ __forceinline__ void compute_midpoint_inner_inner_ratecat(
         }
         write_scaler_shift(D, mid_scaler, r, inherited_shift);
 
-        const fp_t* Mtarget = target_mat + (size_t)r * 16;
-        const fp_t* Mparent = parent_mat + (size_t)r * 16;
-        const fp4_t Pup   = reinterpret_cast<const fp4_t*>(target_up   + (size_t)r * 4)[0];
+        const fp_t* Mtarget = shared_target_mat + (size_t)r * 16;
+        const fp_t* Mparent = shared_parent_mat + (size_t)r * 16;
+        const fp4_t Pup   = reinterpret_cast<const fp4_t*>(target_up + (size_t)r * 4)[0];
         fp_t*       Pmid  = target_mid + (size_t)r * 4;
-        const fp_t* Pbase = mid_base ? (mid_base + (size_t)r * 4) : nullptr;
+        const fp4_t Pbase = reinterpret_cast<const fp4_t*>(mid_base + (size_t)r * 4)[0];
 
-        const fp_t src0 = Pbase[0];
-        const fp_t src1 = Pbase[1];
-        const fp_t src2 = Pbase[2];
-        const fp_t src3 = Pbase[3];
+        const fp_t p0 = fp_dot4(make_fp4(Mparent[0], Mparent[1], Mparent[2], Mparent[3]), Pbase) *
+                        fp_dot4(make_fp4(Mtarget[0], Mtarget[1], Mtarget[2], Mtarget[3]), Pup);
+        const fp_t p1 = fp_dot4(make_fp4(Mparent[4], Mparent[5], Mparent[6], Mparent[7]), Pbase) *
+                        fp_dot4(make_fp4(Mtarget[4], Mtarget[5], Mtarget[6], Mtarget[7]), Pup);
+        const fp_t p2 = fp_dot4(make_fp4(Mparent[8], Mparent[9], Mparent[10], Mparent[11]), Pbase) *
+                        fp_dot4(make_fp4(Mtarget[8], Mtarget[9], Mtarget[10], Mtarget[11]), Pup);
+        const fp_t p3 = fp_dot4(make_fp4(Mparent[12], Mparent[13], Mparent[14], Mparent[15]), Pbase) *
+                        fp_dot4(make_fp4(Mtarget[12], Mtarget[13], Mtarget[14], Mtarget[15]), Pup);
 
-        // propagate parent_down half-branch
-        const fp_t par0 = fp_dot4(make_fp4(Mparent[0], Mparent[1], Mparent[2], Mparent[3]), make_fp4(src0, src1, src2, src3));
-        const fp_t par1 = fp_dot4(make_fp4(Mparent[4], Mparent[5], Mparent[6], Mparent[7]), make_fp4(src0, src1, src2, src3));
-        const fp_t par2 = fp_dot4(make_fp4(Mparent[8], Mparent[9], Mparent[10], Mparent[11]), make_fp4(src0, src1, src2, src3));
-        const fp_t par3 = fp_dot4(make_fp4(Mparent[12], Mparent[13], Mparent[14], Mparent[15]), make_fp4(src0, src1, src2, src3));
-
-        // propagate target up branch
-        const fp_t tgt0 = fp_dot4(make_fp4(Mtarget[0], Mtarget[1], Mtarget[2], Mtarget[3]), Pup);
-        const fp_t tgt1 = fp_dot4(make_fp4(Mtarget[4], Mtarget[5], Mtarget[6], Mtarget[7]), Pup);
-        const fp_t tgt2 = fp_dot4(make_fp4(Mtarget[8], Mtarget[9], Mtarget[10], Mtarget[11]), Pup);
-        const fp_t tgt3 = fp_dot4(make_fp4(Mtarget[12], Mtarget[13], Mtarget[14], Mtarget[15]), Pup);
-
-        Pmid[0] = par0 * tgt0;
-        Pmid[1] = par1 * tgt1;
-        Pmid[2] = par2 * tgt2;
-        Pmid[3] = par3 * tgt3;
+        Pmid[0] = p0;
+        Pmid[1] = p1;
+        Pmid[2] = p2;
+        Pmid[3] = p3;
         
         fp_t col_scale_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
         int scaling_exponent;
@@ -1770,19 +1782,28 @@ template __device__ void compute_midpoint_inner_inner_ratecat<1>(
     const NodeOpInfo&,
     unsigned int,
     bool,
-    int);
+    int,
+    bool,
+    fp_t*,
+    fp_t*);
 template __device__ void compute_midpoint_inner_inner_ratecat<4>(
     const DeviceTree&,
     const NodeOpInfo&,
     unsigned int,
     bool,
-    int);
+    int,
+    bool,
+    fp_t*,
+    fp_t*);
 template __device__ void compute_midpoint_inner_inner_ratecat<8>(
     const DeviceTree&,
     const NodeOpInfo&,
     unsigned int,
     bool,
-    int);
+    int,
+    bool,
+    fp_t*,
+    fp_t*);
 
 // Combine query CLV (after applying pendant PMAT) with midpoint CLV for placement.
 template<int RATE_CATS>
@@ -2410,7 +2431,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Upward_Kernel(
             const NodeOpInfo& op = ops[i];
             switch (op.op_type) {
                 case OP_TIP_TIP:
-                    if (D.states == 4 && !D.force_generic_upward) {
+                    if (D.states == 4) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_tip_tip_site_ratecat_nolookup<1>(D, op, site);
@@ -2430,7 +2451,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Upward_Kernel(
                     }
                     break;
                 case OP_TIP_INNER:
-                    if (D.states == 4 && !D.force_generic_upward) {
+                    if (D.states == 4) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_tip_inner_site_ratecat<1>(D, op, site);
@@ -2450,7 +2471,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Upward_Kernel(
                     }
                     break;
                 case OP_INNER_INNER:
-                    if (D.states == 4 && !D.force_generic_upward) {
+                    if (D.states == 4) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_inner_inner_site_ratecat<1>(D, op, site);
@@ -2492,7 +2513,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Downward_Kernel(
             const NodeOpInfo& op = ops[i];
             switch (op.op_type) {
                 case OP_DOWN_INNER_INNER:
-                    if (D.states == 4 && !D.force_generic_downward) {
+                    if (D.states == 4) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_downward_inner_inner_ratecat<1>(D, op, site);
@@ -2512,7 +2533,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Downward_Kernel(
                     }
                     break;
                 case OP_DOWN_INNER_TIP:
-                    if (D.states == 4 && !D.force_generic_downward) {
+                    if (D.states == 4) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_downward_inner_tip_ratecat<1>(D, op, site);
@@ -2532,7 +2553,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Downward_Kernel(
                     }
                     break;
                 case OP_DOWN_TIP_INNER:
-                    if (D.states == 4 && !D.force_generic_downward) {
+                    if (D.states == 4) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_downward_tip_inner_ratecat<1>(D, op, site);
@@ -2552,7 +2573,7 @@ __global__ void Rtree_Likelihood_Site_Parallel_Downward_Kernel(
                     }
                     break;
                 case OP_DOWN_TIP_TIP:
-                    if (D.states == 4 && !D.force_generic_downward) {
+                    if (D.states == 4) {
                         switch (D.rate_cats) {
                             case 1:
                                 compute_downward_tip_tip_ratecat<1>(D, op, site);

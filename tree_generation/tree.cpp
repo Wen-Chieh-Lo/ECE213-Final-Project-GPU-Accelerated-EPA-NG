@@ -34,76 +34,6 @@ static std::string resolve_path(const std::filesystem::path& base, const std::st
     return (base / candidate).string();
 }
 
-void print_tree_rec(const TreeBuildResult& T, int node_id, int depth)
-{
-    if (node_id < 0) return;
-    const TreeNode &nd = T.nodes[node_id];
-
-    for (int i = 0; i < depth; ++i) std::cout << "  ";
-
-    std::cout << "[" << nd.id << "]";
-    if (nd.is_tip) {
-        std::cout << " (tip: " << nd.name << ")";
-    } else {
-        std::cout << " (inner)";
-    }
-
-    if (nd.parent >= 0) {
-        std::cout << "  len=" << nd.branch_length_to_parent
-                  << "  parent=" << nd.parent;
-    } else {
-        std::cout << "  <ROOT>";
-    }
-    std::cout << "\n";
-
-    if (!nd.is_tip) {
-        if (nd.left  >= 0) print_tree_rec(T, nd.left,  depth + 1);
-        if (nd.right >= 0) print_tree_rec(T, nd.right, depth + 1);
-    }
-}
-
-void print_tree_structure(const TreeBuildResult& T)
-{
-    std::cout << "==== Tree structure (indented) ====\n";
-    if (T.root_id < 0) {
-        std::cout << "No root_id set!\n";
-        return;
-    }
-    print_tree_rec(T, T.root_id, 0);
-    std::cout << "===================================\n";
-}
-
-static void print_pmat_host_node_rc0(const HostPacking& H, int node_id, int states, int rate_cats)
-{
-    if (node_id < 0 || states <= 0 || rate_cats <= 0) return;
-    const size_t per_node = (size_t)rate_cats * (size_t)states * (size_t)states;
-    const size_t base = (size_t)node_id * per_node;
-    if (H.pmats.size() < base + (size_t)states * (size_t)states) return;
-
-    std::cout << "PMAT node " << node_id << " rc 0:\n";
-    const fp_t* P = H.pmats.data() + base;
-    for (int i = 0; i < states; ++i) {
-        for (int j = 0; j < states; ++j) {
-            std::cout << P[i * states + j];
-            if (j + 1 < states) std::cout << " ";
-        }
-        std::cout << "\n";
-    }
-}
-
-static void print_edges_by_length(const TreeBuildResult& T, double target_len, double tol = 1e-6)
-{
-    std::cout << "Edges with branch length ~= " << target_len << ":\n";
-    for (const auto& nd : T.nodes) {
-        if (nd.parent < 0) continue;
-        if (std::fabs(nd.branch_length_to_parent - target_len) <= tol) {
-            std::cout << "  node_id=" << nd.id
-                      << " parent=" << nd.parent
-                      << " len=" << nd.branch_length_to_parent << "\n";
-        }
-    }
-}
-
 static void normalize_vector(std::vector<double>& vec) {
     double sum = 0.0;
     for (double v : vec) sum += v;
@@ -339,13 +269,6 @@ int main(int argc, char** argv) {
     std::vector<NewPlacementQuery> placement_queries =
         build_placement_query(resolve_path(config_base, query_alignment_cfg));
     printf("Precision mode: %s\n", FP_MODE_NAME);
-#if !defined(MLIPPER_USE_DOUBLE)
-    printf("Warning: float precision path is still experimental.\n");
-#endif
-    printf("Query sequences for placement: %zu\n", placement_queries.size());
-    for(auto & q : placement_queries) {
-        printf("  Query '%s'\n", q.msa_name.c_str());
-    }
     // const auto start_gpu = std::chrono::steady_clock::now();
     auto res = BuildAllToGPU(
         msa_names,
@@ -369,7 +292,6 @@ int main(int argc, char** argv) {
 
     std::cout << "Uploaded. N=" << res.dev.N << ", tips=" << res.dev.tips
                 << ", per_node_elems=" << res.dev.per_node_elems() << "\n";
-    print_tree_structure(res.tree);
 
     
     const auto start_gpu = std::chrono::steady_clock::now();
@@ -458,7 +380,6 @@ int main(int argc, char** argv) {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    print_tree_structure(res.tree);
     free_device_tree(res.dev);
 
     return 0;
