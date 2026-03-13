@@ -24,6 +24,7 @@ mkdir -p "$OUTPUT_DIR"
 
 declare -A GPU_WALL_MS_BY_KEY
 declare -A TOP1_ACC_BY_KEY
+declare -A TOP5_ACC_BY_KEY
 declare -A EPA_NG_MS_BY_DATASET
 
 ensure_file() {
@@ -158,32 +159,38 @@ print_summary_table() {
     local epa_ms
     local baseline_ms
     local fast_ms
-    local baseline_acc
-    local fast_acc
+    local baseline_top1_acc
+    local baseline_top5_acc
+    local fast_top1_acc
+    local fast_top5_acc
     local baseline_speedup
     local fast_speedup
 
     echo
-    printf '%-8s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n' \
-        "dataset" "epa_ng_s" "base_s" "base_acc" "base_spd" "fast_s" "fast_acc" "fast_spd"
-    printf '%-8s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n' \
-        "-------" "--------" "------" "--------" "--------" "------" "--------" "--------"
+    printf '%-8s %-12s %-12s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n' \
+        "dataset" "epa_ng_s" "base_s" "base_t1" "base_t5" "base_spd" "fast_s" "fast_t1" "fast_t5" "fast_spd"
+    printf '%-8s %-12s %-12s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n' \
+        "-------" "--------" "------" "-------" "-------" "--------" "------" "-------" "-------" "--------"
     for dataset in 1k 2k 5k; do
         epa_ms="${EPA_NG_MS_BY_DATASET["$dataset"]:-NA}"
         baseline_ms="${GPU_WALL_MS_BY_KEY["$dataset|baseline"]:-NA}"
         fast_ms="${GPU_WALL_MS_BY_KEY["$dataset|fast"]:-NA}"
-        baseline_acc="${TOP1_ACC_BY_KEY["$dataset|baseline"]:-NA}"
-        fast_acc="${TOP1_ACC_BY_KEY["$dataset|fast"]:-NA}"
+        baseline_top1_acc="${TOP1_ACC_BY_KEY["$dataset|baseline"]:-NA}"
+        baseline_top5_acc="${TOP5_ACC_BY_KEY["$dataset|baseline"]:-NA}"
+        fast_top1_acc="${TOP1_ACC_BY_KEY["$dataset|fast"]:-NA}"
+        fast_top5_acc="${TOP5_ACC_BY_KEY["$dataset|fast"]:-NA}"
         baseline_speedup="$(format_speedup "$epa_ms" "$baseline_ms")"
         fast_speedup="$(format_speedup "$epa_ms" "$fast_ms")"
-        printf '%-8s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n' \
+        printf '%-8s %-12s %-12s %-12s %-12s %-12s %-12s %-12s %-12s %-12s\n' \
             "$dataset" \
             "$(format_seconds_from_ms "$epa_ms")" \
             "$(format_seconds_from_ms "$baseline_ms")" \
-            "$baseline_acc" \
+            "$baseline_top1_acc" \
+            "$baseline_top5_acc" \
             "$baseline_speedup" \
             "$(format_seconds_from_ms "$fast_ms")" \
-            "$fast_acc" \
+            "$fast_top1_acc" \
+            "$fast_top5_acc" \
             "$fast_speedup"
     done
 }
@@ -250,6 +257,7 @@ run_mode() {
     local gpu_kernel_ms
     local gpu_wall_ms
     local top1_exact_pct
+    local top5_exact_pct
     local -a mode_env
 
     mkdir -p "$run_dir"
@@ -305,14 +313,17 @@ run_mode() {
     gpu_kernel_ms="$(extract_value 'GPU kernel time =' "$run_log")"
     gpu_wall_ms="$(extract_value 'GPU Wall Clock time =' "$run_log")"
     top1_exact_pct="$(extract_percent 'top-1 exact edge match (tree split):' "$compare_log")"
+    top5_exact_pct="$(extract_percent "pred top-1 in truth top-${COMPARE_TOPK} (tree split):" "$compare_log")"
     GPU_WALL_MS_BY_KEY["$dataset_size|$mode"]="$gpu_wall_ms"
     TOP1_ACC_BY_KEY["$dataset_size|$mode"]="$top1_exact_pct"
+    TOP5_ACC_BY_KEY["$dataset_size|$mode"]="$top5_exact_pct"
 
-    printf 'Completed %-8s %-8s runtime=%s ms acc=%s\n' \
+    printf 'Completed %-8s %-8s runtime=%s ms top-1 acc=%s top-5 acc=%s\n' \
         "$dataset_size" \
         "$mode" \
         "$(format_ms "$gpu_wall_ms")" \
-        "$top1_exact_pct"
+        "$top1_exact_pct" \
+        "$top5_exact_pct"
 }
 
 ensure_runtime_dataset

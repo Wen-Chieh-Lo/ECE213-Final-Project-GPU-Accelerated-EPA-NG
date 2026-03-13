@@ -92,25 +92,27 @@ The script performs the following steps automatically:
 4. generates missing EPA-ng truth placements for 1k, 2k, and 5k query sets
 5. runs MLIPPER in `baseline` and `fast` modes
 6. compares each MLIPPER result against the EPA-ng truth with [`scripts/compare_jplace.py`](scripts/compare_jplace.py)
-7. prints a CLI summary table with runtime, top-1 accuracy, and speedup relative to EPA-ng
+7. prints a CLI summary table with runtime, top-1 accuracy, top-5 accuracy, and speedup relative to EPA-ng
 
 Example output format:
 
 ```text
-dataset  epa_ng_s     base_s       base_acc     base_spd     fast_s       fast_acc     fast_spd
-1k       ...          ...          ...          ...          ...          ...          ...
-2k       ...          ...          ...          ...          ...          ...          ...
-5k       ...          ...          ...          ...          ...          ...          ...
+dataset  epa_ng_s     base_s       base_t1      base_t5      base_spd     fast_s       fast_t1      fast_t5      fast_spd
+1k       ...          ...          ...          ...          ...          ...          ...          ...          ...
+2k       ...          ...          ...          ...          ...          ...          ...          ...          ...
+5k       ...          ...          ...          ...          ...          ...          ...          ...          ...
 ```
 
 Column definitions:
 
 - `epa_ng_s`: EPA-ng wall-clock runtime in seconds
 - `base_s`: MLIPPER baseline runtime in seconds
-- `base_acc`: baseline top-1 exact edge match accuracy
+- `base_t1`: baseline top-1 exact edge match accuracy
+- `base_t5`: baseline top-5 truth coverage accuracy
 - `base_spd`: baseline speedup relative to EPA-ng
 - `fast_s`: MLIPPER fast runtime in seconds
-- `fast_acc`: fast top-1 exact edge match accuracy
+- `fast_t1`: fast top-1 exact edge match accuracy
+- `fast_t5`: fast top-5 truth coverage accuracy
 - `fast_spd`: fast speedup relative to EPA-ng
 
 ## Output Locations
