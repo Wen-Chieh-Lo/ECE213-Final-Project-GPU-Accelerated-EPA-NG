@@ -35,6 +35,20 @@ ensure_file() {
     fi
 }
 
+ensure_binary() {
+    local binary_path="$ROOT_DIR/MLIPPER"
+    if [[ -x "$binary_path" ]]; then
+        return
+    fi
+
+    echo "MLIPPER binary not found. Building float binary."
+    make float
+    if [[ ! -x "$binary_path" ]]; then
+        echo "Failed to build MLIPPER binary: $binary_path" >&2
+        exit 1
+    fi
+}
+
 ensure_runtime_dataset() {
     local file
     local missing=0
@@ -332,9 +346,7 @@ TRUTH_1K="$ROOT_DIR/output/runtime_benchmarks/epa_ng_reference/query_1k/epa_resu
 TRUTH_2K="$ROOT_DIR/output/runtime_benchmarks/epa_ng_reference/query_2k/epa_result.jplace"
 TRUTH_5K="$ROOT_DIR/output/runtime_benchmarks/epa_ng_reference/query_5k/epa_result.jplace"
 
-echo "Building float binary"
-make float
-
+ensure_binary
 ensure_epa_ng
 ensure_truth_jplace "$QUERY_1K" "query_1k" "$TRUTH_1K"
 ensure_truth_jplace "$QUERY_2K" "query_2k" "$TRUTH_2K"

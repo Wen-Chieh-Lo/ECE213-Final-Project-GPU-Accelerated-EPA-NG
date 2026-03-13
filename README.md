@@ -87,7 +87,7 @@ From inside the container, run:
 The script performs the following steps automatically:
 
 1. extracts `data/neotrop_runtime_dataset.tar.gz` if the required dataset files are missing
-2. rebuilds the float binary with `make float`
+2. uses the prebuilt `MLIPPER` binary if present; otherwise builds it with `make float`
 3. checks that `epa-ng` is available in the configured conda environment
 4. generates missing EPA-ng truth placements for 1k, 2k, and 5k query sets
 5. runs MLIPPER in `baseline` and `fast` modes
