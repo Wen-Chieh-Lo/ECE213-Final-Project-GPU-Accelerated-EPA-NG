@@ -19,6 +19,7 @@ CXX := g++
 # ==========================================
 DEBUG ?= 0
 USE_DOUBLE ?= 1
+LINEINFO ?= 0
 BUILD_DIR ?= build
 # ==========================================
 # libpll
@@ -61,6 +62,10 @@ ifeq ($(DEBUG),1)
     NVCCFLAGS += -G -O0 -lineinfo
 endif
 
+ifeq ($(LINEINFO),1)
+    NVCCFLAGS += -lineinfo
+endif
+
 ifeq ($(USE_DOUBLE),1)
     CXXFLAGS  += -DMLIPPER_USE_DOUBLE
     NVCCFLAGS += -DMLIPPER_USE_DOUBLE
@@ -72,7 +77,8 @@ endif
 CPU_SRCS  := pmatrix/pmat.cpp \
              tree_generation/tree_generation.cpp \
              tree_generation/parse_file.cpp \
-             tree_generation/tree.cpp
+             tree_generation/tree.cpp \
+             tree_generation/seq_preproc.cpp
 
 CUDA_SRCS := tree_generation/tree_generation_device.cu \
              tree_generation/tree_placement.cu \
@@ -102,7 +108,7 @@ FORCE:
 
 $(BUILD_CONFIG): FORCE
 	@mkdir -p $(dir $(BUILD_CONFIG))
-	@printf "DEBUG=%s\nUSE_DOUBLE=%s\nCUDA_HOME=%s\n" "$(DEBUG)" "$(USE_DOUBLE)" "$(CUDA_HOME)" > $(BUILD_CONFIG).tmp
+	@printf "DEBUG=%s\nUSE_DOUBLE=%s\nLINEINFO=%s\nCUDA_HOME=%s\n" "$(DEBUG)" "$(USE_DOUBLE)" "$(LINEINFO)" "$(CUDA_HOME)" > $(BUILD_CONFIG).tmp
 	@cmp -s $(BUILD_CONFIG).tmp $(BUILD_CONFIG) 2>/dev/null || mv $(BUILD_CONFIG).tmp $(BUILD_CONFIG)
 	@rm -f $(BUILD_CONFIG).tmp
 

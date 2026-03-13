@@ -19,6 +19,10 @@
 #include "partial_likelihood.cuh"
 #include <tbb/parallel_for.h>
 
+namespace {
+
+// ----- Downward-op construction helpers -----
+
 static inline int down_op_type_for_target(bool target_is_tip, bool sibling_is_tip) {
     if (target_is_tip && sibling_is_tip) return static_cast<int>(OP_DOWN_TIP_TIP);
     if (target_is_tip) return static_cast<int>(OP_DOWN_TIP_INNER);
@@ -26,22 +30,22 @@ static inline int down_op_type_for_target(bool target_is_tip, bool sibling_is_ti
     return static_cast<int>(OP_DOWN_INNER_INNER);
 }
 
-static inline void push_down_op(
+static inline void append_downward_op(
     std::vector<NodeOpInfo>& ops,
     int parent_id,
     int left_id,
     int right_id,
     bool left_is_tip,
     bool right_is_tip,
-    const std::vector<int>& node2tip,
+    const std::vector<int>& node_to_tip,
     uint8_t dir_tag)
 {
     NodeOpInfo op{};
     op.parent_id = parent_id;
     op.left_id   = left_id;
     op.right_id  = right_id;
-    op.left_tip_index  = left_is_tip  ? node2tip[left_id]  : -1;
-    op.right_tip_index = right_is_tip ? node2tip[right_id] : -1;
+    op.left_tip_index  = left_is_tip  ? node_to_tip[left_id]  : -1;
+    op.right_tip_index = right_is_tip ? node_to_tip[right_id] : -1;
     op.clv_pool = static_cast<uint8_t>(CLV_POOL_DOWN);
     op.dir_tag  = dir_tag;
 
@@ -52,31 +56,15 @@ static inline void push_down_op(
     ops.push_back(op);
 }
 
-// forward decl for device likelihood wrapper
-double EvaluateTreeLogLikelihood_device(
-    const DeviceTree&      D,
-    const TreeBuildResult& T,
-    const HostPacking&     H,
-    const std::vector<double>& pi,
-    const std::vector<double>& rate_weights,
-    cudaStream_t stream = 0);
-    
-void UpdateTreeLogLikelihood_device(
-    DeviceTree&            D,
-    TreeBuildResult&       T,
-    HostPacking&           H,
-    const EigResult& er,
-    const std::vector<double>& rate_multipliers,
-    std::vector<PlacementResult>* placement_results_out,
-    int smoothing,
-    cudaStream_t           stream);
+} // namespace
+
+// ----- Host-side PMAT staging -----
 
 // Build transition probability matrices for each node/rate category on host.
 void fill_pmats_in_host_packing(
     const TreeBuildResult&       T,
     HostPacking&                 H,
     const EigResult&             er,
-    const std::vector<double>&   pi,                 // len = states
     const std::vector<double>&   rate_multipliers,   // len = rate_cats (per-category rate multipliers)
     int states,
     int rate_cats,
@@ -163,39 +151,7 @@ void fill_pmats_in_host_packing(
     }
 }
 
-void fill_query_pmats(
-    PlacementQueryBatch&         Q,
-    const EigResult&             er,
-    const std::vector<double>&   rate_multipliers,
-    int states,
-    int rate_cats)
-{
-    const size_t per_query = (size_t)rate_cats * states * states;
-    const size_t qcount = Q.count;
-    Q.query_pmats.assign(per_query * qcount, fp_t(0));
-    if (Q.branch_lengths.size() != qcount) {
-        Q.branch_lengths.assign(qcount, fp_t(0.5));
-    }
-    for (size_t qi = 0; qi < qcount; ++qi) {
-        fp_t* base = Q.query_pmats.data() + qi * per_query;
-        double blen  = static_cast<double>(Q.branch_lengths[qi]);
-        std::vector<double> pbuf((size_t)states * (size_t)states);
-        for (int rc = 0; rc < rate_cats; ++rc) {
-            double r = rate_multipliers[rc];  // rate category multiplier
-            double t = blen;                  // branch length
-            double p = 0;
-
-            fp_t* P = base + (size_t)rc * states * states;
-
-            pmatrix_from_triple(
-                er.Vinv.data(), er.V.data(), er.lambdas.data(),
-                            r, t, p, pbuf.data(), states);
-            for (size_t idx = 0; idx < pbuf.size(); ++idx) {
-                P[idx] = static_cast<fp_t>(pbuf[idx]);
-            }
-        }
-    }
-}
+// ----- Per-query CLV staging -----
 
 // Select view for a specific query's PMAT chunk.
 DeviceTree make_query_view(const DeviceTree& D, int query_idx) {
@@ -233,7 +189,7 @@ __global__ void BuildQueryClvKernel(
     }
 }
 
-void build_query_clv_on_device(
+void build_query_clv(
     const DeviceTree& D,
     int query_idx,
     cudaStream_t stream)
@@ -282,9 +238,11 @@ HostPacking pack_host_arrays_from_tree_and_msa(
     }
     
     // Build tip name -> MSA row lookup
-    std::unordered_map<std::string,int> name2row;
-    name2row.reserve(msa_tip_names.size()*2);
-    for (int r = 0; r < (int)msa_tip_names.size(); ++r) name2row[msa_tip_names[r]] = r;
+    std::unordered_map<std::string,int> name_to_row;
+    name_to_row.reserve(msa_tip_names.size()*2);
+    for (int row_idx = 0; row_idx < (int)msa_tip_names.size(); ++row_idx) {
+        name_to_row[msa_tip_names[row_idx]] = row_idx;
+    }
 
     // Collect tip order in postorder and the corresponding node ids
     std::vector<int> tip_node_ids_host;
@@ -306,8 +264,8 @@ HostPacking pack_host_arrays_from_tree_and_msa(
         for (int t = 0; t < tips; ++t) {
             const int node_id = tip_node_ids_host[t];
             const auto& name  = T.nodes[node_id].name;
-            auto it = name2row.find(name);
-            if (it == name2row.end())
+            auto it = name_to_row.find(name);
+            if (it == name_to_row.end())
                 throw std::runtime_error("Tip not found in MSA: " + name);
             const std::string& row = msa_rows[it->second];
             for (size_t s = 0; s < sites; ++s)
@@ -340,15 +298,7 @@ HostPacking pack_host_arrays_from_tree_and_msa(
     return H;
 }
 
-static inline std::vector<double> transpose_sq(const std::vector<double>& M, int n) {
-    std::vector<double> T((size_t)n * n);
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            T[(size_t)i * n + j] = M[(size_t)j * n + i];
-        }
-    }
-    return T;
-}
+namespace {
 
 static inline std::vector<fp_t> cast_to_fp(const std::vector<double>& src) {
     std::vector<fp_t> out(src.size());
@@ -357,6 +307,8 @@ static inline std::vector<fp_t> cast_to_fp(const std::vector<double>& src) {
     }
     return out;
 }
+
+} // namespace
 
 // ===== Copy host packing to GPU and build DeviceTree =====
 // Upload host packing and model parameters to GPU, constructing DeviceTree.
@@ -371,11 +323,20 @@ DeviceTree upload_to_gpu(
     const PlacementQueryBatch* queries)
 {
     DeviceTree D;
-    D.N = (int)T.nodes.size();
-    D.tips = (int)H.tip_node_ids.size();
+    const int node_count = static_cast<int>(T.nodes.size());
+    const int tip_count = static_cast<int>(H.tip_node_ids.size());
+    const int query_count = queries ? static_cast<int>(queries->size()) : 0;
+    const size_t site_count = sites;
+    const size_t state_count = static_cast<size_t>(states);
+    const size_t rate_count = static_cast<size_t>(rate_cats);
+    const size_t matrix_elems = state_count * state_count;
+
+    D.N = node_count;
+    D.tips = tip_count;
     D.inners = D.N - D.tips;
-    D.placement_queries = (queries ? (int)queries->size() : 0);
+    D.placement_queries = query_count;
     D.root_id = T.root_id;
+
     // Reserve space for future insertions: each committed placement adds 2 nodes (1 internal + 1 tip).
     // This preallocates large CLV/PMAT/topology buffers so the tree can grow without reupload_to_gpu().
     const int reserve_inserts = D.placement_queries;
@@ -387,88 +348,90 @@ DeviceTree upload_to_gpu(
     D.rate_cats = rate_cats;
     D.log2_stride = ceil_log2_u32((unsigned int)(D.states + 1));
     D.per_rate_scaling = per_rate_scaling;
-    
-    // --- alloc topology ---
-    CUDA_CHECK(cudaMalloc(&D.d_lambdas, sizeof(fp_t) * (size_t)D.rate_cats * D.states));
-    CUDA_CHECK(cudaMalloc(&D.d_V,       sizeof(fp_t) * D.states * D.states));
-    CUDA_CHECK(cudaMalloc(&D.d_Vinv,    sizeof(fp_t) * D.states * D.states));
 
-    CUDA_CHECK(cudaMalloc(&D.d_U,       sizeof(fp_t) * D.states * D.states));
-    CUDA_CHECK(cudaMalloc(&D.d_rate_weights, sizeof(fp_t) * D.rate_cats));
-    CUDA_CHECK(cudaMalloc(&D.d_frequencies, sizeof(fp_t) * D.states));
-
-    // expand lambdas per rate category, scaling by the per-category rate multiplier.
-    {
-        std::vector<fp_t> lambdas_scaled((size_t)D.rate_cats * D.states, fp_t(0));
-        for (int rc = 0; rc < D.rate_cats; ++rc) {
-            double r = rate_multipliers[rc];
-            for (int s = 0; s < D.states; ++s) {
-                lambdas_scaled[(size_t)rc * D.states + s] = static_cast<fp_t>(er.lambdas[s] * r);
-            }
-        }
-        CUDA_CHECK(cudaMemcpy(D.d_lambdas,
-                            lambdas_scaled.data(),
-                            sizeof(fp_t) * lambdas_scaled.size(),
-                            cudaMemcpyHostToDevice));
-    }
-
-    //Temporary Fixed : Transpose of Eigen vectors for coalescent model
-    auto V_T    = cast_to_fp(transpose_sq(er.V,    D.states));
-    auto Vinv_T = cast_to_fp(transpose_sq(er.Vinv, D.states));
-    auto U_T    = cast_to_fp(transpose_sq(er.U,    D.states));
-    auto rate_weights_fp = cast_to_fp(rate_weights);
-    auto pi_fp = cast_to_fp(pi);
-
-    CUDA_CHECK(cudaMemcpy(D.d_V,    V_T.data(),    sizeof(fp_t) * D.states * D.states, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(D.d_Vinv, Vinv_T.data(), sizeof(fp_t) * D.states * D.states, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(D.d_U,    U_T.data(),    sizeof(fp_t) * D.states * D.states, cudaMemcpyHostToDevice));
-    if ((int)rate_weights.size() != rate_cats) {
+    if (static_cast<int>(rate_weights.size()) != rate_cats) {
         throw std::runtime_error("rate_weights size mismatch.");
     }
-    CUDA_CHECK(cudaMemcpy(D.d_rate_weights, rate_weights_fp.data(), sizeof(fp_t) * D.rate_cats, cudaMemcpyHostToDevice));
-    if ((int)pi.size() != states) {
+    if (static_cast<int>(pi.size()) != states) {
         throw std::runtime_error("pi size mismatch.");
     }
-    CUDA_CHECK(cudaMemcpy(D.d_frequencies, pi_fp.data(), sizeof(fp_t) * D.states, cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMalloc(&D.d_blen,      sizeof(fp_t) * D.capacity_N));
-    CUDA_CHECK(cudaMalloc(&D.d_new_pendant_length,  sizeof(fp_t) * D.capacity_N));
-    CUDA_CHECK(cudaMalloc(&D.d_new_proximal_length, sizeof(fp_t) * D.capacity_N));
-    CUDA_CHECK(cudaMalloc(&D.d_prev_pendant_length,  sizeof(fp_t) * D.capacity_N));
-    CUDA_CHECK(cudaMalloc(&D.d_prev_proximal_length, sizeof(fp_t) * D.capacity_N));
-    
-    CUDA_CHECK(cudaMemcpy(D.d_blen,      H.blen.data(),       sizeof(fp_t) * D.N, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(D.d_new_pendant_length,  0, sizeof(fp_t) * D.capacity_N));
-    CUDA_CHECK(cudaMemset(D.d_new_proximal_length, 0, sizeof(fp_t) * D.capacity_N));
-    CUDA_CHECK(cudaMemset(D.d_prev_pendant_length,  0, sizeof(fp_t) * D.capacity_N));
-    CUDA_CHECK(cudaMemset(D.d_prev_proximal_length, 0, sizeof(fp_t) * D.capacity_N));
+    // Host-side staging for model uploads.
+    std::vector<fp_t> lambdas_scaled(rate_count * state_count, fp_t(0));
+    for (int rate_idx = 0; rate_idx < D.rate_cats; ++rate_idx) {
+        const double rate_multiplier = rate_multipliers[rate_idx];
+        for (int state_idx = 0; state_idx < D.states; ++state_idx) {
+            lambdas_scaled[static_cast<size_t>(rate_idx) * state_count + static_cast<size_t>(state_idx)] =
+                static_cast<fp_t>(er.lambdas[state_idx] * rate_multiplier);
+        }
+    }
 
-    // --- tips ---
+    const auto V_fp = cast_to_fp(er.V);
+    const auto Vinv_fp = cast_to_fp(er.Vinv);
+    const auto U_fp = cast_to_fp(er.U);
+    const auto rate_weights_fp = cast_to_fp(rate_weights);
+    const auto pi_fp = cast_to_fp(pi);
 
-    CUDA_CHECK(cudaMalloc(&D.d_tipchars, sizeof(uint8_t) * (size_t)D.capacity_tips * sites));
-    CUDA_CHECK(cudaMemcpy(D.d_tipchars, H.tipchars.data(), sizeof(uint8_t) * (size_t)D.tips * sites, cudaMemcpyHostToDevice));
+    const size_t model_matrix_bytes = sizeof(fp_t) * matrix_elems;
+    const size_t lambdas_bytes = sizeof(fp_t) * lambdas_scaled.size();
+    const size_t rate_weights_bytes = sizeof(fp_t) * rate_count;
+    const size_t frequencies_bytes = sizeof(fp_t) * state_count;
 
-    const unsigned int tipmap_size = D.states + 1;
+    // --- model parameters ---
+    CUDA_CHECK(cudaMalloc(&D.d_lambdas, lambdas_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_V, model_matrix_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_Vinv, model_matrix_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_U, model_matrix_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_rate_weights, rate_weights_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_frequencies, frequencies_bytes));
 
+    CUDA_CHECK(cudaMemcpy(D.d_lambdas, lambdas_scaled.data(), lambdas_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_V, V_fp.data(), model_matrix_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_Vinv, Vinv_fp.data(), model_matrix_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_U, U_fp.data(), model_matrix_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_rate_weights, rate_weights_fp.data(), rate_weights_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_frequencies, pi_fp.data(), frequencies_bytes, cudaMemcpyHostToDevice));
 
-    // --- CLV & Offsets ---
-    const size_t per_node = (size_t)sites * (size_t)rate_cats * (size_t)states;
-    const size_t clv_capacity_elems = (size_t)D.capacity_N * per_node;
+    // --- branch lengths and tip characters ---
+    const size_t capacity_node_bytes = sizeof(fp_t) * static_cast<size_t>(D.capacity_N);
+    const size_t live_node_bytes = sizeof(fp_t) * static_cast<size_t>(D.N);
+    const size_t tipchar_capacity_bytes = sizeof(uint8_t) * static_cast<size_t>(D.capacity_tips) * site_count;
+    const size_t tipchar_live_bytes = sizeof(uint8_t) * static_cast<size_t>(D.tips) * site_count;
+
+    CUDA_CHECK(cudaMalloc(&D.d_blen, live_node_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_new_pendant_length, capacity_node_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_new_proximal_length, capacity_node_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_prev_pendant_length, capacity_node_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_prev_proximal_length, capacity_node_bytes));
+    CUDA_CHECK(cudaMemcpy(D.d_blen, H.blen.data(), live_node_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(D.d_new_pendant_length, 0, capacity_node_bytes));
+    CUDA_CHECK(cudaMemset(D.d_new_proximal_length, 0, capacity_node_bytes));
+    CUDA_CHECK(cudaMemset(D.d_prev_pendant_length, 0, capacity_node_bytes));
+    CUDA_CHECK(cudaMemset(D.d_prev_proximal_length, 0, capacity_node_bytes));
+
+    CUDA_CHECK(cudaMalloc(&D.d_tipchars, tipchar_capacity_bytes));
+    CUDA_CHECK(cudaMemcpy(D.d_tipchars, H.tipchars.data(), tipchar_live_bytes, cudaMemcpyHostToDevice));
+
+    // --- CLV and derivative workspaces ---
+    const size_t per_node = site_count * rate_count * state_count;
+    const size_t clv_capacity_elems = static_cast<size_t>(D.capacity_N) * per_node;
     const size_t clv_total = clv_capacity_elems * 2; // up + down
-    CUDA_CHECK(cudaMalloc(&D.d_clv_up,  sizeof(fp_t) * clv_total));
+    const size_t clv_total_bytes = sizeof(fp_t) * clv_total;
+    const size_t clv_capacity_bytes = sizeof(fp_t) * clv_capacity_elems;
+    const size_t placement_clv_bytes = sizeof(fp_t) * site_count;
+
+    CUDA_CHECK(cudaMalloc(&D.d_clv_up, clv_total_bytes));
     D.d_clv_down = D.d_clv_up + clv_capacity_elems;
     D.clv_down_offset_elems = clv_capacity_elems;
-    // Midpoint buffer: one per node
-    CUDA_CHECK(cudaMalloc(&D.d_clv_mid, sizeof(fp_t) * clv_capacity_elems));
-    // Cached parent_down * sibling_up products for midpoint reuse
-    CUDA_CHECK(cudaMalloc(&D.d_clv_mid_base, sizeof(fp_t) * clv_capacity_elems));
-    // Persistent workspace for downward convergence update.
-    CUDA_CHECK(cudaMalloc(&D.d_downward_scratch, sizeof(fp_t) * clv_capacity_elems));
-    CUDA_CHECK(cudaMalloc(&D.d_placement_clv, sizeof(fp_t) * D.sites));
-    CUDA_CHECK(cudaMemset(D.d_placement_clv, 0, sizeof(fp_t) * D.sites));
-    // Reusable derivative workspaces
-    const size_t sumtable_stride = (size_t)sites * (size_t)rate_cats * (size_t)states;
-    const size_t max_ops = (size_t)D.capacity_N * 2;
+
+    CUDA_CHECK(cudaMalloc(&D.d_clv_mid, clv_capacity_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_clv_mid_base, clv_capacity_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_downward_scratch, clv_capacity_bytes));
+    CUDA_CHECK(cudaMalloc(&D.d_placement_clv, placement_clv_bytes));
+    CUDA_CHECK(cudaMemset(D.d_placement_clv, 0, placement_clv_bytes));
+
+    const size_t sumtable_stride = site_count * rate_count * state_count;
+    const size_t max_ops = static_cast<size_t>(D.capacity_N) * 2;
     D.sumtable_capacity_ops = max_ops;
     D.likelihood_capacity_ops = max_ops;
     if (sumtable_stride > 0 && max_ops > 0) {
@@ -479,10 +442,11 @@ DeviceTree upload_to_gpu(
     }
 
     // Optionally zero out the CLV pool (or let kernels overwrite)
-    CUDA_CHECK(cudaMemset(D.d_clv_up, 0, sizeof(fp_t) * clv_total));
-    CUDA_CHECK(cudaMemset(D.d_clv_mid, 0, sizeof(fp_t) * clv_capacity_elems));
-    CUDA_CHECK(cudaMemset(D.d_clv_mid_base, 0, sizeof(fp_t) * clv_capacity_elems));
-    CUDA_CHECK(cudaMemset(D.d_downward_scratch, 0, sizeof(fp_t) * clv_capacity_elems));
+    CUDA_CHECK(cudaMemset(D.d_clv_up, 0, clv_total_bytes));
+    CUDA_CHECK(cudaMemset(D.d_clv_mid, 0, clv_capacity_bytes));
+    CUDA_CHECK(cudaMemset(D.d_clv_mid_base, 0, clv_capacity_bytes));
+    CUDA_CHECK(cudaMemset(D.d_downward_scratch, 0, clv_capacity_bytes));
+
     // Initialize only the root slice of down pool to exact 1.0; others remain 0 until overwritten.
     if (per_node > 0) {
         std::vector<fp_t> ones(per_node, fp_t(1));
@@ -492,8 +456,9 @@ DeviceTree upload_to_gpu(
                               cudaMemcpyHostToDevice));
     }
 
-    const size_t pmat_elems_cur = (size_t)D.N * (size_t)D.rate_cats * (size_t)D.states * (size_t)D.states;
-    const size_t pmat_elems_cap = (size_t)D.capacity_N * (size_t)D.rate_cats * (size_t)D.states * (size_t)D.states;
+    // --- PMAT buffers ---
+    const size_t pmat_elems_cur = static_cast<size_t>(D.N) * rate_count * matrix_elems;
+    const size_t pmat_elems_cap = static_cast<size_t>(D.capacity_N) * rate_count * matrix_elems;
     const size_t pmat_bytes_cur = sizeof(fp_t) * pmat_elems_cur;
     const size_t pmat_bytes_cap = sizeof(fp_t) * pmat_elems_cap;
     CUDA_CHECK(cudaMalloc(&D.d_pmat, pmat_bytes_cap));
@@ -516,32 +481,57 @@ DeviceTree upload_to_gpu(
     const fp_t* pmat_mid_dist_src = H.pmats_mid_dist.empty() ? H.pmats_mid.data() : H.pmats_mid_dist.data();
     CUDA_CHECK(cudaMemset(D.d_pmat_mid_dist, 0, pmat_bytes_cap));
     CUDA_CHECK(cudaMemcpy(D.d_pmat_mid_dist, pmat_mid_dist_src, pmat_bytes_cur, cudaMemcpyHostToDevice));
+
     // Allocate query PMAT buffer sized for up to ~2*N placement ops (edges).
     {
-        const size_t per_query = (size_t)D.rate_cats * (size_t)D.states * (size_t)D.states;
-        const size_t query_slots = (size_t)D.capacity_N * 2;
+        const size_t per_query = rate_count * matrix_elems;
+        const size_t query_slots = static_cast<size_t>(D.capacity_N) * 2;
         const size_t query_pmat_bytes = sizeof(fp_t) * per_query * query_slots;
         CUDA_CHECK(cudaMalloc(&D.d_query_pmat, query_pmat_bytes));
         CUDA_CHECK(cudaMemset(D.d_query_pmat, 0, query_pmat_bytes));
     }
 
+    // --- optional pattern weights ---
+    if (!H.pattern_weights.empty()) {
+        if (H.pattern_weights.size() != sites) {
+            throw std::runtime_error("pattern_weights size mismatch.");
+        }
+        std::vector<fp_t> pattern_weights_fp(H.pattern_weights.size(), fp_t(1));
+        for (size_t i = 0; i < H.pattern_weights.size(); ++i) {
+            pattern_weights_fp[i] = static_cast<fp_t>(H.pattern_weights[i]);
+        }
+        CUDA_CHECK(cudaMalloc(&D.d_pattern_weights_u, sizeof(unsigned) * sites));
+        CUDA_CHECK(cudaMemcpy(
+            D.d_pattern_weights_u,
+            H.pattern_weights.data(),
+            sizeof(unsigned) * sites,
+            cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&D.d_pattern_weights, sizeof(fp_t) * sites));
+        CUDA_CHECK(cudaMemcpy(
+            D.d_pattern_weights,
+            pattern_weights_fp.data(),
+            sizeof(fp_t) * sites,
+            cudaMemcpyHostToDevice));
+    }
+
+    // --- optional query buffers ---
     if (queries && !queries->empty()) {
         const size_t qcount = queries->size();
         const size_t qcap = (size_t)D.query_capacity;
-        const size_t chars_bytes = sizeof(uint8_t) * qcap * sites;
+        const size_t chars_bytes = sizeof(uint8_t) * qcap * site_count;
         CUDA_CHECK(cudaMalloc(&D.d_query_chars, chars_bytes));
         CUDA_CHECK(cudaMemset(D.d_query_chars, 0, chars_bytes));
-        CUDA_CHECK(cudaMemcpy(D.d_query_chars, queries->query_chars.data(), sizeof(uint8_t) * qcount * sites, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(D.d_query_chars, queries->query_chars.data(), sizeof(uint8_t) * qcount * site_count, cudaMemcpyHostToDevice));
 
-        const size_t query_clv_elems = qcap * (size_t)sites * (size_t)rate_cats * (size_t)states;
+        const size_t query_clv_elems = qcap * site_count * rate_count * state_count;
         const size_t query_clv_bytes = sizeof(fp_t) * query_clv_elems;
         CUDA_CHECK(cudaMalloc(&D.d_query_clv, query_clv_bytes));
         CUDA_CHECK(cudaMemset(D.d_query_clv, 0, query_clv_bytes));
-
     }
-    // --- scaler ---
-    const size_t scaler_span = per_rate_scaling ? (sites * (size_t)rate_cats) : sites;
-    const size_t scaler_pool = (size_t)D.capacity_N * scaler_span;
+
+    // --- scaler buffers ---
+    const size_t scaler_span = per_rate_scaling ? (site_count * rate_count) : site_count;
+    const size_t scaler_pool = static_cast<size_t>(D.capacity_N) * scaler_span;
     CUDA_CHECK(cudaMalloc(&D.d_site_scaler_storage, sizeof(unsigned) * scaler_pool * 3));
     CUDA_CHECK(cudaMemset(D.d_site_scaler_storage, 0, sizeof(unsigned) * scaler_pool * 3));
     D.d_site_scaler_up = D.d_site_scaler_storage;
@@ -550,17 +540,18 @@ DeviceTree upload_to_gpu(
     D.d_site_scaler_mid_base = D.d_site_scaler_down;
     D.d_site_scaler = D.d_site_scaler_up;
 
+    // --- tip bitmask lookup ---
+    const unsigned int tipmap_size = D.states + 1;
     std::vector<unsigned int> tipmap(tipmap_size);
     for (unsigned int j = 0; j < tipmap_size; ++j) {
-        if(j == D.states){
-            tipmap[j] = 15;  // 0 -> 0001, 1 -> 0010, 2 -> 0100, ...
-        }
-        else{
-            tipmap[j] = 1u << j;  // 0 -> 0001, 1 -> 0010, 2 -> 0100, ...
+        if (j == static_cast<unsigned int>(D.states)) {
+            tipmap[j] = 15;
+        } else {
+            tipmap[j] = 1u << j;
         }
     }
     CUDA_CHECK(cudaMalloc(&D.d_tipmap, sizeof(unsigned) * tipmap_size));
-    CUDA_CHECK(cudaMemcpy(D.d_tipmap, tipmap.data(),  tipmap_size * sizeof(unsigned int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(D.d_tipmap, tipmap.data(), tipmap_size * sizeof(unsigned int), cudaMemcpyHostToDevice));
 
     return D;
 }
@@ -584,6 +575,8 @@ void free_device_tree(DeviceTree& D) {
     F(D.d_placement_clv);
     F(D.d_sumtable);
     F(D.d_likelihoods);
+    F(D.d_pattern_weights_u);
+    F(D.d_pattern_weights);
     F(D.d_query_clv); F(D.d_query_chars);
     F(D.d_query_pmat);
     F(D.d_tipmap);
@@ -591,117 +584,124 @@ void free_device_tree(DeviceTree& D) {
 }
 
 
-// Assemble a NodeOpInfo record for device execution.
-static inline NodeOpInfo make_node_op_device(
-    int parent_id,
-    int left_id,
-    int right_id,
-    int left_tip_index,
-    int right_tip_index,
-    NodeOpType type)
+static void rebuild_node_to_tip_map(
+    const TreeBuildResult& tree,
+    const HostPacking& host,
+    std::vector<int>& node_to_tip)
 {
-    NodeOpInfo op{};
-    op.parent_id = parent_id;
-    op.left_id = left_id;
-    op.right_id = right_id;
-    op.left_tip_index = left_tip_index;
-    op.right_tip_index = right_tip_index;
-    op.op_type = static_cast<int>(type);
-    op.clv_pool = static_cast<uint8_t>(CLV_POOL_UP);
-    op.dir_tag  = static_cast<uint8_t>(CLV_DIR_UP);
-    return op;
-}
-
-// Evaluate full tree log-likelihood on device using prepared DeviceTree.
-double EvaluateTreeLogLikelihood_device(
-    const DeviceTree&      D,
-    const TreeBuildResult& T,
-    const HostPacking&     H,
-    const std::vector<double>& pi,
-    const std::vector<double>& rate_weights,
-    cudaStream_t stream)
-{
-    const int N = (int)T.nodes.size();
-    std::vector<int> node2tip(N, -1);
-
-    for (int tip_idx = 0; tip_idx < (int)H.tip_node_ids.size(); ++tip_idx) {
-        int nid = H.tip_node_ids[tip_idx];
-        node2tip[nid] = tip_idx;
-    }
-
-    std::vector<NodeOpInfo> ops_host;
-    ops_host.reserve(N);
-
-    for (int nid : T.postorder) {
-        const TreeNode& nd = T.nodes[nid];
-        if (nd.is_tip) continue;
-
-        const int L = nd.left;
-        const int R = nd.right;
-        const bool tipL = T.nodes[L].is_tip;
-        const bool tipR = T.nodes[R].is_tip;
-
-        if (tipL && tipR) {
-            int left_tip_idx  = node2tip[L];
-            int right_tip_idx = node2tip[R];
-            NodeOpInfo op = make_node_op_device(
-                nid,
-                L,
-                R,
-                left_tip_idx,
-                right_tip_idx,
-                OP_TIP_TIP);
-            ops_host.push_back(op);
-        } else if (tipL && !tipR) {
-            int left_tip_idx = node2tip[L];
-            NodeOpInfo op = make_node_op_device(
-                nid,
-                L,
-                R,
-                left_tip_idx,
-                -1,
-                OP_TIP_INNER);
-            ops_host.push_back(op);
-        } else if (!tipL && tipR) {
-            int right_tip_idx = node2tip[R];
-            NodeOpInfo op = make_node_op_device(
-                nid,
-                L,
-                R,
-                -1,
-                right_tip_idx,
-                OP_TIP_INNER);
-            ops_host.push_back(op);
-        } else {
-            NodeOpInfo op = make_node_op_device(
-                nid,
-                L,
-                R,
-                -1,
-                -1,
-                OP_INNER_INNER);
-            ops_host.push_back(op);
+    const int node_count = static_cast<int>(tree.nodes.size());
+    node_to_tip.assign(static_cast<size_t>(node_count), -1);
+    for (int tip_idx = 0; tip_idx < static_cast<int>(host.tip_node_ids.size()); ++tip_idx) {
+        const int node_id = host.tip_node_ids[tip_idx];
+        if (node_id >= 0 && node_id < node_count) {
+            node_to_tip[node_id] = tip_idx;
         }
     }
+}
 
-    NodeOpInfo* d_ops = nullptr;
-    const int num_ops = (int)ops_host.size();
-    if (num_ops > 0) {
-        CUDA_CHECK(cudaMalloc(&d_ops, sizeof(NodeOpInfo) * (size_t)num_ops));
-        CUDA_CHECK(cudaMemcpyAsync(
-            d_ops,
-            ops_host.data(),
-            sizeof(NodeOpInfo) * (size_t)num_ops,
-            cudaMemcpyHostToDevice,
-            stream));
+static void build_upward_ops_host(
+    const TreeBuildResult& tree,
+    const std::vector<int>& node_to_tip,
+    std::vector<NodeOpInfo>& upward_ops_host)
+{
+    const int node_count = static_cast<int>(tree.nodes.size());
+    upward_ops_host.clear();
+    upward_ops_host.reserve(static_cast<size_t>(node_count));
+
+    for (int node_id : tree.postorder) {
+        if (node_id < 0 || node_id >= node_count) continue;
+        const TreeNode& node = tree.nodes[node_id];
+        if (node.is_tip) continue;
+
+        const int left_id = node.left;
+        const int right_id = node.right;
+        if (left_id < 0 || right_id < 0) continue;
+
+        const bool left_is_tip = tree.nodes[left_id].is_tip;
+        const bool right_is_tip = tree.nodes[right_id].is_tip;
+        const int left_tip_idx = left_is_tip ? node_to_tip[left_id] : -1;
+        const int right_tip_idx = right_is_tip ? node_to_tip[right_id] : -1;
+
+        NodeOpType op_type = OP_INNER_INNER;
+        if (left_is_tip && right_is_tip) {
+            op_type = OP_TIP_TIP;
+        } else if (left_is_tip || right_is_tip) {
+            op_type = OP_TIP_INNER;
+        }
+
+        NodeOpInfo op{};
+        op.parent_id = node_id;
+        op.left_id = left_id;
+        op.right_id = right_id;
+        op.left_tip_index = left_tip_idx;
+        op.right_tip_index = right_tip_idx;
+        op.op_type = static_cast<int>(op_type);
+        op.clv_pool = static_cast<uint8_t>(CLV_POOL_UP);
+        op.dir_tag = static_cast<uint8_t>(CLV_DIR_UP);
+        upward_ops_host.push_back(op);
     }
-    
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    int num_sms = prop.multiProcessorCount;
+}
 
-    // Clamp block size to what the kernel can actually support on this GPU to avoid
-    // "too many resources requested for launch" when register pressure is high.
+static void build_downward_ops_host(
+    const TreeBuildResult& tree,
+    const std::vector<int>& node_to_tip,
+    std::vector<NodeOpInfo>& downward_ops_host)
+{
+    const int node_count = static_cast<int>(tree.nodes.size());
+    downward_ops_host.clear();
+    downward_ops_host.reserve(static_cast<size_t>(node_count) * 2);
+
+    for (int parent_id : tree.preorder) {
+        const TreeNode& node = tree.nodes[parent_id];
+        if (node.is_tip) continue;
+
+        const int left_id = node.left;
+        const int right_id = node.right;
+        const bool left_is_tip = (left_id >= 0 && tree.nodes[left_id].is_tip);
+        const bool right_is_tip = (right_id >= 0 && tree.nodes[right_id].is_tip);
+
+        append_downward_op(
+            downward_ops_host,
+            parent_id,
+            left_id,
+            right_id,
+            left_is_tip,
+            right_is_tip,
+            node_to_tip,
+            static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
+
+        append_downward_op(
+            downward_ops_host,
+            parent_id,
+            left_id,
+            right_id,
+            left_is_tip,
+            right_is_tip,
+            node_to_tip,
+            static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
+    }
+}
+
+static void launch_upward_clv_update(
+    const DeviceTree& D,
+    const std::vector<NodeOpInfo>& upward_ops_host,
+    int num_sms,
+    cudaStream_t stream)
+{
+    const int upward_op_count = static_cast<int>(upward_ops_host.size());
+    if (upward_op_count <= 0) {
+        throw std::runtime_error("No upward ops to update");
+    }
+
+    NodeOpInfo* d_upward_ops = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_upward_ops, sizeof(NodeOpInfo) * static_cast<size_t>(upward_op_count)));
+    CUDA_CHECK(cudaMemcpyAsync(
+        d_upward_ops,
+        upward_ops_host.data(),
+        sizeof(NodeOpInfo) * static_cast<size_t>(upward_op_count),
+        cudaMemcpyHostToDevice,
+        stream));
+
     cudaFuncAttributes attr{};
     CUDA_CHECK(cudaFuncGetAttributes(&attr, Rtree_Likelihood_Site_Parallel_Upward_Kernel));
     int block = 256;
@@ -716,270 +716,148 @@ double EvaluateTreeLogLikelihood_device(
         block,
         0));
     int max_blocks = num_sms * max_blocks_per_sm;
-    int grid = (D.sites + block - 1) / block;
+    int grid = static_cast<int>((D.sites + static_cast<size_t>(block) - 1) / static_cast<size_t>(block));
     if (max_blocks > 0 && grid > max_blocks) {
         grid = max_blocks;
     }
 
-    if (num_ops > 0) {
-        Rtree_Likelihood_Site_Parallel_Upward_Kernel<<<grid, block, 0, stream>>>(
-            D,
-            d_ops,
-            num_ops);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    if (d_ops) CUDA_CHECK(cudaFree(d_ops));
-    double total = root_likelihood::compute_root_loglikelihood_total(
+    Rtree_Likelihood_Site_Parallel_Upward_Kernel<<<grid, block, 0, stream>>>(
         D,
-        T.root_id,
-        nullptr,
-        nullptr,
-        0.0,
-        stream);
-    return total;
+        d_upward_ops,
+        upward_op_count);
+    CHECK_CUDA_LAST();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(d_upward_ops));
 }
 
-void UpdateTreeLogLikelihood_device(
-    DeviceTree&                 D,
-    TreeBuildResult&            T,
-    HostPacking&                H,
-    const EigResult&            er,
-    const std::vector<double>&  rate_multipliers,
-    std::vector<PlacementResult>* placement_results_out,
-    int                         smoothing,
-    cudaStream_t                stream)
+static void launch_downward_clv_update(
+    const DeviceTree& D,
+    NodeOpInfo* d_ops,
+    int num_ops,
+    int num_sms,
+    cudaStream_t stream)
 {
-    int N = (int)T.nodes.size();
-    std::vector<NodeOpInfo> ops_host;
-    std::vector<NodeOpInfo> ops_up_host;
-    std::vector<int> node2tip(N, -1);
+    if (num_ops <= 0 || !d_ops) return;
 
-    NodeOpInfo* d_ops = nullptr;
-    int num_ops = 0;
-
-    auto free_ops = [&]() {
-        if (d_ops) {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            CUDA_CHECK(cudaFree(d_ops));
-            d_ops = nullptr;
-        }
-        num_ops = 0;
-    };
-
-    // Build node2tip map (host)
-    auto rebuild_node2tip = [&]() {
-        N = (int)T.nodes.size();
-        node2tip.assign((size_t)N, -1);
-        for (int tip_idx = 0; tip_idx < (int)H.tip_node_ids.size(); ++tip_idx) {
-            const int nid = H.tip_node_ids[tip_idx];
-            if (nid >= 0 && nid < N) node2tip[nid] = tip_idx;
-        }
-    };
-
-
-    // Build UPWARD ops into ops_up_host (host)
-    auto build_upward_ops_host_full = [&]() {
-        ops_up_host.clear();
-        ops_up_host.reserve((size_t)N);
-
-        for (int nid : T.postorder) {
-            if (nid < 0 || nid >= (int)T.nodes.size()) continue;
-            const TreeNode& nd = T.nodes[nid];
-            if (nd.is_tip) continue;
-
-            const int L = nd.left;
-            const int R = nd.right;
-            if (L < 0 || R < 0) continue;
-
-            const bool tipL = (L >= 0 && T.nodes[L].is_tip);
-            const bool tipR = (R >= 0 && T.nodes[R].is_tip);
-            const int left_tip_idx  = tipL ? node2tip[L] : -1;
-            const int right_tip_idx = tipR ? node2tip[R] : -1;
-
-            NodeOpType type;
-            if (tipL && tipR) {
-                type = OP_TIP_TIP;
-            } else if (tipL || tipR) {
-                type = OP_TIP_INNER;
-            } else {
-                type = OP_INNER_INNER;
-            }
-
-            NodeOpInfo op{};
-            op.parent_id = nid;
-            op.left_id = L;
-            op.right_id = R;
-            op.left_tip_index = left_tip_idx;
-            op.right_tip_index = right_tip_idx;
-            op.op_type = static_cast<int>(type);
-            op.clv_pool = static_cast<uint8_t>(CLV_POOL_UP);
-            op.dir_tag  = static_cast<uint8_t>(CLV_DIR_UP);
-            ops_up_host.push_back(op);
-        }
-    };
-
-    // Build DOWNWARD ops into ops_host (host)
-    auto build_downward_ops_host = [&]() {
-        ops_host.clear();
-        ops_host.reserve((size_t)N * 2);
-
-        for (int parent_id : T.preorder) {
-            const TreeNode& nd = T.nodes[parent_id];
-            if (nd.is_tip) continue;
-
-            const int L = nd.left;
-            const int R = nd.right;
-            const bool tipL = (L >= 0 && T.nodes[L].is_tip);
-            const bool tipR = (R >= 0 && T.nodes[R].is_tip);
-
-            push_down_op(
-                ops_host,
-                parent_id, L, R,
-                tipL, tipR,
-                node2tip,
-                static_cast<uint8_t>(CLV_DIR_DOWN_LEFT));
-
-            push_down_op(
-                ops_host,
-                parent_id, L, R,
-                tipL, tipR,
-                node2tip,
-                static_cast<uint8_t>(CLV_DIR_DOWN_RIGHT));
-        }
-
-        free_ops();
-        num_ops = (int)ops_host.size();
-        if (num_ops <= 0) return;
-
-        CUDA_CHECK(cudaMalloc(&d_ops, sizeof(NodeOpInfo) * (size_t)num_ops));
-        CUDA_CHECK(cudaMemcpyAsync(
-            d_ops,
-            ops_host.data(),
-            sizeof(NodeOpInfo) * (size_t)num_ops,
-            cudaMemcpyHostToDevice,
-            stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    };
-
-    // Kernel launch config (computed once; if D changes devices/attrs, recompute)
-    cudaDeviceProp prop{};
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-    const int num_sms = prop.multiProcessorCount;
-
-    auto update_upward = [&](const std::vector<NodeOpInfo>& ops) {
-        const int num_ops_up = (int)ops.size();
-        if (num_ops_up <= 0)  throw std::runtime_error("No upward ops to update");;
-        NodeOpInfo* d_ops_up = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_ops_up, sizeof(NodeOpInfo) * (size_t)num_ops_up));
-        CUDA_CHECK(cudaMemcpyAsync(
-            d_ops_up,
-            ops.data(),
-            sizeof(NodeOpInfo) * (size_t)num_ops_up,
-            cudaMemcpyHostToDevice,
-            stream));
-
-        cudaFuncAttributes attr{};
-        CUDA_CHECK(cudaFuncGetAttributes(&attr, Rtree_Likelihood_Site_Parallel_Upward_Kernel));
-        int block = 256;
-        if (attr.maxThreadsPerBlock > 0 && block > attr.maxThreadsPerBlock) block = attr.maxThreadsPerBlock;
-
-        int max_blocks_per_sm = 4;
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_sm,
-            Rtree_Likelihood_Site_Parallel_Upward_Kernel,
-            block,
-            0));
-        int max_blocks = num_sms * max_blocks_per_sm;
-        int grid = (int)((D.sites + (size_t)block - 1) / (size_t)block);
-        if (max_blocks > 0 && grid > max_blocks) grid = max_blocks;
-
-        Rtree_Likelihood_Site_Parallel_Upward_Kernel<<<grid, block, 0, stream>>>(D, d_ops_up, num_ops_up);
-        CHECK_CUDA_LAST();
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaFree(d_ops_up));
-    };
-
-    auto update_downward = [&]() {
-        if (num_ops <= 0 || !d_ops) return;
-
-        
-        cudaFuncAttributes attr{};
-        CUDA_CHECK(cudaFuncGetAttributes(&attr, Rtree_Likelihood_Site_Parallel_Downward_Kernel));
-        int block = 256;
-        if (attr.maxThreadsPerBlock > 0 && block > attr.maxThreadsPerBlock) block = attr.maxThreadsPerBlock;
-
-        int max_blocks_per_sm = 4;
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &max_blocks_per_sm,
-            Rtree_Likelihood_Site_Parallel_Downward_Kernel,
-            block,
-            0));
-        int max_blocks = num_sms * max_blocks_per_sm;
-        int grid = (int)((D.sites + (size_t)block - 1) / (size_t)block);
-        if (max_blocks > 0 && grid > max_blocks) grid = max_blocks;
-
-        Rtree_Likelihood_Site_Parallel_Downward_Kernel<<<grid, block, 0, stream>>>(D, d_ops, num_ops);
-        CHECK_CUDA_LAST();
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-    };
-
-    // --------------------------
-    // Initial: build downward CLV once for current tree
-    // --------------------------
-    rebuild_node2tip();
-    build_upward_ops_host_full();
-    update_upward(ops_up_host);
-    build_downward_ops_host();
-    update_downward();
-    // keep d_ops for query 0 placement (do NOT free here)
-
-    PlacementPruneConfig prune_cfg{};
-    prune_cfg.enable_pruning = true;
-    prune_cfg.max_consecutive_drops = 2;
-    prune_cfg.drop_threshold = 10;
-    prune_cfg.enable_small_frontier_fallback = true;
-    prune_cfg.small_frontier_threshold = 16;
-
-    if (placement_results_out) {
-        placement_results_out->clear();
-        placement_results_out->reserve((size_t)D.placement_queries);
+    cudaFuncAttributes attr{};
+    CUDA_CHECK(cudaFuncGetAttributes(&attr, Rtree_Likelihood_Site_Parallel_Downward_Kernel));
+    int block = 256;
+    if (attr.maxThreadsPerBlock > 0 && block > attr.maxThreadsPerBlock) {
+        block = attr.maxThreadsPerBlock;
     }
 
-    int queries_to_process = D.placement_queries;
+    int max_blocks_per_sm = 4;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_blocks_per_sm,
+        Rtree_Likelihood_Site_Parallel_Downward_Kernel,
+        block,
+        0));
+    int max_blocks = num_sms * max_blocks_per_sm;
+    int grid = static_cast<int>((D.sites + static_cast<size_t>(block) - 1) / static_cast<size_t>(block));
+    if (max_blocks > 0 && grid > max_blocks) {
+        grid = max_blocks;
+    }
+
+    Rtree_Likelihood_Site_Parallel_Downward_Kernel<<<grid, block, 0, stream>>>(D, d_ops, num_ops);
+    CHECK_CUDA_LAST();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void free_placement_op_buffer(
+    PlacementOpBuffer& placement_ops,
+    cudaStream_t stream)
+{
+    if (placement_ops.d_ops) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaFree(placement_ops.d_ops));
+        placement_ops.d_ops = nullptr;
+    }
+    placement_ops.num_ops = 0;
+}
+
+// ----- Tree CLV update pipeline -----
+
+void UpdateTreeClvs(
+    DeviceTree& D,
+    TreeBuildResult& T,
+    HostPacking& H,
+    PlacementOpBuffer& placement_ops,
+    cudaStream_t stream)
+{
+    std::vector<NodeOpInfo> downward_ops_host;
+    std::vector<NodeOpInfo> upward_ops_host;
+    std::vector<int> node_to_tip(T.nodes.size(), -1);
+
+    cudaDeviceProp device_props{};
+    CUDA_CHECK(cudaGetDeviceProperties(&device_props, 0));
+    const int sm_count = device_props.multiProcessorCount;
+
+    rebuild_node_to_tip_map(T, H, node_to_tip);
+    build_upward_ops_host(T, node_to_tip, upward_ops_host);
+    launch_upward_clv_update(D, upward_ops_host, sm_count, stream);
+
+    build_downward_ops_host(T, node_to_tip, downward_ops_host);
+    free_placement_op_buffer(placement_ops, stream);
+    placement_ops.num_ops = static_cast<int>(downward_ops_host.size());
+    if (placement_ops.num_ops > 0) {
+        CUDA_CHECK(cudaMalloc(
+            &placement_ops.d_ops,
+            sizeof(NodeOpInfo) * static_cast<size_t>(placement_ops.num_ops)));
+        CUDA_CHECK(cudaMemcpyAsync(
+            placement_ops.d_ops,
+            downward_ops_host.data(),
+            sizeof(NodeOpInfo) * static_cast<size_t>(placement_ops.num_ops),
+            cudaMemcpyHostToDevice,
+            stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    launch_downward_clv_update(D, placement_ops.d_ops, placement_ops.num_ops, sm_count, stream);
+}
+
+// ----- Query placement evaluation -----
+
+void EvaluatePlacementQueries(
+    DeviceTree& D,
+    const EigResult& er,
+    const std::vector<double>& rate_multipliers,
+    const PlacementOpBuffer& placement_ops,
+    std::vector<PlacementResult>* placement_results_out,
+    int smoothing,
+    cudaStream_t stream)
+{
+    if (placement_results_out) {
+        placement_results_out->clear();
+        placement_results_out->reserve(static_cast<size_t>(D.placement_queries));
+    }
+
+    int query_count = D.placement_queries;
     if (const char* env_max_queries = std::getenv("MLIPPER_MAX_QUERIES")) {
         const int parsed = std::atoi(env_max_queries);
         if (parsed > 0) {
-            queries_to_process = std::min(D.placement_queries, parsed);
+            query_count = std::min(D.placement_queries, parsed);
         }
     }
 
-    for (int qi = 0; qi < queries_to_process; ++qi) {
-
+    for (int query_idx = 0; query_idx < query_count; ++query_idx) {
         CUDA_CHECK(cudaMemset(D.d_new_pendant_length, 0, sizeof(double) * D.N));
         CUDA_CHECK(cudaMemset(D.d_new_proximal_length, 0, sizeof(double) * D.N));
         CUDA_CHECK(cudaMemset(D.d_prev_pendant_length, 0, sizeof(double) * D.N));
         CUDA_CHECK(cudaMemset(D.d_prev_proximal_length, 0, sizeof(double) * D.N));
 
-        build_query_clv_on_device(D, qi, stream);
+        build_query_clv(D, query_idx, stream);
         CHECK_CUDA_LAST();
 
-        DeviceTree Dq = make_query_view(D, qi);
-
-        PlacementResult pres = PlacementEvaluationKernelPreorderPruned(
-	            Dq,
-	            T,
-	            er,
-	            rate_multipliers,
-	            d_ops,
-	            num_ops,
-	            smoothing,
-	            prune_cfg,
-	            stream,
-	            T.root_id);
+        DeviceTree query_view = make_query_view(D, query_idx);
+        PlacementResult placement = PlacementEvaluationKernel(
+            query_view,
+            er,
+            rate_multipliers,
+            placement_ops.d_ops,
+            placement_ops.num_ops,
+            smoothing,
+            stream);
         if (placement_results_out) {
-            placement_results_out->push_back(pres);
+            placement_results_out->push_back(placement);
         }
     }
-
-    free_ops();
 }

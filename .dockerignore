@@ -1,0 +1,14 @@
+.git
+.gitignore
+build
+bin
+output
+MLIPPER
+tree.nwk
+*.o
+*.d
+*.log
+*.ncu-rep
+*.ncu.log
+*.nsys-rep
+*.sqlite

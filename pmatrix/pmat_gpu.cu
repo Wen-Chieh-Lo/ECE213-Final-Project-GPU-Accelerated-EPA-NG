@@ -9,62 +9,63 @@ constexpr int kMaxStates = 16;
 __device__ void pmatrix_from_triple_device(
     const fp_t* Vinv,
     const fp_t* V,
-    const fp_t* lamb,
-    fp_t r,
-    fp_t t,
-    fp_t p,
-    fp_t* P,
-    int n)
+    const fp_t* rate_eigenvalues,
+    fp_t rate_scale,
+    fp_t branch_length,
+    fp_t pinv,
+    fp_t* out_pmat,
+    int state_count)
 {
-    if (!Vinv || !V || !lamb || !P) return;
-    if (n <= 0 || n > kMaxStates) return;
+    if (!Vinv || !V || !rate_eigenvalues || !out_pmat) return;
+    if (state_count <= 0 || state_count > kMaxStates) return;
 
-    fp_t D[kMaxStates];
-    for (int j = 0; j < n; ++j) {
-        D[j] = fp_expm1(lamb[j] * r * t);
+    fp_t diag_expm1[kMaxStates];
+    for (int state_idx = 0; state_idx < state_count; ++state_idx) {
+        diag_expm1[state_idx] =
+            fp_expm1(rate_eigenvalues[state_idx] * rate_scale * branch_length);
     }
 
-    // V and Vinv are uploaded as transposed matrices (column-major view),
-    // so index them accordingly to recover the original row-major math.
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
+    for (int row = 0; row < state_count; ++row) {
+        for (int col = 0; col < state_count; ++col) {
             fp_t acc = fp_t(0);
-            for (int k = 0; k < n; ++k) {
-                const fp_t vik   = V[k * n + i];     // original V[i,k]
-                const fp_t vinvj = Vinv[j * n + k];  // original Vinv[k,j]
-                acc += vik * D[k] * vinvj;
+            for (int eig_idx = 0; eig_idx < state_count; ++eig_idx) {
+                const fp_t v_entry = V[row * state_count + eig_idx];
+                const fp_t vinv_entry = Vinv[eig_idx * state_count + col];
+                acc += v_entry * diag_expm1[eig_idx] * vinv_entry;
             }
-            P[i * n + j] = acc;
+            out_pmat[row * state_count + col] = acc;
         }
-        P[i * n + i] += fp_t(1.0);
+        out_pmat[row * state_count + row] += fp_t(1.0);
     }
 
-    if (p > 0.0) {
-        for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < n; ++j) {
-                fp_t I = (i == j) ? fp_t(1.0) : fp_t(0.0);
-                P[i * n + j] = (fp_t(1.0) - p) * P[i * n + j] + p * I;
+    if (pinv > 0.0) {
+        for (int row = 0; row < state_count; ++row) {
+            for (int col = 0; col < state_count; ++col) {
+                const fp_t identity_entry = (row == col) ? fp_t(1.0) : fp_t(0.0);
+                out_pmat[row * state_count + col] =
+                    (fp_t(1.0) - pinv) * out_pmat[row * state_count + col] +
+                    pinv * identity_entry;
             }
         }
     }
 
     // Clamp tiny negatives and renormalize rows.
-    for (int i = 0; i < n; ++i) {
-        fp_t s = fp_t(0);
-        for (int j = 0; j < n; ++j) {
-            fp_t& x = P[i * n + j];
-            if (x < 0.0 && x > fp_t(-1e-7f)) x = 0.0;
-            s += x;
+    for (int row = 0; row < state_count; ++row) {
+        fp_t row_sum = fp_t(0);
+        for (int col = 0; col < state_count; ++col) {
+            fp_t& entry = out_pmat[row * state_count + col];
+            if (entry < 0.0 && entry > fp_t(-1e-7f)) entry = 0.0;
+            row_sum += entry;
         }
-        if (s != 0.0) {
-            for (int j = 0; j < n; ++j) {
-                P[i * n + j] /= s;
+        if (row_sum != 0.0) {
+            for (int col = 0; col < state_count; ++col) {
+                out_pmat[row * state_count + col] /= row_sum;
             }
         }
     }
 }
 
-__global__ void pmatrix_from_triple_kernel_per_op(
+__global__ void pmatrix_from_triple_kernel(
     const fp_t* Vinv,
     const fp_t* V,
     const fp_t* lambdas,
@@ -73,50 +74,27 @@ __global__ void pmatrix_from_triple_kernel_per_op(
     fp_t* P,
     int n,
     int rate_cats,
-    int num_ops)
+    int item_count)
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = num_ops * rate_cats;
-    if (idx < 0 || idx >= total) return;
+    const int flat_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_entries = item_count * rate_cats;
+    if (flat_index >= total_entries) return;
 
-    const int op_idx = idx / rate_cats;
-    const int rc = idx - op_idx * rate_cats;
-    if (op_idx < 0 || op_idx >= num_ops || rc < 0 || rc >= rate_cats) return;
+    const int item_idx = flat_index / rate_cats;
+    const int rate_idx = flat_index - item_idx * rate_cats;
+    if (item_idx >= item_count || rate_idx >= rate_cats) return;
 
     if (!branch_lengths) return;
-    const fp_t t = branch_lengths[op_idx];
+    const fp_t branch_length = branch_lengths[item_idx];
 
-    const fp_t* lamb = lambdas + (size_t)rc * (size_t)n;
-    fp_t* out = P + (size_t)idx * (size_t)n * (size_t)n;
+    const size_t state_count = static_cast<size_t>(n);
+    const size_t rate_count = static_cast<size_t>(rate_cats);
+    const size_t matrix_span = state_count * state_count;
+    const size_t rate_offset = static_cast<size_t>(rate_idx) * state_count;
+    const size_t output_base =
+        (static_cast<size_t>(item_idx) * rate_count + static_cast<size_t>(rate_idx)) * matrix_span;
+    const fp_t* rate_lambdas = lambdas + rate_offset;
+    fp_t* out_pmat = P + output_base;
 
-    pmatrix_from_triple_device(Vinv, V, lamb, fp_t(1.0), t, p, out, n);
-}
-
-__global__ void pmatrix_from_triple_kernel_per_node(
-    const fp_t* Vinv,
-    const fp_t* V,
-    const fp_t* lambdas,
-    const fp_t* branch_lengths,
-    fp_t p,
-    fp_t* P,
-    int n,
-    int rate_cats,
-    int num_nodes)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = num_nodes * rate_cats;
-    if (idx < 0 || idx >= total) return;
-
-    const int node_idx = idx / rate_cats;
-    const int rc = idx - node_idx * rate_cats;
-    if (node_idx < 0 || node_idx >= num_nodes || rc < 0 || rc >= rate_cats) return;
-
-    if (!branch_lengths) return;
-    const fp_t t = branch_lengths[node_idx];
-
-    const fp_t* lamb = lambdas + (size_t)rc * (size_t)n;
-    fp_t* out = P + ((size_t)node_idx * (size_t)rate_cats + (size_t)rc)
-        * (size_t)n * (size_t)n;
-
-    pmatrix_from_triple_device(Vinv, V, lamb, fp_t(1.0), t, p, out, n);
+    pmatrix_from_triple_device(Vinv, V, rate_lambdas, fp_t(1.0), branch_length, p, out_pmat, n);
 }

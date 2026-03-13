@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -13,12 +14,18 @@
 #include <libpll/pll.h>
 
 #include "precision.hpp"
+#include "root_likelihood.cuh"
 #include "tree.hpp"
 #include "tree_placement.cuh"
 #include "parse_file.hpp"
+#include "seq_preproc.hpp"
 #include "../mlipper_util.h"
 
-static std::string read_file_to_string(const std::string& path) {
+namespace {
+
+// ----- File and path helpers -----
+
+std::string read_file_to_string(const std::string& path) {
     std::ifstream ifs(path);
     if (!ifs) throw std::runtime_error("Cannot open file: " + path);
     std::ostringstream oss;
@@ -26,7 +33,7 @@ static std::string read_file_to_string(const std::string& path) {
     return oss.str();
 }
 
-static std::string resolve_path(const std::filesystem::path& base, const std::string& p) {
+std::string resolve_path(const std::filesystem::path& base, const std::string& p) {
     namespace fs = std::filesystem;
     fs::path candidate(p);
     if (candidate.empty()) return {};
@@ -34,97 +41,48 @@ static std::string resolve_path(const std::filesystem::path& base, const std::st
     return (base / candidate).string();
 }
 
-static void normalize_vector(std::vector<double>& vec) {
+// ----- Model input normalization helpers -----
+
+void normalize_vector(std::vector<double>& vec) {
     double sum = 0.0;
     for (double v : vec) sum += v;
     if (sum <= 0.0) return;
     for (double& v : vec) v /= sum;
 }
 
-static std::vector<double> ensure_normalized_pi(std::vector<double> pi, int states) {
+std::vector<double> ensure_normalized_pi(std::vector<double> pi, int states) {
     if ((int)pi.size() != states) pi.assign(states, 1.0 / states);
     normalize_vector(pi);
     return pi;
 }
 
-static std::vector<double> build_mixture_weights(const parse::ModelConfig& model, int rate_cats) {
-    std::vector<double> weights;
-    if (rate_cats <= 0) return weights;
-    if ((int)model.rate_weights.size() == rate_cats) {
-        weights = model.rate_weights;
-    } else {
-        weights.assign(rate_cats, 1.0 / rate_cats);
-    }
+// ----- Environment helpers -----
 
-    double sum = 0.0;
-    for (double v : weights) sum += v;
-    if (sum <= 0.0) {
-        weights.assign(rate_cats, 1.0 / rate_cats);
-        return weights;
-    }
-    for (double& v : weights) v /= sum;
-    return weights;
+void set_int_env_if_specified(const char* name, int value) {
+    if (value < 0) return;
+    setenv(name, std::to_string(value).c_str(), 1);
 }
 
-static std::vector<double> build_gamma_rate_categories(double alpha, int rate_cats) {
-    std::vector<double> rates(rate_cats, 1.0);
-    if (rate_cats <= 1 || alpha <= 0.0) return rates;
-    std::vector<float> gamma_tmp(rate_cats);
-    int status = pll_compute_gamma_cats(static_cast<float>(alpha), rate_cats, gamma_tmp.data(), PLL_GAMMA_RATES_MEAN);
-    if (status != PLL_SUCCESS) {
-        throw std::runtime_error("pll_compute_gamma_cats failed.");
-    }
-    for (int i = 0; i < rate_cats; ++i) {
-        rates[i] = static_cast<double>(gamma_tmp[i]);
-    }
-    return rates;
+void set_double_env_if_specified(const char* name, double value) {
+    if (value < 0.0) return;
+    setenv(name, std::to_string(value).c_str(), 1);
 }
 
-static std::vector<double> build_gtr_q_matrix(
-    int states,
-    const parse::ModelConfig& model,
-    const std::vector<double>& pi)
-{
-    std::vector<double> Q(states * states, 0.0);
-    if (states != 4 || model.rates.size() < 6 || pi.size() != 4)
-        return Q;
-
-    auto set_pair = [&](int i, int j, double rate) {
-        Q[i * states + j] = rate * pi[j];
-        Q[j * states + i] = rate * pi[i];
-    };
-
-    set_pair(0, 1, model.rates[0]); // A-C
-    set_pair(0, 2, model.rates[1]); // A-G
-    set_pair(0, 3, model.rates[2]); // A-T
-    set_pair(1, 2, model.rates[3]); // C-G
-    set_pair(1, 3, model.rates[4]); // C-T
-    set_pair(2, 3, model.rates[5]); // G-T
-
-    for (int i = 0; i < states; ++i) {
-        double row_sum = 0.0;
-        for (int j = 0; j < states; ++j) {
-            if (i != j) row_sum += Q[i * states + j];
-        }
-        Q[i * states + i] = -row_sum;
-    }
-
-    // 1) Compute μ = - Σ_i π_i * Q_ii
-    double mu = 0.0;
-    for (int i = 0; i < states; ++i) {
-        mu -= pi[i] * Q[i * states + i];
-    }
-
-    // 2) Scale the entire Q by the same μ
-    for (int idx = 0; idx < states * states; ++idx) {
-        Q[idx] /= mu;
-    }
-
-    return Q;
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value && value[0] && std::string(value) != "0";
 }
+
+} // namespace
 
 int main(int argc, char** argv) {
-    CLI::App app{"test_tree_gen"};
+    const auto start_gpu = std::chrono::steady_clock::now();
+    cudaEvent_t start, stop;
+    float gpu_ms_kernel = 0.0f;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    CLI::App app{"MLIPPER"};
     app.get_formatter()->column_width(40);
 
     // Single config object filled directly by CLI11 options.
@@ -161,6 +119,15 @@ int main(int argc, char** argv) {
     config.model.rates = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
     config.model.per_rate_scaling = true;
     bool no_per_rate_scaling = false;
+    int full_opt_passes = -1;
+    int refine_global_passes = -1;
+    int refine_extra_passes = -1;
+    int refine_detect_topk = -1;
+    int refine_topk = -1;
+    double refine_gap_top2 = -1.0;
+    double refine_gap_top5 = -1.0;
+    double refine_converged_loglk_eps = -1.0;
+    double refine_converged_length_eps = -1.0;
 
     app.add_option("--states", config.model.states, "Number of states")->group("Model");
     app.add_option("--subst-model", config.model.subst_model, "Substitution model")->group("Model");
@@ -171,6 +138,34 @@ int main(int argc, char** argv) {
     app.add_option("--rates", config.model.rates, "GTR rates rAC,rAG,rAT,rCG,rCT,rGT (list)")->group("Model")->delimiter(',');
     app.add_option("--rate-weights", config.model.rate_weights, "Rate category weights (list)")->group("Model")->delimiter(',');
     app.add_flag("--no-per-rate-scaling", no_per_rate_scaling, "Disable per-rate scaling")->group("Model");
+
+    app.add_option("--full-opt-passes", full_opt_passes,
+                   "Full optimization passes when refine is disabled")
+        ->group("Placement");
+    app.add_option("--refine-global-passes", refine_global_passes,
+                   "Full-op passes before refine selection")
+        ->group("Placement");
+    app.add_option("--refine-extra-passes", refine_extra_passes,
+                   "Maximum extra passes after refine top-K selection")
+        ->group("Placement");
+    app.add_option("--refine-detect-topk", refine_detect_topk,
+                   "Top-K candidates examined when deciding whether to refine")
+        ->group("Placement");
+    app.add_option("--refine-topk", refine_topk,
+                   "Top-K candidates retained for refine passes")
+        ->group("Placement");
+    app.add_option("--refine-gap-top2", refine_gap_top2,
+                   "Ambiguity threshold for top1-top2 log-likelihood gap")
+        ->group("Placement");
+    app.add_option("--refine-gap-top5", refine_gap_top5,
+                   "Ambiguity threshold for top1-top5 log-likelihood gap")
+        ->group("Placement");
+    app.add_option("--refine-converged-loglk-eps", refine_converged_loglk_eps,
+                   "Per-op refine early-stop threshold for log-likelihood change")
+        ->group("Placement");
+    app.add_option("--refine-converged-length-eps", refine_converged_length_eps,
+                   "Per-op refine early-stop threshold for branch-length change")
+        ->group("Placement");
 
     try {
         app.parse(argc, argv);
@@ -252,13 +247,14 @@ int main(int argc, char** argv) {
     const auto& alignment = inputs.tree_alignment;
 
     const auto& msa_names = alignment.names;
-    const auto& rows = alignment.sequences;
+    std::vector<std::string> rows = alignment.sequences;
     size_t sites = alignment.sites;
     const std::string& newick = inputs.tree;
     const auto& model = inputs.config.model;
     int states = model.states;
     int rate_cats = model.ncat;
     bool per_rate_scaling = model.per_rate_scaling;
+    std::vector<unsigned> pattern_weights(sites, 1u);
 
     std::vector<double> pi = ensure_normalized_pi(model.freqs, states);
     std::vector<double> rate_weights = build_mixture_weights(model, rate_cats);
@@ -268,6 +264,27 @@ int main(int argc, char** argv) {
     const std::string& query_alignment_cfg = inputs.config.files.query_alignment;
     std::vector<NewPlacementQuery> placement_queries =
         build_placement_query(resolve_path(config_base, query_alignment_cfg));
+    if (!env_flag_enabled("MLIPPER_DISABLE_REPETITIVE_COLUMNS")) {
+        remove_repetitive_columns(rows, placement_queries, pattern_weights, sites);
+        if (sites == 0) {
+            throw std::runtime_error("All columns were removed after repetitive-column compression.");
+        }
+    }
+    const bool disable_pattern_weights = env_flag_enabled("MLIPPER_DISABLE_PATTERN_WEIGHTS");
+    const std::vector<unsigned> no_pattern_weights;
+    const std::vector<unsigned>& pattern_weights_arg =
+        disable_pattern_weights ? no_pattern_weights : pattern_weights;
+
+    set_int_env_if_specified("MLIPPER_FULL_OPT_PASSES", full_opt_passes);
+    set_int_env_if_specified("MLIPPER_REFINE_GLOBAL_PASSES", refine_global_passes);
+    set_int_env_if_specified("MLIPPER_REFINE_EXTRA_PASSES", refine_extra_passes);
+    set_int_env_if_specified("MLIPPER_REFINE_DETECT_TOPK", refine_detect_topk);
+    set_int_env_if_specified("MLIPPER_REFINE_TOPK", refine_topk);
+    set_double_env_if_specified("MLIPPER_REFINE_GAP_TOP2", refine_gap_top2);
+    set_double_env_if_specified("MLIPPER_REFINE_GAP_TOP5", refine_gap_top5);
+    set_double_env_if_specified("MLIPPER_REFINE_CONVERGED_LOGLK_EPS", refine_converged_loglk_eps);
+    set_double_env_if_specified("MLIPPER_REFINE_CONVERGED_LENGTH_EPS", refine_converged_length_eps);
+
     printf("Precision mode: %s\n", FP_MODE_NAME);
     // const auto start_gpu = std::chrono::steady_clock::now();
     auto res = BuildAllToGPU(
@@ -278,6 +295,7 @@ int main(int argc, char** argv) {
         pi,
         rate_multipliers,
         rate_weights,
+        pattern_weights_arg,
         sites,
         states,
         rate_cats,
@@ -294,32 +312,33 @@ int main(int argc, char** argv) {
                 << ", per_node_elems=" << res.dev.per_node_elems() << "\n";
 
     
-    const auto start_gpu = std::chrono::steady_clock::now();
-    cudaEvent_t start, stop;
-    float gpu_ms_kernel = 0.0f;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
+    
     cudaEventRecord(start);
-    double logL = EvaluateTreeLogLikelihood(
+    PlacementOpBuffer placement_ops;
+    UpdateTreeClvs(
         res.dev,
         res.tree,
         res.hostPack,
-        pi,
-        rate_weights,
-        0
-    );
+        placement_ops,
+        0);
+    double logL = root_likelihood::compute_root_loglikelihood_total(
+        res.dev,
+        res.tree.root_id,
+        res.dev.d_pattern_weights_u,
+        nullptr,
+        0.0,
+        0);
     printf("Initial tree log-likelihood = %.12f\n", logL);
     std::vector<PlacementResult> placement_results;
-    UpdateTreeLogLikelihood_device(
+    EvaluatePlacementQueries(
         res.dev,
-        res.tree,
-        res.hostPack,
         res.eig,
         rate_multipliers,
+        placement_ops,
         &placement_results,
         1,
         0);
+    free_placement_op_buffer(placement_ops, 0);
 
     if (!jplace_out.empty()) {
         if (placement_results.size() != placement_queries.size()) {

@@ -15,16 +15,89 @@
 #include "partial_likelihood.cuh"
 #include "parse_file.hpp"
 
-double EvaluateTreeLogLikelihood_device(
-    const DeviceTree&      D,
-    const TreeBuildResult& T,
-    const HostPacking&     H,
-    const std::vector<double>& pi,
-    const std::vector<double>& rate_weights,
-    cudaStream_t stream);
-
 static void throw_if(bool cond, const char* msg) {
     if (cond) throw std::runtime_error(msg);
+}
+
+std::vector<double> build_mixture_weights(const parse::ModelConfig& model, int rate_cats) {
+    std::vector<double> weights;
+    if (rate_cats <= 0) return weights;
+    if (static_cast<int>(model.rate_weights.size()) == rate_cats) {
+        weights = model.rate_weights;
+    } else {
+        weights.assign(rate_cats, 1.0 / rate_cats);
+    }
+
+    double sum = 0.0;
+    for (double value : weights) sum += value;
+    if (sum <= 0.0) {
+        weights.assign(rate_cats, 1.0 / rate_cats);
+        return weights;
+    }
+    for (double& value : weights) value /= sum;
+    return weights;
+}
+
+std::vector<double> build_gamma_rate_categories(double alpha, int rate_cats) {
+    std::vector<double> rates(rate_cats, 1.0);
+    if (rate_cats <= 1 || alpha <= 0.0) return rates;
+
+    std::vector<double> gamma_tmp(rate_cats);
+    const int status = pll_compute_gamma_cats(
+        alpha,
+        rate_cats,
+        gamma_tmp.data(),
+        PLL_GAMMA_RATES_MEAN);
+    if (status != PLL_SUCCESS) {
+        throw std::runtime_error("pll_compute_gamma_cats failed.");
+    }
+
+    for (int rate_idx = 0; rate_idx < rate_cats; ++rate_idx) {
+        rates[rate_idx] = gamma_tmp[rate_idx];
+    }
+    return rates;
+}
+
+std::vector<double> build_gtr_q_matrix(
+    int states,
+    const parse::ModelConfig& model,
+    const std::vector<double>& pi)
+{
+    std::vector<double> q_matrix(states * states, 0.0);
+    if (states != 4 || model.rates.size() < 6 || pi.size() != 4) {
+        return q_matrix;
+    }
+
+    auto set_pair = [&](int row, int col, double rate) {
+        q_matrix[row * states + col] = rate * pi[col];
+        q_matrix[col * states + row] = rate * pi[row];
+    };
+
+    set_pair(0, 1, model.rates[0]);
+    set_pair(0, 2, model.rates[1]);
+    set_pair(0, 3, model.rates[2]);
+    set_pair(1, 2, model.rates[3]);
+    set_pair(1, 3, model.rates[4]);
+    set_pair(2, 3, model.rates[5]);
+
+    for (int row = 0; row < states; ++row) {
+        double row_sum = 0.0;
+        for (int col = 0; col < states; ++col) {
+            if (row != col) row_sum += q_matrix[row * states + col];
+        }
+        q_matrix[row * states + row] = -row_sum;
+    }
+
+    double mu = 0.0;
+    for (int row = 0; row < states; ++row) {
+        mu -= pi[row] * q_matrix[row * states + row];
+    }
+
+    for (double& entry : q_matrix) {
+        entry /= mu;
+    }
+
+    return q_matrix;
 }
 
 static PlacementQueryBatch make_query_batch(
@@ -55,7 +128,6 @@ static PlacementQueryBatch make_query_batch(
             batch.query_chars[qi * sites + s] = encode_state_DNA5(q.msa[s]);
         }
     }
-    // fill_query_pmats(batch, eig, rate_multipliers, states, rate_cats);
     return batch;
 }
 
@@ -215,6 +287,7 @@ BuildToGpuResult BuildAllToGPU(
     const std::vector<double>& pi,           // size = states
     const std::vector<double>& rate_multipliers,   // size = rate_cats
     const std::vector<double>& rate_weights, // size = rate_cats
+    const std::vector<unsigned>& pattern_weights,
     size_t sites, int states, int rate_cats, bool per_rate_scaling,
     const std::vector<NewPlacementQuery>& placement_queries)
 {
@@ -232,11 +305,15 @@ BuildToGpuResult BuildAllToGPU(
     // 2) Align MSA → HostPacking (topology arrays, tipchars, offsets, scaler)
     HostPacking H = pack_host_arrays_from_tree_and_msa(
         T, msa_tip_names, msa_rows, sites, states);
+    if (!pattern_weights.empty() && pattern_weights.size() != sites) {
+        throw std::runtime_error("pattern_weights size mismatch.");
+    }
+    H.pattern_weights = pattern_weights;
 
     // 3) Host-side GTR decomposition (V/Vinv/λ)
     EigResult Eigen = gtr_eigendecomp_cpu(Q_rowmajor.data(), pi.data(), states);
 
-    fill_pmats_in_host_packing(T, H, Eigen, pi, rate_multipliers, states, rate_cats);
+    fill_pmats_in_host_packing(T, H, Eigen, rate_multipliers, states, rate_cats);
 
     // Placement queries staged separately from HostPacking.
     PlacementQueryBatch Q = make_query_batch(
@@ -262,19 +339,6 @@ BuildToGpuResult BuildAllToGPU(
         Q.empty() ? nullptr : &Q);
 
     return BuildToGpuResult{ std::move(D), std::move(T), std::move(H), std::move(Eigen), std::move(Q) };
-}
-
-// Evaluate tree log-likelihood using prepared DeviceTree/HostPacking and model vectors.
-double EvaluateTreeLogLikelihood(
-    const DeviceTree&      D,
-    const TreeBuildResult& T,
-    const HostPacking&     H,
-    const std::vector<double>& pi,
-    const std::vector<double>& rate_weights,
-    cudaStream_t stream = 0)
-{
-    double loglk = EvaluateTreeLogLikelihood_device(D, T, H, pi, rate_weights, stream);
-    return loglk;
 }
 
 std::vector<NewPlacementQuery> build_placement_query(const std::string& alignment_path)

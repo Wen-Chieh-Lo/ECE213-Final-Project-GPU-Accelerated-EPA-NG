@@ -142,7 +142,7 @@ def build_edge_split_map(tree_text: str) -> Dict[int, Tuple[str, ...]]:
     return edge_to_split
 
 
-def load_jplace(path: Path) -> Dict[str, QueryPlacements]:
+def load_jplace(path: Path) -> Dict[str, List[QueryPlacements]]:
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
 
@@ -160,7 +160,7 @@ def load_jplace(path: Path) -> Dict[str, QueryPlacements]:
         field_index[name] = fields.index(name)
     edge_splits = build_edge_split_map(tree_text)
 
-    result: Dict[str, QueryPlacements] = {}
+    result: Dict[str, List[QueryPlacements]] = {}
     for entry in placements:
         names = entry.get("n")
         rows = entry.get("p")
@@ -188,7 +188,7 @@ def load_jplace(path: Path) -> Dict[str, QueryPlacements]:
         query_placements = QueryPlacements(top1=parsed_rows[0], all_rows=parsed_rows)
 
         for query_name in names:
-            result[str(query_name)] = query_placements
+            result.setdefault(str(query_name), []).append(query_placements)
 
     return result
 
@@ -222,12 +222,33 @@ def main() -> int:
     truth = load_jplace(Path(args.truth))
     pred = load_jplace(Path(args.pred))
 
-    shared_queries = sorted(set(truth) & set(pred))
-    truth_only = sorted(set(truth) - set(pred))
-    pred_only = sorted(set(pred) - set(truth))
+    shared_query_names = sorted(set(truth) & set(pred))
+    if not shared_query_names:
+        raise SystemExit("No shared query names between the two jplace files.")
+
+    shared_queries: List[Tuple[str, QueryPlacements, QueryPlacements]] = []
+    truth_only_instances = 0
+    pred_only_instances = 0
+
+    for query_name in shared_query_names:
+        truth_rows = truth[query_name]
+        pred_rows = pred[query_name]
+        shared_count = min(len(truth_rows), len(pred_rows))
+        truth_only_instances += max(0, len(truth_rows) - shared_count)
+        pred_only_instances += max(0, len(pred_rows) - shared_count)
+        for occurrence in range(shared_count):
+            display_name = query_name if shared_count == 1 else f"{query_name}#{occurrence + 1}"
+            shared_queries.append((display_name, truth_rows[occurrence], pred_rows[occurrence]))
+
+    for query_name, rows in truth.items():
+        if query_name not in pred:
+            truth_only_instances += len(rows)
+    for query_name, rows in pred.items():
+        if query_name not in truth:
+            pred_only_instances += len(rows)
 
     if not shared_queries:
-        raise SystemExit("No shared query names between the two jplace files.")
+        raise SystemExit("No shared query instances between the two jplace files.")
 
     exact_matches = 0
     exact_split_matches = 0
@@ -241,9 +262,7 @@ def main() -> int:
     topk_not_top1 = []
     topk_rank_histogram: Dict[int, int] = {}
 
-    for query_name in shared_queries:
-        truth_q = truth[query_name]
-        pred_q = pred[query_name]
+    for query_name, truth_q, pred_q in shared_queries:
         truth_p = truth_q.top1
         pred_p = pred_q.top1
         truth_topk = truth_q.all_rows[: max(1, args.truth_topk)]
@@ -297,9 +316,9 @@ def main() -> int:
 
     print(f"truth file: {args.truth}")
     print(f"pred file:  {args.pred}")
-    print(f"shared queries: {len(shared_queries)}")
-    print(f"truth-only queries: {len(truth_only)}")
-    print(f"pred-only queries: {len(pred_only)}")
+    print(f"shared query instances: {len(shared_queries)}")
+    print(f"truth-only query instances: {truth_only_instances}")
+    print(f"pred-only query instances: {pred_only_instances}")
     print()
 
     exact_rate = exact_matches / float(len(shared_queries))

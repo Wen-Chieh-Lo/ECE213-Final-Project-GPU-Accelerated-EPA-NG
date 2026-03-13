@@ -12,6 +12,13 @@ namespace root_likelihood {
 
 constexpr double kLn2 = 0.69314718055994530942;
 
+__device__ __forceinline__ unsigned load_pattern_weight_cached(
+    const unsigned* pattern_w,
+    unsigned int site_idx)
+{
+    return pattern_w ? pattern_w[site_idx] : 1u;
+}
+
 __device__ __forceinline__ unsigned int combined_scaler_shift_at(
     const unsigned* scaler_pool,
     const DeviceTree& D,
@@ -69,7 +76,7 @@ __device__ __forceinline__ void compute_root_loglikelihood_states4(
         if (inv_idx >= 0) site_sum += invar_proportion * freqs[inv_idx];
     }
     double loglk = log(site_sum > 1e-300 ? site_sum : 1e-300);
-    if (pattern_w) loglk *= static_cast<double>(pattern_w[site_idx]);
+    loglk *= static_cast<double>(load_pattern_weight_cached(pattern_w, site_idx));
     total_likelihood[site_idx] = static_cast<fp_t>(loglk);
 }
 
@@ -112,7 +119,7 @@ __device__ __forceinline__ void compute_root_loglikelihood_states5(
         if (inv_idx >= 0) site_sum += invar_proportion * freqs[inv_idx];
     }
     double loglk = log(site_sum > 1e-300 ? site_sum : 1e-300);
-    if (pattern_w) loglk *= static_cast<double>(pattern_w[site_idx]);
+    loglk *= static_cast<double>(load_pattern_weight_cached(pattern_w, site_idx));
     total_likelihood[site_idx] = static_cast<fp_t>(loglk);
 }
 
@@ -146,7 +153,7 @@ __device__ __forceinline__ void compute_root_loglikelihood_generic(
         if (inv_idx >= 0) site_sum += invar_proportion * freqs[inv_idx];
     }
     double loglk = log(site_sum > 1e-300 ? site_sum : 1e-300);
-    if (pattern_w) loglk *= static_cast<double>(pattern_w[site_idx]);
+    loglk *= static_cast<double>(load_pattern_weight_cached(pattern_w, site_idx));
     total_likelihood[site_idx] = static_cast<fp_t>(loglk);
 }
 
@@ -230,10 +237,18 @@ double compute_root_loglikelihood_total(
         throw std::runtime_error("Device placement_clv buffer is not initialized.");
     }
 
+    DeviceTree D_root = D;
+    if (D.d_site_scaler_up) {
+        const size_t scaler_span = D.per_rate_scaling
+            ? (D.sites * (size_t)D.rate_cats)
+            : D.sites;
+        D_root.d_site_scaler = D.d_site_scaler_up + (size_t)root_id * scaler_span;
+    }
+
     const size_t per_node = D.per_node_elems();
     if (per_node > 0) {
         CUDA_CHECK(cudaMemcpyAsync(
-            D.d_clv_mid,
+            D_root.d_clv_mid,
             D.d_clv_up + (size_t)root_id * per_node,
             sizeof(fp_t) * per_node,
             cudaMemcpyDeviceToDevice,
@@ -256,9 +271,9 @@ double compute_root_loglikelihood_total(
     root_op.clv_pool = static_cast<uint8_t>(CLV_POOL_UP);
 
     dim3 block(256);
-    dim3 grid((unsigned)((D.sites + block.x - 1) / block.x));
+    dim3 grid((unsigned)((D_root.sites + block.x - 1) / block.x));
     RootLikelihoodPerSiteKernel<<<grid, block, 0, stream>>>(
-        D,
+        D_root,
         root_op,
         d_pattern_w,
         d_invar_indices,
@@ -266,12 +281,12 @@ double compute_root_loglikelihood_total(
     
     CUDA_CHECK(cudaGetLastError());
     
-    std::vector<fp_t> host_lk(D.sites, fp_t(0));
-    if (D.sites > 0) {
+    std::vector<fp_t> host_lk(D_root.sites, fp_t(0));
+    if (D_root.sites > 0) {
         CUDA_CHECK(cudaMemcpyAsync(
             host_lk.data(),
-            D.d_placement_clv,
-            sizeof(fp_t) * D.sites,
+            D_root.d_placement_clv,
+            sizeof(fp_t) * D_root.sites,
             cudaMemcpyDeviceToHost,
             stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -320,6 +335,8 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
 
     double local_sum = 0.0;
     for (unsigned int site = threadIdx.x; site < D.sites; site += blockDim.x) {
+        const fp_t site_weight = static_cast<fp_t>(
+            load_pattern_weight_cached(D.d_pattern_weights_u, site));
         const fp_t* query_clv = D.d_query_clv + (size_t)site * per_site;
         const fp_t* distal_clv = D.d_clv_mid_base + (size_t)target_id * per_node + (size_t)site * per_site;
         const fp_t* prox_clv = D.d_clv_up + (size_t)target_id * per_node + (size_t)site * per_site;
@@ -389,8 +406,9 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
                 site_lk += rate_w * val;
             }
         }
-        local_sum += static_cast<double>(fp_log(site_lk > FP_EPS ? site_lk : FP_EPS))
-                   - static_cast<double>(site_min_shift) * kLn2;
+        local_sum += static_cast<double>(site_weight) *
+            (static_cast<double>(fp_log(site_lk > FP_EPS ? site_lk : FP_EPS))
+             - static_cast<double>(site_min_shift) * kLn2);
     }
 
     // Block reduction (warp then block) to avoid atomics.
@@ -444,6 +462,8 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
 
     double local_sum = 0.0;
     for (unsigned int site = threadIdx.x; site < D.sites; site += blockDim.x) {
+        const fp_t site_weight = static_cast<fp_t>(
+            load_pattern_weight_cached(D.d_pattern_weights_u, site));
         const fp_t* query_clv = D.d_query_clv + (size_t)site * per_site;
         const fp_t* distal_clv = D.d_clv_mid_base + (size_t)target_id * per_node + (size_t)site * per_site;
         const fp_t* prox_clv = D.d_clv_up + (size_t)target_id * per_node + (size_t)site * per_site;
@@ -503,8 +523,9 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
                 site_lk += rate_w * rate_sum;
             }
         }
-        local_sum += static_cast<double>(fp_log(site_lk > FP_EPS ? site_lk : FP_EPS))
-                   - static_cast<double>(site_min_shift) * kLn2;
+        local_sum += static_cast<double>(site_weight) *
+            (static_cast<double>(fp_log(site_lk > FP_EPS ? site_lk : FP_EPS))
+             - static_cast<double>(site_min_shift) * kLn2);
     }
 
     __shared__ double warp_sum[32];
@@ -578,6 +599,12 @@ void compute_combined_loglik_per_op_device(
 
     const size_t per_query = (size_t)D.rate_cats * (size_t)D.states * (size_t)D.states;
     const size_t per_node_pmat = per_query;
+    auto check_launch = [&](const char* stage) {
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string(stage) + ": " + cudaGetErrorString(err));
+        }
+    };
 
     dim3 block(256);
     dim3 grid(1, (unsigned)num_ops);
@@ -593,6 +620,7 @@ void compute_combined_loglik_per_op_device(
                 per_query,
                 per_node_pmat,
                 d_out);
+            check_launch("CombinedPlacementLoglikPerOpKernelStates4<4>");
         } else if (D.rate_cats == 1) {
             CombinedPlacementLoglikPerOpKernelStates4<1><<<grid, block, 0, stream>>>(
                 D,
@@ -604,6 +632,7 @@ void compute_combined_loglik_per_op_device(
                 per_query,
                 per_node_pmat,
                 d_out);
+            check_launch("CombinedPlacementLoglikPerOpKernelStates4<1>");
         } else if (D.rate_cats == 8) {
             CombinedPlacementLoglikPerOpKernelStates4<8><<<grid, block, 0, stream>>>(
                 D,
@@ -615,6 +644,7 @@ void compute_combined_loglik_per_op_device(
                 per_query,
                 per_node_pmat,
                 d_out);
+            check_launch("CombinedPlacementLoglikPerOpKernelStates4<8>");
         } else {
             CombinedPlacementLoglikPerOpKernelGeneric<<<grid, block, 0, stream>>>(
                 D,
@@ -626,6 +656,7 @@ void compute_combined_loglik_per_op_device(
                 per_query,
                 per_node_pmat,
                 d_out);
+            check_launch("CombinedPlacementLoglikPerOpKernelGeneric states4");
         }
     } else {
         CombinedPlacementLoglikPerOpKernelGeneric<<<grid, block, 0, stream>>>(
@@ -638,8 +669,8 @@ void compute_combined_loglik_per_op_device(
             per_query,
             per_node_pmat,
             d_out);
+        check_launch("CombinedPlacementLoglikPerOpKernelGeneric");
     }
-    CUDA_CHECK(cudaGetLastError());
 }
 
 
