@@ -1,6 +1,4 @@
-# MLIPPER Submission Package
-
-This repository contains the submission-ready MLIPPER benchmark package for the TA. It includes:
+# MLIPPER
 
 - a self-contained GPU Docker build in [`Dockerfile`](Dockerfile)
 - the benchmark driver script in [`run.sh`](run.sh)
