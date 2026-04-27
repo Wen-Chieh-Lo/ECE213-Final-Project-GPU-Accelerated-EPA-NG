@@ -49,18 +49,14 @@ __device__ void pmatrix_from_triple_device(
         }
     }
 
-    // Clamp tiny negatives and renormalize rows.
+    // Keep PMAT on the raw matrix-exponential path so branch-length
+    // derivatives remain consistent with the eigenbasis diagtable used by the
+    // Newton kernels. Small floating deviations are preferable to optimizing
+    // against a renormalized matrix that the derivative code does not model.
     for (int row = 0; row < state_count; ++row) {
-        fp_t row_sum = fp_t(0);
         for (int col = 0; col < state_count; ++col) {
             fp_t& entry = out_pmat[row * state_count + col];
-            if (entry < 0.0 && entry > fp_t(-1e-7f)) entry = 0.0;
-            row_sum += entry;
-        }
-        if (row_sum != 0.0) {
-            for (int col = 0; col < state_count; ++col) {
-                out_pmat[row * state_count + col] /= row_sum;
-            }
+            if (entry < 0.0 && entry > fp_t(-1e-12)) entry = 0.0;
         }
     }
 }

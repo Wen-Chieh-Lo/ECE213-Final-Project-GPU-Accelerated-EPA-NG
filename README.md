@@ -84,14 +84,56 @@ From inside the container, run:
 ./run.sh
 ```
 
+If you want MLIPPER to estimate equilibrium base frequencies directly from the
+reference alignment instead of using manual `--freqs` or the uniform default,
+pass:
+
+```bash
+./MLIPPER ... --empirical-freqs
+```
+
+This computes empirical frequencies from `--tree-alignment` and ignores
+ambiguous DNA symbols by distributing them across their represented states
+(for example `N` or `-` contributes `0.25` to each of A/C/G/T in 4-state DNA).
+
+When writing a committed Newick tree with `--commit-to-tree`, MLIPPER now
+collapses very short internal branches into output polytomies by default:
+
+```bash
+./MLIPPER ... --commit-to-tree final_tree.nwk
+```
+
+The default threshold is `1e-6`. To change or disable it:
+
+```bash
+./MLIPPER ... --commit-to-tree final_tree.nwk \
+  --commit-collapse-internal-epsilon 1e-5
+
+./MLIPPER ... --commit-to-tree final_tree.nwk \
+  --commit-collapse-internal-epsilon -1
+```
+
+This only changes the emitted `.nwk` output. Internal placement, commit, and
+reinsert passes continue to use the uncollapsed binary tree.
+
+For the EPA-ng benchmark, use:
+
+```bash
+python3 scripts/epa_ng_testing.py
+python3 scripts/epa_ng_testing.py --datasets 1k 2k 5k
+```
+
+The first command runs the default 1k benchmark. The second runs all three
+bundled query sets.
+
 The script performs the following steps automatically:
 
 1. extracts `data/neotrop_runtime_dataset.tar.gz` if the required dataset files are missing
 2. uses the prebuilt `MLIPPER` binary if present; otherwise builds it with `make float`
 3. checks that `epa-ng` is available in the configured conda environment
-4. generates missing EPA-ng truth placements for 1k, 2k, and 5k query sets
+4. generates missing EPA-ng truth placements for the selected query sets
 5. runs MLIPPER in `baseline` and `fast` modes
-6. compares each MLIPPER result against the EPA-ng truth with [`scripts/compare_jplace.py`](scripts/compare_jplace.py)
+6. compares each MLIPPER result against the EPA-ng truth inside [`scripts/epa_ng_testing.py`](scripts/epa_ng_testing.py)
 7. prints a CLI summary table with runtime, top-1 accuracy, top-5 accuracy, and speedup relative to EPA-ng
 
 Example output format:

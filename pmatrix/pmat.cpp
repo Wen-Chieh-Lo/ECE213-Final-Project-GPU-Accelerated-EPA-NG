@@ -1,258 +1,199 @@
-#include <vector>
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
-#include <algorithm>
-// #include <lapacke.h>
+#include <vector>
+
 #include "pmat.h"
 
 extern "C" {
-    void dsyevd_(char* jobz, char* uplo, int* n,
-                 double* a, int* lda,
-                 double* w,
-                 double* work, int* lwork,
-                 int* iwork, int* liwork,
-                 int* info);
-}
-static void eye(double* I, int n){
-    std::fill(I, I+n*n, 0.0);
-    for(int i=0;i<n;++i) I[i*n+i] = 1.0;
+void dsyevd_(char* jobz, char* uplo, int* n,
+             double* a, int* lda,
+             double* w,
+             double* work, int* lwork,
+             int* iwork, int* liwork,
+             int* info);
 }
 
-static void matmul_nn(const double* A, const double* B, double* C, int n){
-    std::fill(C, C+n*n, 0.0);
-    for(int i=0;i<n;++i){
-        for(int k=0;k<n;++k){
-            double aik = A[i*n + k];
-            for(int j=0;j<n;++j){
-                C[i*n + j] += aik * B[k*n + j];
-            }
+namespace {
+
+void eye(double* matrix, int n) {
+    std::fill(matrix, matrix + n * n, 0.0);
+    for (int i = 0; i < n; ++i) matrix[i * n + i] = 1.0;
+}
+
+void clamp_neg_and_row_norm(double* p, int n) {
+    for (int row = 0; row < n; ++row) {
+        double sum = 0.0;
+        for (int col = 0; col < n; ++col) {
+            double& entry = p[row * n + col];
+            if (entry < 0.0 && entry > -1e-14) entry = 0.0;
+            sum += entry;
+        }
+        if (sum != 0.0) {
+            for (int col = 0; col < n; ++col) p[row * n + col] /= sum;
         }
     }
 }
 
-static void matadd_inplace(double* A, const double* B, int n){
-    for(int i=0;i<n*n;++i) A[i] += B[i];
-}
-
-static double inf_norm(const std::vector<double>& M, int n){
-    double m = 0.0;
-    for(int i=0;i<n*n;++i) m = std::max(m, std::abs(M[i]));
-    return m;
-}
-
-static double check_rowsum_max_dev(const double* P, int n){
-    double worst = 0.0;
-    for(int i=0;i<n;++i){
-        double s = 0.0;
-        for(int j=0;j<n;++j) s += P[i*n + j];
-        worst = std::max(worst, std::abs(s - 1.0));
-    }
-    return worst;
-}
-
-static void clamp_neg_and_row_norm(double* P, int n){
-    for(int i=0;i<n;++i){
-        double s = 0.0;
-        for(int j=0;j<n;++j){
-            double &x = P[i*n + j];
-            if (x < 0.0 && x > -1e-14) x = 0.0;
-            s += x;
-        }
-        if (s != 0.0){
-            for(int j=0;j<n;++j) P[i*n + j] /= s;
-        }
-    }
-}
+}  // namespace
 
 void pmatrix_from_triple(const double* Vinv, const double* V,
-                                const double* lamb, double r, double t, double p,
-                                double* P, int n)
-{
-    // I
-    std::vector<double> I(n*n, 0.0); 
-    for (int i=0;i<n;++i) I[i*n+i] = 1.0;
+                         const double* lamb, double r, double t, double p,
+                         double* P, int n) {
+    std::vector<double> I(n * n, 0.0);
+    for (int i = 0; i < n; ++i) I[i * n + i] = 1.0;
 
-    // D = diag( expm1(λ r t) )
-    std::vector<double> D(n*n, 0.0);
-    for (int j=0;j<n;++j) D[j*n + j] = std::expm1(lamb[j] * r * t);
+    std::vector<double> D(n * n, 0.0);
+    for (int j = 0; j < n; ++j) D[j * n + j] = std::expm1(lamb[j] * r * t);
 
-    // T = V * D
-    std::vector<double> T(n*n, 0.0);
-    for (int i=0;i<n;++i){
-        for (int k=0;k<n;++k){
-            double vik = V[i*n + k];
-            for (int j=0;j<n;++j){
-                T[i*n + j] += vik * D[k*n + j];
-            }
+    std::vector<double> T(n * n, 0.0);
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < n; ++k) {
+            const double vik = V[i * n + k];
+            for (int j = 0; j < n; ++j) T[i * n + j] += vik * D[k * n + j];
         }
     }
 
-    // P = I + T * Vinv  (= I + V * [e^{Λt}-I] * V^{-1})
-    std::fill(P, P + n*n, 0.0);
-    for (int i=0;i<n;++i){
-        for (int k=0;k<n;++k){
-            double tik = T[i*n + k];
-            for (int j=0;j<n;++j){
-                P[i*n + j] += tik * Vinv[k*n + j];
-            }
+    std::fill(P, P + n * n, 0.0);
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < n; ++k) {
+            const double tik = T[i * n + k];
+            for (int j = 0; j < n; ++j) P[i * n + j] += tik * Vinv[k * n + j];
         }
     }
-    for (int i=0;i<n;++i) P[i*n + i] += 1.0;
+    for (int i = 0; i < n; ++i) P[i * n + i] += 1.0;
 
-    // Invariant mix: P = (1-p) P + p I (only linear mix; do not touch the exponent)
-    if (p > 0){
-        for (int i=0;i<n*n;++i) P[i] = (1.0 - p)*P[i] + p*I[i];
+    if (p > 0.0) {
+        for (int i = 0; i < n * n; ++i) P[i] = (1.0 - p) * P[i] + p * I[i];
     }
 
-    // Numerical hygiene: clamp small negatives and renormalize each row to sum to 1.
-    // This keeps PMAT close to stochastic even under floating error.
     clamp_neg_and_row_norm(P, n);
 }
 
-
-
 void pmatrix_direct(const double* U, const double* pi,
-                           const double* lamb, double r, double t, double p,
-                           double* P, int n)
-{
+                    const double* lamb, double r, double t, double p,
+                    double* P, int n) {
     std::vector<double> Dsqrt(n), Dsqrt_inv(n);
-    for(int i=0;i<n;++i){ Dsqrt[i]=std::sqrt(pi[i]); Dsqrt_inv[i]=1.0/Dsqrt[i]; }
-    // E = diag(exp(lamb*r*t))
-    std::vector<double> E(n*n,0.0), temp(n*n,0.0), M(n*n,0.0), I(n*n,0.0);
-    for(int j=0;j<n;++j) E[j*n + j] = std::exp(lamb[j]*r*t);
-    // temp = U * E
-    matmul_nn(U, E.data(), temp.data(), n);
-    // M = temp * U^T (explicitly expand U^T by index)
-    std::fill(M.begin(), M.end(), 0.0);
-    for(int i=0;i<n;++i){
-        for(int k=0;k<n;++k){
-            double tik = temp[i*n + k];
-            for(int j=0;j<n;++j){
-                M[i*n + j] += tik * U[j*n + k]; // U^T[k,j] = U[j,k]
-            }
+    for (int i = 0; i < n; ++i) {
+        Dsqrt[i] = std::sqrt(pi[i]);
+        Dsqrt_inv[i] = 1.0 / Dsqrt[i];
+    }
+
+    std::vector<double> E(n * n, 0.0), temp(n * n, 0.0), M(n * n, 0.0), I(n * n, 0.0);
+    for (int j = 0; j < n; ++j) E[j * n + j] = std::exp(lamb[j] * r * t);
+
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < n; ++k) {
+            const double uik = U[i * n + k];
+            for (int j = 0; j < n; ++j) temp[i * n + j] += uik * E[k * n + j];
         }
     }
-    // P0 = D^{-1} * M * D
-    std::vector<double> P0(n*n, 0.0);
-    for(int i=0;i<n;++i){
-        for(int j=0;j<n;++j){
-            P0[i*n + j] = Dsqrt_inv[i] * M[i*n + j] * Dsqrt[j];
+
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < n; ++k) {
+            const double tik = temp[i * n + k];
+            for (int j = 0; j < n; ++j) M[i * n + j] += tik * U[j * n + k];
         }
     }
+
+    std::vector<double> P0(n * n, 0.0);
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) P0[i * n + j] = Dsqrt_inv[i] * M[i * n + j] * Dsqrt[j];
+    }
+
     eye(I.data(), n);
-    for(int i=0;i<n*n;++i) P[i] = (1.0 - p)*P0[i] + p*I[i];
+    for (int i = 0; i < n * n; ++i) P[i] = (1.0 - p) * P0[i] + p * I[i];
 }
 
-
-EigResult gtr_eigendecomp_cpu(
-    const double* Q_rowmajor,   // Q (row-major, size n*n)
-    const double* pi,           // Stationary frequencies (length n, sum=1)
-    int n)
-{
+EigResult gtr_eigendecomp_cpu(const double* Q_rowmajor, const double* pi, int n) {
     if (n <= 0) throw std::invalid_argument("n must be > 0");
 
-    // 1) D = diag(sqrt(pi))
     std::vector<double> sqrtpi(n);
     for (int i = 0; i < n; ++i) {
         if (pi[i] <= 0.0) throw std::invalid_argument("pi must be > 0");
         sqrtpi[i] = std::sqrt(pi[i]);
     }
 
-    // 2) S = D * Q * D^{-1}  (S is symmetric)
-    //    S[i,j] = sqrt(pi[i]) * Q[i,j] / sqrt(pi[j])
     std::vector<double> S(n * n);
     for (int i = 0; i < n; ++i) {
         const double si = sqrtpi[i];
-        for (int j = 0; j < n; ++j) {
-            S[i*n + j] = si * Q_rowmajor[i*n + j] / sqrtpi[j];
+        for (int j = 0; j < n; ++j) S[i * n + j] = si * Q_rowmajor[i * n + j] / sqrtpi[j];
+    }
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            const double sym = 0.5 * (S[i * n + j] + S[j * n + i]);
+            S[i * n + j] = sym;
+            S[j * n + i] = sym;
         }
     }
 
-    // 3) Symmetric eigendecomposition: S = U * Λ * U^T
-    //    dsyevd (divide & conquer) for speed/stability
-    //    Row-major + upper-triangular ('U') convention
-    for (int i=0;i<n;++i){
-        for (int j=i+1;j<n;++j){
-            double sym = 0.5 * (S[i*n + j] + S[j*n + i]);
-            S[i*n + j] = sym;
-            S[j*n + i] = sym;
-        }
-    }
     std::vector<double> lambdas(n);
-    // int info = LAPACKE_dsyevd(LAPACK_ROW_MAJOR, 'V', 'U', n, S.data(), n, lambdas.data());
-
     std::vector<double> A(n * n);
     for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            // row-major S(i,j) -> column-major A(i,j)
-            A[j * n + i] = S[i * n + j];
-        }
+        for (int j = 0; j < n; ++j) A[j * n + i] = S[i * n + j];
     }
 
-    char jobz  = 'V';  // compute eigenvalues + eigenvectors
-    char uplo  = 'U';  // upper triangle (aligned with original LAPACKE call)
-    int  N     = n;
-    int  lda   = n;
-    int  info  = 0;
-
-    // workspace query
-    int    lwork  = -1;
-    int    liwork = -1;
-    double work_query;
-    int    iwork_query;
+    char jobz = 'V';
+    char uplo = 'U';
+    int N = n;
+    int lda = n;
+    int info = 0;
+    int lwork = -1;
+    int liwork = -1;
+    double work_query = 0.0;
+    int iwork_query = 0;
 
     dsyevd_(&jobz, &uplo, &N,
-        A.data(), &lda,
-        lambdas.data(),
-        &work_query, &lwork,
-        &iwork_query, &liwork,
-        &info);
-    lwork  = static_cast<int>(work_query);   // assign, do not redeclare
-    liwork = iwork_query;      
+            A.data(), &lda,
+            lambdas.data(),
+            &work_query, &lwork,
+            &iwork_query, &liwork,
+            &info);
+    if (info != 0) throw std::runtime_error("dsyevd workspace query failed");
+
+    lwork = static_cast<int>(work_query);
+    liwork = iwork_query;
     std::vector<double> work(lwork);
-    std::vector<int>    iwork(liwork);
+    std::vector<int> iwork(liwork);
 
     dsyevd_(&jobz, &uplo, &N,
-        A.data(), &lda,
-        lambdas.data(),
-        work.data(), &lwork,
-        iwork.data(), &liwork,
-        &info);
+            A.data(), &lda,
+            lambdas.data(),
+            work.data(), &lwork,
+            iwork.data(), &liwork,
+            &info);
     if (info != 0) throw std::runtime_error("dsyevd failed, info=" + std::to_string(info));
-    // Now A holds U (row-major; column j is eigenvector j)
-    std::vector<double> U(n*n);
-    for (int i=0;i<n;++i)
-        for (int j=0;j<n;++j)
-            U[i*n + j] = A[j*n + i];   // U(i,j) = S^T(i,j)
-    // 4) Build V = D^{-1} U, Vinv = U^T D
+
+    std::vector<double> U(n * n);
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            U[i * n + j] = A[j * n + i];
+
     EigResult out;
-    out.lambdas = std::move(lambdas);
+    out.lambdas = lambdas;
     out.V.resize(n * n);
     out.Vinv.resize(n * n);
-    out.U = U;  // Keep U so pmatrix_direct can reuse it
+    out.U = U;
 
-    // V[i,j] = U[i,j] / sqrt(pi[i])
     for (int i = 0; i < n; ++i) {
         const double invsqrt = 1.0 / sqrtpi[i];
-        for (int j = 0; j < n; ++j) {
-            out.V[i*n + j] = U[i*n + j] * invsqrt;
-        }
+        for (int j = 0; j < n; ++j) out.V[i * n + j] = U[i * n + j] * invsqrt;
     }
-    // Vinv[i,j] = U^T D = U(j,i) * sqrt(pi[j])
     for (int i = 0; i < n; ++i) {
         const double sp = sqrtpi[i];
-        for (int j = 0; j < n; ++j) {
-            out.Vinv[j*n + i] = U[i*n + j] * sp; // equals Vinv[j,i] = U(i,j)*sqrtpi[i]
-        }
+        for (int j = 0; j < n; ++j) out.Vinv[j * n + i] = U[i * n + j] * sp;
     }
 
-    // 5) Optional numerical fix: clamp tiny positives to 0 to avoid surprises in exp
-    //    Rate matrix eigenvalues should be ≤ 0 with a single 0 (steady state)
-    for (int j = 0; j < n; ++j) {
-        if (out.lambdas[j] > -1e-15 && out.lambdas[j] < 1e-15) {
-            out.lambdas[j] = 0.0;
-        }
+    for (double& lambda : out.lambdas) {
+        if (lambda > -1e-15 && lambda < 1e-15) lambda = 0.0;
     }
 
     return out;
+}
+
+EigResult gtr_eigendecomp_libpll(const double* Q_rowmajor, const double* pi, int n) {
+    // Keep the benchmark path working in both float and double builds even when
+    // libpll eigen helpers are unavailable or differ by scalar ABI.
+    return gtr_eigendecomp_cpu(Q_rowmajor, pi, n);
 }

@@ -61,7 +61,7 @@ void compute_combined_loglik_per_op_device(
     const fp_t* d_pendant_pmats, // [num_ops * rate_cats * states * states]
     const fp_t* d_distal_pmats,  // [N * rate_cats * states * states]
     const fp_t* d_proximal_pmats,// [N * rate_cats * states * states]
-    fp_t* d_out,                   // [num_ops]
+    fp_t* d_out,                  // [num_ops]
     cudaStream_t stream = 0);
 
 } // namespace root_likelihood

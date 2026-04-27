@@ -12,14 +12,71 @@
 #include <string>
 #include <stdexcept>
 #include <cstddef>
+#include <vector>
 #include "tree_generation/tree.hpp"
 
 // Branch length defaults to match epa-ng constants.
 constexpr double DEFAULT_BRANCH_LENGTH = 0.10536051565782628; // -log(0.9)
-constexpr double OPT_BRANCH_LEN_MIN = 1.0e-4; // PLLMOD_OPT_MIN_BRANCH_LEN
+// Match the EPA-ng / PLLMOD branch-length floor for placement optimization.
+constexpr double OPT_BRANCH_LEN_MIN = 1.0e-4;
 constexpr double OPT_BRANCH_LEN_MAX = 100.0;  // PLLMOD_OPT_MAX_BRANCH_LEN
 constexpr double OPT_BRANCH_EPSILON = 1.0e-1;
 constexpr double OPT_BRANCH_XTOL = OPT_BRANCH_LEN_MIN / 10.0;
+
+template <typename T>
+__host__ __device__ inline T scalar_min(T lhs, T rhs) {
+    return lhs < rhs ? lhs : rhs;
+}
+
+template <typename T>
+__host__ __device__ inline T scalar_max(T lhs, T rhs) {
+    return lhs > rhs ? lhs : rhs;
+}
+
+template <typename T>
+__host__ __device__ inline T clamp_scalar(T value, T lower, T upper) {
+    if (upper < lower) upper = lower;
+    if (value < lower) return lower;
+    if (value > upper) return upper;
+    return value;
+}
+
+__host__ __device__ inline double effective_split_branch_min(
+    double total_branch_length,
+    double min_branch_length = OPT_BRANCH_LEN_MIN)
+{
+    if (total_branch_length <= 0.0) return min_branch_length;
+    return scalar_min(min_branch_length, 0.5 * total_branch_length);
+}
+
+__host__ __device__ inline void normalize_split_branch_lengths(
+    double total_branch_length,
+    double proposed_proximal_length,
+    double min_branch_length,
+    double& proximal_length_out,
+    double& distal_length_out)
+{
+    if (total_branch_length <= 0.0) {
+        proximal_length_out = min_branch_length;
+        distal_length_out = min_branch_length;
+        return;
+    }
+
+    const double lower_bound = effective_split_branch_min(total_branch_length, min_branch_length);
+    const double upper_bound = scalar_max(lower_bound, total_branch_length - lower_bound);
+    proximal_length_out = clamp_scalar(proposed_proximal_length, lower_bound, upper_bound);
+    distal_length_out = total_branch_length - proximal_length_out;
+}
+
+__host__ __device__ inline double sanitize_branch_length(
+    double branch_length,
+    double min_branch_length = OPT_BRANCH_LEN_MIN,
+    double max_branch_length = OPT_BRANCH_LEN_MAX,
+    double default_branch_length = DEFAULT_BRANCH_LENGTH)
+{
+    if (!(branch_length > 0.0)) branch_length = default_branch_length;
+    return clamp_scalar(branch_length, min_branch_length, max_branch_length);
+}
 
 // Basic tags describing the operation type and CLV buffer selection.
 enum NodeOpType : int {
@@ -99,10 +156,10 @@ inline unsigned int ceil_log2_u32(unsigned int x) {
 
 // RAII wrapper for device buffers allocated with cudaMalloc.
 struct DeviceBuffer {
-    double* ptr{nullptr};
+    fp_t* ptr{nullptr};
 
     DeviceBuffer() = default;
-    explicit DeviceBuffer(std::size_t count) { CHECK_CUDA(cudaMalloc(&ptr, sizeof(double) * count)); }
+    explicit DeviceBuffer(std::size_t count) { CHECK_CUDA(cudaMalloc(&ptr, sizeof(fp_t) * count)); }
     ~DeviceBuffer() { if (ptr) cudaFree(ptr); }
 
     DeviceBuffer(const DeviceBuffer&) = delete;
@@ -117,7 +174,7 @@ struct DeviceBuffer {
         return *this;
     }
 
-    double* get() const { return ptr; }
+    fp_t* get() const { return ptr; }
 };
 
 // Bounds check helper for states / rate categories.
@@ -127,13 +184,17 @@ inline void validate_states_rate(int states, int rate_cats, int max_states, int 
     if (rate_cats > max_rate_cats) throw std::runtime_error("rate_cats exceeds MAX_RATECATS.");
 }
 
-struct JplacePlacementRecord {
-    std::string query_name;
+struct JplacePlacementRow {
     int edge_num = -1;
     double likelihood = 0.0;
     double like_weight_ratio = 1.0;
     double distal_length = 0.0;
     double pendant_length = 0.0;
+};
+
+struct JplacePlacementRecord {
+    std::string query_name;
+    std::vector<JplacePlacementRow> rows;
 };
 
 inline std::string json_escape_string(const std::string& input) {
@@ -244,12 +305,21 @@ inline void write_jplace(
     for (size_t i = 0; i < placements.size(); ++i) {
         const JplacePlacementRecord& rec = placements[i];
         out << "    {\n";
-        out << "      \"p\": [["
-            << rec.edge_num << ", "
-            << std::setprecision(17) << rec.likelihood << ", "
-            << std::setprecision(17) << rec.like_weight_ratio << ", "
-            << std::setprecision(17) << rec.distal_length << ", "
-            << std::setprecision(17) << rec.pendant_length << "]],\n";
+        out << "      \"p\": [";
+        for (size_t row_idx = 0; row_idx < rec.rows.size(); ++row_idx) {
+            const JplacePlacementRow& row = rec.rows[row_idx];
+            if (row_idx == 0) {
+                out << "[";
+            } else {
+                out << ", [";
+            }
+            out << row.edge_num << ", "
+                << std::setprecision(17) << row.likelihood << ", "
+                << std::setprecision(17) << row.like_weight_ratio << ", "
+                << std::setprecision(17) << row.distal_length << ", "
+                << std::setprecision(17) << row.pendant_length << "]";
+        }
+        out << "],\n";
         out << "      \"n\": [\"" << json_escape_string(rec.query_name) << "\"]\n";
         out << "    }";
         if (i + 1 < placements.size()) out << ",";

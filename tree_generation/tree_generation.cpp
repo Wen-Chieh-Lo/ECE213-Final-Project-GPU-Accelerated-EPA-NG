@@ -1,12 +1,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <type_traits>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <unistd.h>
 
 #include "../mlipper_util.h"
 #include "tree.hpp"
@@ -19,6 +24,96 @@ static void throw_if(bool cond, const char* msg) {
     if (cond) throw std::runtime_error(msg);
 }
 
+static bool env_flag_enabled(const char* name) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return false;
+    return std::string(v) != "0";
+}
+
+static void dump_tree_topology_once(const TreeBuildResult& tree) {
+    if (!env_flag_enabled("MLIPPER_DEBUG_TREE_TOPOLOGY")) return;
+    static bool dumped = false;
+    if (dumped) return;
+    dumped = true;
+
+    std::fprintf(stderr,
+                 "[MLIPPER-TREE] root=%d nodes=%zu\n",
+                 tree.root_id,
+                 tree.nodes.size());
+    for (const TreeNode& node : tree.nodes) {
+        std::fprintf(stderr,
+                     "[MLIPPER-TREE] node=%d parent=%d left=%d right=%d is_tip=%d blen=%.12e name=%s\n",
+                     node.id,
+                     node.parent,
+                     node.left,
+                     node.right,
+                     node.is_tip ? 1 : 0,
+                     static_cast<double>(node.branch_length_to_parent),
+                     node.name.empty() ? "<inner>" : node.name.c_str());
+    }
+}
+
+static void dump_vector_line(const char* tag, const char* name,
+                             const std::vector<double>& values, int count) {
+    std::fprintf(stderr, "[%s] %s=(", tag, name);
+    for (int idx = 0; idx < count; ++idx) {
+        std::fprintf(stderr, "%s%.15e", idx ? "," : "", values[idx]);
+    }
+    std::fprintf(stderr, ")\n");
+}
+
+static void dump_matrix_rows(const char* tag, const char* name,
+                             const std::vector<double>& values, int states) {
+    for (int row = 0; row < states; ++row) {
+        std::fprintf(stderr, "[%s] %s_row%d=(", tag, name, row);
+        for (int col = 0; col < states; ++col) {
+            const double value = values[(size_t)row * (size_t)states + (size_t)col];
+            std::fprintf(stderr, "%s%.15e", col ? "," : "", value);
+        }
+        std::fprintf(stderr, ")\n");
+    }
+}
+
+static std::string preview_names(std::vector<std::string> names, size_t limit = 5) {
+    std::sort(names.begin(), names.end());
+    std::ostringstream oss;
+    const size_t count = std::min(limit, names.size());
+    for (size_t idx = 0; idx < count; ++idx) {
+        if (idx) oss << ", ";
+        oss << names[idx];
+    }
+    if (names.size() > limit) {
+        oss << " ... (" << names.size() << " total)";
+    }
+    return oss.str();
+}
+
+static void dump_eigendecomp_once(const std::vector<double>& q_rowmajor,
+                                  const std::vector<double>& pi,
+                                  const EigResult& eigen,
+                                  int states) {
+    if (!env_flag_enabled("MLIPPER_DEBUG_EIGEN")) return;
+    static bool dumped = false;
+    if (dumped) return;
+    dumped = true;
+
+    std::fprintf(stderr, "[MLIPPER-EIGEN] states=%d\n", states);
+    dump_vector_line("MLIPPER-EIGEN", "pi", pi, states);
+    dump_vector_line("MLIPPER-EIGEN", "evals", eigen.lambdas, states);
+    dump_matrix_rows("MLIPPER-EIGEN", "Q", q_rowmajor, states);
+    dump_matrix_rows("MLIPPER-EIGEN", "V", eigen.V, states);
+    dump_matrix_rows("MLIPPER-EIGEN", "Vinv", eigen.Vinv, states);
+}
+
+template <typename>
+struct pll_gamma_cats_traits;
+
+template <typename Ret, typename Alpha, typename Count, typename OutputPtr, typename Mode>
+struct pll_gamma_cats_traits<Ret (*)(Alpha, Count, OutputPtr, Mode)> {
+    using alpha_type = Alpha;
+    using output_type = std::remove_pointer_t<OutputPtr>;
+};
+
 std::vector<double> build_mixture_weights(const parse::ModelConfig& model, int rate_cats) {
     std::vector<double> weights;
     if (rate_cats <= 0) return weights;
@@ -29,10 +124,14 @@ std::vector<double> build_mixture_weights(const parse::ModelConfig& model, int r
     }
 
     double sum = 0.0;
-    for (double value : weights) sum += value;
-    if (sum <= 0.0) {
-        weights.assign(rate_cats, 1.0 / rate_cats);
-        return weights;
+    for (double value : weights) {
+        if (!std::isfinite(value) || value <= 0.0) {
+            throw std::runtime_error("Rate weights must be finite and > 0.");
+        }
+        sum += value;
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) {
+        throw std::runtime_error("Rate weights must sum to a positive finite value.");
     }
     for (double& value : weights) value /= sum;
     return weights;
@@ -42,10 +141,14 @@ std::vector<double> build_gamma_rate_categories(double alpha, int rate_cats) {
     std::vector<double> rates(rate_cats, 1.0);
     if (rate_cats <= 1 || alpha <= 0.0) return rates;
 
-    std::vector<double> gamma_tmp(rate_cats);
+    using gamma_traits = pll_gamma_cats_traits<decltype(&pll_compute_gamma_cats)>;
+    using gamma_alpha_t = typename gamma_traits::alpha_type;
+    using gamma_output_t = typename gamma_traits::output_type;
+
+    std::vector<gamma_output_t> gamma_tmp(rate_cats);
     const int status = pll_compute_gamma_cats(
-        alpha,
-        rate_cats,
+        static_cast<gamma_alpha_t>(alpha),
+        static_cast<unsigned int>(rate_cats),
         gamma_tmp.data(),
         PLL_GAMMA_RATES_MEAN);
     if (status != PLL_SUCCESS) {
@@ -63,10 +166,17 @@ std::vector<double> build_gtr_q_matrix(
     const parse::ModelConfig& model,
     const std::vector<double>& pi)
 {
-    std::vector<double> q_matrix(states * states, 0.0);
-    if (states != 4 || model.rates.size() < 6 || pi.size() != 4) {
-        return q_matrix;
+    if (states != 4) {
+        throw std::runtime_error("build_gtr_q_matrix currently supports only 4-state DNA.");
     }
+    if (model.rates.size() != 6) {
+        throw std::runtime_error("build_gtr_q_matrix requires exactly 6 GTR rates.");
+    }
+    if (pi.size() != 4) {
+        throw std::runtime_error("build_gtr_q_matrix requires exactly 4 equilibrium frequencies.");
+    }
+
+    std::vector<double> q_matrix(states * states, 0.0);
 
     auto set_pair = [&](int row, int col, double rate) {
         q_matrix[row * states + col] = rate * pi[col];
@@ -117,7 +227,7 @@ static PlacementQueryBatch make_query_batch(
     }
     const size_t qcount = batch.count;
     batch.branch_lengths.assign(qcount, fp_t(0.5));
-    batch.query_chars.resize(qcount * sites, 4);
+    batch.query_chars.resize(qcount * sites, states == 4 ? 15 : 4);
     for (size_t qi = 0; qi < qcount; ++qi) {
         const auto& q = placement_queries[qi];
         if (q.pendant > fp_t(0)) batch.branch_lengths[qi] = q.pendant;
@@ -125,7 +235,8 @@ static PlacementQueryBatch make_query_batch(
             throw std::runtime_error("Query sequence length mismatch.");
         }
         for (size_t s = 0; s < sites; ++s) {
-            batch.query_chars[qi * sites + s] = encode_state_DNA5(q.msa[s]);
+            batch.query_chars[qi * sites + s] =
+                (states == 4) ? encode_state_DNA4_mask(q.msa[s]) : encode_state_DNA5(q.msa[s]);
         }
     }
     return batch;
@@ -144,13 +255,24 @@ TreeBuildResult build_tree_from_newick_with_pll(
 {
     TreeBuildResult out;
     // 1) Parse Newick with libpll (rooted tree)
-    const char* filename = "./tree.nwk";
+    std::filesystem::path tree_path_template =
+        std::filesystem::temp_directory_path() / "mlipper-tree-XXXXXX.nwk";
+    std::string tree_path_string = tree_path_template.string();
+    std::vector<char> tree_path_buffer(
+        tree_path_string.begin(),
+        tree_path_string.end());
+    tree_path_buffer.push_back('\0');
+    const int tree_fd = mkstemps(tree_path_buffer.data(), 4);
+    throw_if(tree_fd < 0, "mkstemps failed for temporary Newick path.");
+    close(tree_fd);
     {
-        std::ofstream ofs(filename);
+        std::ofstream ofs(tree_path_buffer.data(), std::ios::trunc);
+        throw_if(!ofs, "Failed to open temporary Newick path for writing.");
         ofs << newick_text;
     }
 
-    pll_rtree_t* rtree = pll_rtree_parse_newick(filename);
+    pll_rtree_t* rtree = pll_rtree_parse_newick(tree_path_buffer.data());
+    std::remove(tree_path_buffer.data());
 
     throw_if(!rtree, "pll_rtree_parse_newick failed (check Newick syntax).");
 
@@ -165,7 +287,10 @@ TreeBuildResult build_tree_from_newick_with_pll(
     std::unordered_map<std::string,int> msa_idx;
     msa_idx.reserve(msa_tip_names.size()*2);
     for (int i = 0; i < (int)msa_tip_names.size(); ++i) {
-        msa_idx[msa_tip_names[i]] = i;
+        const auto [_, inserted] = msa_idx.emplace(msa_tip_names[i], i);
+        if (!inserted) {
+            throw std::runtime_error("Duplicate alignment taxon name: " + msa_tip_names[i]);
+        }
     }
 
     // 4) Build node_id mapping: libpll rooted trees usually have tips first, inners later; take order from traversal
@@ -231,16 +356,35 @@ TreeBuildResult build_tree_from_newick_with_pll(
 
     // 6) Align MSA names: build tip name -> node id; also ensure every tip exists in the MSA
     out.tip_node_by_name.reserve(num_tips*2);
-    unsigned int found_tips = 0;
+    std::vector<std::string> missing_tree_tips;
     for (const TreeNode& tn : out.nodes) {
         if (!tn.is_tip) continue;
         if (tn.name.empty()) {
             throw std::runtime_error("Encountered a tip with empty name.");
         }
-        out.tip_node_by_name[tn.name] = tn.id;
-        if (msa_idx.find(tn.name) != msa_idx.end()) ++found_tips;
+        const auto [_, inserted] = out.tip_node_by_name.emplace(tn.name, tn.id);
+        if (!inserted) {
+            throw std::runtime_error("Duplicate tip name in Newick tree: " + tn.name);
+        }
+        if (msa_idx.find(tn.name) == msa_idx.end()) {
+            missing_tree_tips.push_back(tn.name);
+        }
     }
-    throw_if(found_tips != num_tips, "Some tips in Newick not found in MSA names.");
+    if (!missing_tree_tips.empty()) {
+        throw std::runtime_error(
+            "Newick tips not found in alignment: " + preview_names(missing_tree_tips));
+    }
+
+    std::vector<std::string> missing_alignment_tips;
+    for (const auto& entry : msa_idx) {
+        if (out.tip_node_by_name.find(entry.first) == out.tip_node_by_name.end()) {
+            missing_alignment_tips.push_back(entry.first);
+        }
+    }
+    if (!missing_alignment_tips.empty()) {
+        throw std::runtime_error(
+            "Alignment taxa not found in Newick tree: " + preview_names(missing_alignment_tips));
+    }
 
     // 7) Produce postorder over the whole tree (as ids): children before parent
     out.postorder.resize(num_nodes);
@@ -278,18 +422,18 @@ TreeBuildResult build_tree_from_newick_with_pll(
     return out;
 }
 
-// End-to-end pipeline: build tree, pack host arrays, compute matrices, upload to GPU.
-BuildToGpuResult BuildAllToGPU(
+static BuildToGpuResult BuildAllToGPUFromTree(
     const std::vector<std::string>& msa_tip_names,
     const std::vector<std::string>& msa_rows,
-    const std::string& newick_text,
-    const std::vector<double>& Q_rowmajor,   // size = states*states
-    const std::vector<double>& pi,           // size = states
-    const std::vector<double>& rate_multipliers,   // size = rate_cats
-    const std::vector<double>& rate_weights, // size = rate_cats
+    TreeBuildResult T,
+    const std::vector<double>& Q_rowmajor,
+    const std::vector<double>& pi,
+    const std::vector<double>& rate_multipliers,
+    const std::vector<double>& rate_weights,
     const std::vector<unsigned>& pattern_weights,
     size_t sites, int states, int rate_cats, bool per_rate_scaling,
-    const std::vector<NewPlacementQuery>& placement_queries)
+    const std::vector<NewPlacementQuery>& placement_queries,
+    bool commit_to_tree)
 {
     throw_if(states > 64, "states exceeds MAX_STATES (64).");
     throw_if(rate_cats > 8, "rate_cats exceeds MAX_RATECATS (8).");
@@ -298,11 +442,8 @@ BuildToGpuResult BuildAllToGPU(
     if (pi.size() != (size_t)states)
         throw std::runtime_error("pi size mismatch.");
 
-    // 1) Newick → TreeBuildResult (postorder, topology, offsets)
-    TreeBuildResult T = build_tree_from_newick_with_pll(
-        msa_tip_names, newick_text, sites, states, rate_cats, per_rate_scaling);
+    dump_tree_topology_once(T);
 
-    // 2) Align MSA → HostPacking (topology arrays, tipchars, offsets, scaler)
     HostPacking H = pack_host_arrays_from_tree_and_msa(
         T, msa_tip_names, msa_rows, sites, states);
     if (!pattern_weights.empty() && pattern_weights.size() != sites) {
@@ -310,12 +451,13 @@ BuildToGpuResult BuildAllToGPU(
     }
     H.pattern_weights = pattern_weights;
 
-    // 3) Host-side GTR decomposition (V/Vinv/λ)
-    EigResult Eigen = gtr_eigendecomp_cpu(Q_rowmajor.data(), pi.data(), states);
+    EigResult Eigen = env_flag_enabled("MLIPPER_USE_LIBPLL_EIGEN")
+        ? gtr_eigendecomp_libpll(Q_rowmajor.data(), pi.data(), states)
+        : gtr_eigendecomp_cpu(Q_rowmajor.data(), pi.data(), states);
+    dump_eigendecomp_once(Q_rowmajor, pi, Eigen, states);
 
     fill_pmats_in_host_packing(T, H, Eigen, rate_multipliers, states, rate_cats);
 
-    // Placement queries staged separately from HostPacking.
     PlacementQueryBatch Q = make_query_batch(
         placement_queries,
         sites,
@@ -324,7 +466,6 @@ BuildToGpuResult BuildAllToGPU(
         Eigen,
         rate_multipliers);
 
-    // 4) Upload everything to GPU (including model constants)
     DeviceTree D = upload_to_gpu(
         T,
         H,
@@ -336,9 +477,73 @@ BuildToGpuResult BuildAllToGPU(
         states,
         rate_cats,
         per_rate_scaling,
-        Q.empty() ? nullptr : &Q);
+        Q.empty() ? nullptr : &Q,
+        commit_to_tree);
 
     return BuildToGpuResult{ std::move(D), std::move(T), std::move(H), std::move(Eigen), std::move(Q) };
+}
+
+// End-to-end pipeline: build tree, pack host arrays, compute matrices, upload to GPU.
+BuildToGpuResult BuildAllToGPU(
+    const std::vector<std::string>& msa_tip_names,
+    const std::vector<std::string>& msa_rows,
+    const std::string& newick_text,
+    const std::vector<double>& Q_rowmajor,   // size = states*states
+    const std::vector<double>& pi,           // size = states
+    const std::vector<double>& rate_multipliers,   // size = rate_cats
+    const std::vector<double>& rate_weights, // size = rate_cats
+    const std::vector<unsigned>& pattern_weights,
+    size_t sites, int states, int rate_cats, bool per_rate_scaling,
+    const std::vector<NewPlacementQuery>& placement_queries,
+    bool commit_to_tree)
+{
+    TreeBuildResult T = build_tree_from_newick_with_pll(
+        msa_tip_names, newick_text, sites, states, rate_cats, per_rate_scaling);
+    return BuildAllToGPUFromTree(
+        msa_tip_names,
+        msa_rows,
+        std::move(T),
+        Q_rowmajor,
+        pi,
+        rate_multipliers,
+        rate_weights,
+        pattern_weights,
+        sites,
+        states,
+        rate_cats,
+        per_rate_scaling,
+        placement_queries,
+        commit_to_tree);
+}
+
+BuildToGpuResult BuildAllToGPU(
+    const std::vector<std::string>& msa_tip_names,
+    const std::vector<std::string>& msa_rows,
+    const TreeBuildResult& tree,
+    const std::vector<double>& Q_rowmajor,
+    const std::vector<double>& pi,
+    const std::vector<double>& rate_multipliers,
+    const std::vector<double>& rate_weights,
+    const std::vector<unsigned>& pattern_weights,
+    size_t sites, int states, int rate_cats, bool per_rate_scaling,
+    const std::vector<NewPlacementQuery>& placement_queries,
+    bool commit_to_tree)
+{
+    return BuildAllToGPUFromTree(
+        msa_tip_names,
+        msa_rows,
+        tree,
+        Q_rowmajor,
+        pi,
+        rate_multipliers,
+        rate_weights,
+        pattern_weights,
+        sites,
+        states,
+        rate_cats,
+        per_rate_scaling,
+        placement_queries,
+        commit_to_tree);
 }
 
 std::vector<NewPlacementQuery> build_placement_query(const std::string& alignment_path)

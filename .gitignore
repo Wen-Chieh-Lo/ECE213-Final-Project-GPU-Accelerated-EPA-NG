@@ -1,21 +1,38 @@
-build/*
-bin/*
+# Native build outputs and local binaries
+/build/
+/build_*/
+/bin/
+/MLIPPER
+/MLIPPER_*
 *.o
 *.d
+
+# Profiling traces
 *.nsys-rep
 *.sqlite
 *.ncu-rep
 *.ncu.log
 *.details.txt
 
-# Generated logs, data, and outputs
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local scratch and tool state
+/.codex
+/.codex/
+/.tmp_truth_rank_probe/
+/tmp/
+/output/
+
+# Generated logs and one-off root-level artifacts
 *.log
-*.nwk
-*.tre
-*.aln
-*.fa
-build/
-data/*
-MLIPPER
-output/
-!data/neotrop_runtime_dataset.tar.gz
+/*.fa
+/*.fasta
+/*.aln
+/*.tre
+/*.nwk
+/*.jplace
+
+# Local datasets stay out of git by default.
+/data/*

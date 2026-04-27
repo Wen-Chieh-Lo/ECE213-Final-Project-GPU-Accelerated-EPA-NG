@@ -7,7 +7,11 @@
 #include <stdexcept>
 #include <cstddef>
 #include <cstdint>
+#ifdef MLIPPER_USE_VENDOR_PLL
+#include "pll.h"
+#else
 #include <libpll/pll.h>
+#endif
 
 #include "../pmatrix/pmat.h"
 #include "precision.hpp"
@@ -15,9 +19,41 @@
 struct PlacementResult;
 struct NodeOpInfo;
 
+struct CommitTimingStats {
+    double initial_upward_host_ms = 0.0;
+    double initial_downward_host_ms = 0.0;
+    double initial_upward_stage_ms = 0.0;
+    double initial_downward_stage_ms = 0.0;
+
+    double query_reset_stage_ms = 0.0;
+    double query_build_clv_stage_ms = 0.0;
+    double query_kernel_total_ms = 0.0;
+
+    double insertion_pre_clv_ms = 0.0;
+    double insertion_upward_host_ms = 0.0;
+    double insertion_downward_host_ms = 0.0;
+    double insertion_upward_stage_ms = 0.0;
+    double insertion_downward_stage_ms = 0.0;
+
+    long long initial_upward_ops = 0;
+    long long initial_downward_ops = 0;
+    long long insertion_upward_ops = 0;
+    long long insertion_downward_ops = 0;
+
+    int initial_updates = 0;
+    int query_evals = 0;
+    int insertion_updates = 0;
+};
+
 struct PlacementOpBuffer {
     NodeOpInfo* d_ops = nullptr;
     int num_ops = 0;
+    int capacity = 0;
+    std::vector<int> node_to_tip;
+    std::vector<NodeOpInfo> upward_ops_host;
+    std::vector<NodeOpInfo> downward_ops_host;
+    bool profile_commit_timing = false;
+    CommitTimingStats timing;
 };
 
 namespace parse {
@@ -43,6 +79,30 @@ inline uint8_t encode_state_DNA5(char c) {
         case 'U': case 'u': return 3;
         case '-':           return 4; // gap
         default:            return 4; // Treat as gap for now; switch to bitmask if you need IUPAC
+    }
+}
+
+inline uint8_t encode_state_DNA4_mask(char c) {
+    switch (c) {
+        case 'A': case 'a': return 1u << 0;
+        case 'C': case 'c': return 1u << 1;
+        case 'G': case 'g': return 1u << 2;
+        case 'T': case 't':
+        case 'U': case 'u': return 1u << 3;
+        case 'R': case 'r': return (1u << 0) | (1u << 2); // A/G
+        case 'Y': case 'y': return (1u << 1) | (1u << 3); // C/T
+        case 'S': case 's': return (1u << 1) | (1u << 2); // C/G
+        case 'W': case 'w': return (1u << 0) | (1u << 3); // A/T
+        case 'K': case 'k': return (1u << 2) | (1u << 3); // G/T
+        case 'M': case 'm': return (1u << 0) | (1u << 1); // A/C
+        case 'B': case 'b': return (1u << 1) | (1u << 2) | (1u << 3); // C/G/T
+        case 'D': case 'd': return (1u << 0) | (1u << 2) | (1u << 3); // A/G/T
+        case 'H': case 'h': return (1u << 0) | (1u << 1) | (1u << 3); // A/C/T
+        case 'V': case 'v': return (1u << 0) | (1u << 1) | (1u << 2); // A/C/G
+        case 'N': case 'n':
+        case '-':
+        case '.':
+        default:            return (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3); // unknown/gap
     }
 }
 
@@ -125,7 +185,7 @@ struct DeviceTree {
     fp_t   *d_prev_pendant_length = nullptr; // [N]
     fp_t   *d_prev_proximal_length = nullptr; // [N] previous proximal branch lengths (smoothing rollback)
 
-    uint8_t *d_tipchars = nullptr; // [tips * sites], DNA5: 0..4
+    uint8_t *d_tipchars = nullptr; // [tips * sites], DNA4 bitmask when states==4 else DNA5 code
 
     fp_t    *d_clv_up = nullptr;
     fp_t    *d_clv_down = nullptr;
@@ -141,6 +201,9 @@ struct DeviceTree {
     unsigned *d_pattern_weights_u = nullptr;
     fp_t     *d_pattern_weights = nullptr;
 
+    // Root-likelihood compatibility view. Do not alias this to one of the
+    // branch-local scaler pools globally; set it explicitly only for the
+    // root-specific path that still expects a flat site-scaler pointer.
     unsigned *d_site_scaler = nullptr;
     unsigned *d_site_scaler_storage = nullptr;
     unsigned *d_site_scaler_up = nullptr;
@@ -152,9 +215,9 @@ struct DeviceTree {
     fp_t* d_pmat_mid = nullptr;             // half-branch pmats for midpoint calculations
     fp_t* d_pmat_mid_prox = nullptr;        // proximal branch pmats for midpoint calculations
     fp_t* d_pmat_mid_dist = nullptr;        // distal branch pmats for midpoint calculations
-    unsigned int* d_tipmap = nullptr;
+    unsigned int* d_tipmap = nullptr;       // decode table for tip/query chars -> state bitmask
 
-    uint8_t* d_query_chars = nullptr; // [num_queries * sites]
+    uint8_t* d_query_chars = nullptr; // [num_queries * sites], same encoding contract as d_tipchars
     fp_t   *d_query_clv = nullptr;    // [sites * rate_cats * states]
     fp_t   *d_query_pmat = nullptr;
 
@@ -171,7 +234,7 @@ struct DeviceTree {
         return (size_t)capacity_N * scaler_elems();
     }
     size_t scaler_storage_elems() const {
-        return scaler_pool_elems() * 3;
+        return scaler_pool_elems() * 4;
     }
     size_t pmat_per_node_elems() const {
         return (size_t)rate_cats * (size_t)states * (size_t)states;
@@ -206,6 +269,26 @@ struct PlacementQueryBatch {
     size_t size() const { return count; }
 };
 
+struct PlacementCommitContext {
+    TreeBuildResult* tree = nullptr;
+    HostPacking* host = nullptr;
+    PlacementQueryBatch* queries = nullptr;
+    PlacementOpBuffer* placement_ops = nullptr;
+    const std::vector<std::string>* query_names = nullptr;
+    std::vector<std::string>* inserted_query_names = nullptr;
+};
+
+struct DeviceTreeReloadTimingStats {
+    double branch_copy_ms = 0.0;
+    double branch_reset_ms = 0.0;
+    double tipchar_copy_ms = 0.0;
+    double clv_reset_ms = 0.0;
+    double root_seed_ms = 0.0;
+    double pmat_copy_ms = 0.0;
+    double query_copy_ms = 0.0;
+    double pattern_copy_ms = 0.0;
+};
+
 // ----- Host packing and upload -----
 HostPacking pack_host_arrays_from_tree_and_msa(
     const TreeBuildResult& T,
@@ -230,6 +313,16 @@ void build_query_clv(
     const DeviceTree& D,
     int query_idx,
     cudaStream_t stream = 0);
+void copy_unscaled_up_clv_to_query_slot(
+    const DeviceTree& src,
+    int src_node_id,
+    DeviceTree& dst,
+    int dst_query_idx,
+    cudaStream_t stream = 0);
+void copy_upward_state(
+    const DeviceTree& src,
+    DeviceTree& dst,
+    cudaStream_t stream = 0);
 
 DeviceTree upload_to_gpu(
     const TreeBuildResult& T,
@@ -239,8 +332,26 @@ DeviceTree upload_to_gpu(
     const std::vector<double>& rate_multipliers,
     const std::vector<double>& pi,
     size_t sites, int states, int rate_cats, bool per_rate_scaling,
-    const PlacementQueryBatch* queries = nullptr
+    const PlacementQueryBatch* queries = nullptr,
+    bool commit_to_tree = false
 );
+void reload_device_tree_live_data(
+    DeviceTree& D,
+    const TreeBuildResult& T,
+    const HostPacking& H,
+    const PlacementQueryBatch* queries = nullptr,
+    cudaStream_t stream = 0,
+    DeviceTreeReloadTimingStats* timing = nullptr);
+void reload_device_tree_live_data_local_spr(
+    DeviceTree& D,
+    const TreeBuildResult& T,
+    const HostPacking& H,
+    const HostPacking& base_H,
+    int current_main_pmat_node,
+    int& previous_main_pmat_node,
+    const PlacementQueryBatch* queries = nullptr,
+    cudaStream_t stream = 0,
+    DeviceTreeReloadTimingStats* timing = nullptr);
 
 struct BuildToGpuResult {
     DeviceTree dev;
@@ -260,7 +371,20 @@ BuildToGpuResult BuildAllToGPU(
     const std::vector<double>& rate_weights, // size = rate_cats
     const std::vector<unsigned>& pattern_weights,
     size_t sites, int states, int rate_cats, bool per_rate_scaling,
-    const std::vector<NewPlacementQuery>& placement_queries);
+    const std::vector<NewPlacementQuery>& placement_queries,
+    bool commit_to_tree = false);
+BuildToGpuResult BuildAllToGPU(
+    const std::vector<std::string>& msa_tip_names,
+    const std::vector<std::string>& msa_rows,
+    const TreeBuildResult& tree,
+    const std::vector<double>& Q_rowmajor,   // size = states*states
+    const std::vector<double>& pi,           // size = states
+    const std::vector<double>& rate_multipliers,   // size = rate_cats
+    const std::vector<double>& rate_weights, // size = rate_cats
+    const std::vector<unsigned>& pattern_weights,
+    size_t sites, int states, int rate_cats, bool per_rate_scaling,
+    const std::vector<NewPlacementQuery>& placement_queries,
+    bool commit_to_tree = false);
 
 // ----- Device lifecycle and evaluation -----
 
@@ -286,6 +410,17 @@ void free_placement_op_buffer(
     PlacementOpBuffer& placement_ops,
     cudaStream_t stream = 0);
 
+void DownloadClvDump(
+    const DeviceTree& D,
+    std::vector<fp_t>& clv_up,
+    std::vector<unsigned>& scaler_up,
+    cudaStream_t stream = 0);
+
+void UploadPlacementOps(
+    PlacementOpBuffer& placement_ops,
+    const std::vector<NodeOpInfo>& host_ops,
+    cudaStream_t stream = 0);
+
 void UpdateTreeClvs(
     DeviceTree& D,
     TreeBuildResult& T,
@@ -293,13 +428,23 @@ void UpdateTreeClvs(
     PlacementOpBuffer& placement_ops,
     cudaStream_t stream = 0);
 
+void UpdateTreeClvsAfterPrune(
+    DeviceTree& D,
+    TreeBuildResult& T,
+    HostPacking& H,
+    PlacementOpBuffer& placement_ops,
+    int upward_start_node,
+    const std::vector<NodeOpInfo>& downward_ops_host,
+    cudaStream_t stream = 0);
+
 void EvaluatePlacementQueries(
     DeviceTree& D,
     const EigResult& er,
     const std::vector<double>& rate_multipliers,
-    const PlacementOpBuffer& placement_ops,
+    PlacementCommitContext& commit_ctx,
     std::vector<struct PlacementResult>* placement_results_out = nullptr,
     int smoothing = 1,
+    bool commit_to_tree = true,
     cudaStream_t stream = 0);
 
 // ----- Placement query input helpers -----

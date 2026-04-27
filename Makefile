@@ -12,6 +12,7 @@ NVCC_ARCH ?= -gencode arch=compute_86,code=sm_86 \
 # Compiler
 # ==========================================
 CXX := g++
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
 # ==========================================
 # Debug toggle
@@ -26,6 +27,11 @@ BUILD_DIR ?= build
 # ==========================================
 PLL_INC_DIR ?= /usr/local/include
 PLL_LIB_DIR ?= /usr/local/lib
+USE_EPA_VENDOR_PLL ?= 1
+EPA_PLL_ROOT ?= $(abspath $(REPO_ROOT)/../../DIPPER_MLIPPER/DIPPER/reference/epa-ng_DBG)
+EPA_PLL_INC_DIR ?= $(EPA_PLL_ROOT)/libs/pll-modules/libs/libpll/src
+EPA_PLL_LIB_DIR ?= $(EPA_PLL_ROOT)/build/libs/pll-modules/libs/libpll/src
+PLL_LINK_FLAGS := -L$(PLL_LIB_DIR) -lpll
 
 # ==========================================
 # System LAPACK / BLAS
@@ -56,6 +62,36 @@ CXXFLAGS := -O3 -std=c++17 -fno-omit-frame-pointer $(INCLUDES)
 NVCCFLAGS := -O3 -std=c++17 -ccbin $(CXX) \
              -Xcompiler -fno-omit-frame-pointer -rdc=true \
              $(INCLUDES) $(CUDA_INC) $(NVCC_ARCH)
+
+ifneq ($(and $(wildcard $(EPA_PLL_INC_DIR)/pll.h),$(wildcard $(EPA_PLL_LIB_DIR)/libpll.a)),)
+HAVE_EPA_VENDOR_PLL := 1
+else
+HAVE_EPA_VENDOR_PLL := 0
+endif
+
+ifeq ($(USE_EPA_VENDOR_PLL),1)
+ifeq ($(HAVE_EPA_VENDOR_PLL),1)
+    INCLUDES := -I. \
+                -Itree_generation \
+                -Ipmatrix \
+                -Ipartial_CUDA \
+                -Icore_CUDA \
+                -I$(CLI11_INC_DIR) \
+                -I$(EPA_PLL_INC_DIR) \
+                -I$(CUDA_HOME)/include \
+                -I$(CONDA_PREFIX)/include
+    CXXFLAGS := -O3 -std=c++17 -fno-omit-frame-pointer $(INCLUDES)
+    NVCCFLAGS := -O3 -std=c++17 -ccbin $(CXX) \
+                 -Xcompiler -fno-omit-frame-pointer -rdc=true \
+                 $(INCLUDES) $(CUDA_INC) $(NVCC_ARCH)
+    CXXFLAGS  += -DMLIPPER_USE_VENDOR_PLL
+    NVCCFLAGS += -DMLIPPER_USE_VENDOR_PLL
+    PLL_LIB_DIR := $(EPA_PLL_LIB_DIR)
+    PLL_LINK_FLAGS := $(EPA_PLL_LIB_DIR)/libpll.a
+else
+    $(warning USE_EPA_VENDOR_PLL=1 but vendor libpll was not found; falling back to system libpll)
+endif
+endif
 
 ifeq ($(DEBUG),1)
     CXXFLAGS  += -g -O0
@@ -108,7 +144,7 @@ FORCE:
 
 $(BUILD_CONFIG): FORCE
 	@mkdir -p $(dir $(BUILD_CONFIG))
-	@printf "DEBUG=%s\nUSE_DOUBLE=%s\nLINEINFO=%s\nCUDA_HOME=%s\n" "$(DEBUG)" "$(USE_DOUBLE)" "$(LINEINFO)" "$(CUDA_HOME)" > $(BUILD_CONFIG).tmp
+	@printf "DEBUG=%s\nUSE_DOUBLE=%s\nLINEINFO=%s\nCUDA_HOME=%s\nUSE_EPA_VENDOR_PLL=%s\nHAVE_EPA_VENDOR_PLL=%s\nPLL_LIB_DIR=%s\nEPA_PLL_ROOT=%s\n" "$(DEBUG)" "$(USE_DOUBLE)" "$(LINEINFO)" "$(CUDA_HOME)" "$(USE_EPA_VENDOR_PLL)" "$(HAVE_EPA_VENDOR_PLL)" "$(PLL_LIB_DIR)" "$(EPA_PLL_ROOT)" > $(BUILD_CONFIG).tmp
 	@cmp -s $(BUILD_CONFIG).tmp $(BUILD_CONFIG) 2>/dev/null || mv $(BUILD_CONFIG).tmp $(BUILD_CONFIG)
 	@rm -f $(BUILD_CONFIG).tmp
 
@@ -126,7 +162,7 @@ $(BUILD_DIR)/%.o: %.cu
 $(TARGET): $(OBJS)
 	@mkdir -p $(dir $@)
 	$(NVCC) -ccbin $(CXX) $(NVCC_ARCH) -o $@ $^ \
-		-L$(PLL_LIB_DIR) -lpll \
+		$(PLL_LINK_FLAGS) \
 		$(CUDA_LIB) -lcudart -lcuda \
 		-ltbb \
 		$(LAPACK_LIBS)

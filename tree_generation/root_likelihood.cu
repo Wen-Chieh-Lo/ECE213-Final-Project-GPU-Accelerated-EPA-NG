@@ -12,6 +12,14 @@ namespace root_likelihood {
 
 constexpr double kLn2 = 0.69314718055994530942;
 
+__device__ __forceinline__ unsigned int threshold_scale_shift(fp_t max_val)
+{
+    const fp_t scale_threshold = fp_ldexp(fp_t(1), SCALE_THRESHOLD_EXPONENT);
+    return (max_val < scale_threshold)
+        ? static_cast<unsigned int>(-SCALE_THRESHOLD_EXPONENT)
+        : 0u;
+}
+
 __device__ __forceinline__ unsigned load_pattern_weight_cached(
     const unsigned* pattern_w,
     unsigned int site_idx)
@@ -121,6 +129,38 @@ __device__ __forceinline__ void compute_root_loglikelihood_states5(
     double loglk = log(site_sum > 1e-300 ? site_sum : 1e-300);
     loglk *= static_cast<double>(load_pattern_weight_cached(pattern_w, site_idx));
     total_likelihood[site_idx] = static_cast<fp_t>(loglk);
+}
+
+template<int RC>
+__device__ __forceinline__ fp4_t build_combined_midpoint_states4(
+    const fp4_t* p_distal,
+    const fp4_t* p_prox,
+    const fp4_t& distal_clv,
+    const fp4_t& prox_clv,
+    unsigned int inherited_shift,
+    unsigned int& total_shift_out)
+{
+    fp4_t midpoint = make_fp4(
+        fp_dot4(p_distal[0], distal_clv) * fp_dot4(p_prox[0], prox_clv),
+        fp_dot4(p_distal[1], distal_clv) * fp_dot4(p_prox[1], prox_clv),
+        fp_dot4(p_distal[2], distal_clv) * fp_dot4(p_prox[2], prox_clv),
+        fp_dot4(p_distal[3], distal_clv) * fp_dot4(p_prox[3], prox_clv));
+
+    fp_t row_max = fp_hmax4(midpoint.x, midpoint.y, midpoint.z, midpoint.w);
+    unsigned int total_shift = inherited_shift;
+    if (row_max > fp_t(0)) {
+        const unsigned int shift = threshold_scale_shift(row_max);
+        if (shift) {
+            total_shift += shift;
+            midpoint.x = fp_ldexp(midpoint.x, shift);
+            midpoint.y = fp_ldexp(midpoint.y, shift);
+            midpoint.z = fp_ldexp(midpoint.z, shift);
+            midpoint.w = fp_ldexp(midpoint.w, shift);
+        }
+    }
+
+    total_shift_out = total_shift;
+    return midpoint;
 }
 
 // Generic device root log-likelihood for any state/rate counts (fallback).
@@ -242,6 +282,8 @@ double compute_root_loglikelihood_total(
         const size_t scaler_span = D.per_rate_scaling
             ? (D.sites * (size_t)D.rate_cats)
             : D.sites;
+        // Root likelihood still uses the legacy flat site-scaler view, but it
+        // should be a root-local slice, not a global alias to the UP pool.
         D_root.d_site_scaler = D.d_site_scaler_up + (size_t)root_id * scaler_span;
     }
 
@@ -291,6 +333,7 @@ double compute_root_loglikelihood_total(
             stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     }
+
     // for(auto i =0; i < 10; i++) {
     //     if (host_lk[i] < 0.0) {
     //         fprintf(stderr, "[root-lk] site %d has negative log-likelihood: %f\n", i, host_lk[i]);
@@ -354,7 +397,6 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
                 combined_scaler_shift_at(D.d_site_scaler_mid_base, D, target_id, site, rc);
             const unsigned int prox_shift =
                 combined_scaler_shift_at(D.d_site_scaler_up, D, target_id, site, rc);
-
             const fp4_t* p_pendant = reinterpret_cast<const fp4_t*>(pendant_pmat + (size_t)rc * 16);
             const fp4_t* p_distal  = reinterpret_cast<const fp4_t*>(distal_pmat  + (size_t)rc * 16);
             const fp4_t* p_prox    = reinterpret_cast<const fp4_t*>(prox_pmat    + (size_t)rc * 16);
@@ -380,11 +422,11 @@ __global__ void CombinedPlacementLoglikPerOpKernelStates4(
             const fp_t v2 = acc_pend2 * acc_dist2 * acc_prox2 * freqs[2];
             const fp_t v3 = acc_pend3 * acc_dist3 * acc_prox3 * freqs[3];
 
-            fp_t val = fp_t(0);
-            if (v0 > fp_t(0)) val += v0;
-            if (v1 > fp_t(0)) val += v1;
-            if (v2 > fp_t(0)) val += v2;
-            if (v3 > fp_t(0)) val += v3;
+            // Match libpll's edge-likelihood accumulation: sum all state
+            // contributions directly, then reconcile per-rate scalers at the
+            // site level. These terms are expected to be non-negative because
+            // they are built from PMAT rows, CLVs, and stationary freqs.
+            const fp_t val = ((v0 + v1) + (v2 + v3));
             const int total_shift = (int)distal_shift + (int)prox_shift;
             rate_vals[rc] = val;
             rate_shifts[rc] = (unsigned int)((total_shift > 0) ? total_shift : 0);
@@ -500,8 +542,8 @@ __global__ void CombinedPlacementLoglikPerOpKernelGeneric(
             }
             fp_t rate_sum = fp_t(0);
             for (int s = 0; s < D.states; ++s) {
-                fp_t val = pend_vec[s] * distal_vec[s] * prox_vec[s] * D.d_frequencies[s];
-                if (val > fp_t(0)) rate_sum += val;
+                const fp_t val = pend_vec[s] * distal_vec[s] * prox_vec[s] * D.d_frequencies[s];
+                rate_sum += val;
             }
             const int total_shift = (int)distal_shift + (int)prox_shift;
             rate_vals[rc] = rate_sum;

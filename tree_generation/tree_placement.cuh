@@ -2,6 +2,8 @@
 #ifndef TREE_GENERATION_TREE_PLACEMENT_CUH
 #define TREE_GENERATION_TREE_PLACEMENT_CUH
 
+#include <limits>
+#include <vector>
 #include <cuda_runtime.h>
 #include "tree.hpp"
 #include "../partial_CUDA/partial_likelihood.cuh"
@@ -23,8 +25,20 @@ void InsertLikelihoodEvaluationKernel(
 struct PlacementResult {
     int target_id = -1;
     double loglikelihood = 0.0;
+    // This stores the jplace distal coordinate for the chosen edge.
     double proximal_length = 0.0;
     double pendant_length = 0.0;
+    double gap_top2 = std::numeric_limits<double>::infinity();
+    double gap_top5 = std::numeric_limits<double>::infinity();
+    struct RankedPlacement {
+        int target_id = -1;
+        double loglikelihood = 0.0;
+        // Same convention as PlacementResult::proximal_length above.
+        double proximal_length = 0.0;
+        double pendant_length = 0.0;
+        double like_weight_ratio = 0.0;
+    };
+    std::vector<RankedPlacement> top_placements;
 };
 
 struct PlacementPruneConfig {

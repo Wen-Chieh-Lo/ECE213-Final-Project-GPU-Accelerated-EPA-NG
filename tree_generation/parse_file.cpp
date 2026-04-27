@@ -7,9 +7,11 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -58,6 +60,9 @@ Alignment read_fasta_alignment(const std::string& path) {
         if (trimmed[0] == '>') {
             push_current();
             current_name = trim_copy(trimmed.substr(1));
+            if (current_name.empty()) {
+                throw std::runtime_error("FASTA sequence name is empty.");
+            }
         } else if (!current_name.empty()) {
             for (char c : trimmed) {
                 if (!std::isspace(static_cast<unsigned char>(c)))
@@ -242,6 +247,59 @@ static void append_newick(const SimpleNode& node, std::string& out) {
     }
 }
 
+static double parse_length_or_zero(const SimpleNode& node) {
+    if (!node.has_length || node.length_str.empty()) return 0.0;
+    try {
+        return std::stod(node.length_str);
+    } catch (...) {
+        return 0.0;
+    }
+}
+
+static std::string format_length(double value) {
+    std::ostringstream oss;
+    oss << std::setprecision(17) << value;
+    return oss.str();
+}
+
+static std::unique_ptr<SimpleNode> prune_tips_recursive(
+    std::unique_ptr<SimpleNode> node,
+    const std::unordered_set<std::string>& tip_names_to_remove)
+{
+    if (!node) return nullptr;
+
+    if (node->children.empty()) {
+        const std::string label = strip_quotes(trim_copy(node->label));
+        if (!label.empty() && tip_names_to_remove.count(label)) {
+            return nullptr;
+        }
+        return node;
+    }
+
+    std::vector<std::unique_ptr<SimpleNode>> kept_children;
+    kept_children.reserve(node->children.size());
+    for (auto& child : node->children) {
+        if (auto kept = prune_tips_recursive(std::move(child), tip_names_to_remove)) {
+            kept_children.push_back(std::move(kept));
+        }
+    }
+    node->children = std::move(kept_children);
+
+    if (node->children.empty()) {
+        return nullptr;
+    }
+
+    if (node->children.size() == 1) {
+        std::unique_ptr<SimpleNode> child = std::move(node->children.front());
+        const double merged_length = parse_length_or_zero(*node) + parse_length_or_zero(*child);
+        child->has_length = true;
+        child->length_str = format_length(merged_length);
+        return child;
+    }
+
+    return node;
+}
+
 std::string normalize_newick(const std::string& raw) {
     try {
         size_t pos = 0;
@@ -261,6 +319,31 @@ std::string normalize_newick(const std::string& raw) {
     }
 }
 
+std::string prune_newick_tips(
+    const std::string& raw,
+    const std::unordered_set<std::string>& tip_names_to_remove)
+{
+    size_t pos = 0;
+    auto root = parse_newick_node(raw, pos);
+    skip_ws(raw, pos);
+    if (pos < raw.size() && raw[pos] == ';') ++pos;
+    skip_ws(raw, pos);
+    if (pos != raw.size()) {
+        throw std::runtime_error("Extra characters after Newick tree.");
+    }
+
+    root = prune_tips_recursive(std::move(root), tip_names_to_remove);
+    if (!root) {
+        throw std::runtime_error("All tips were pruned from the Newick tree.");
+    }
+    resolve_polytomies(root.get());
+
+    std::string pruned;
+    append_newick(*root, pruned);
+    pruned.push_back(';');
+    return pruned;
+}
+
 } // namespace newick
 
 } // namespace detail
@@ -273,6 +356,13 @@ Alignment read_alignment_file(const std::string& path) {
 
 std::string normalize_newick(const std::string& raw) {
     return detail::newick::normalize_newick(raw);
+}
+
+std::string prune_newick_tips(
+    const std::string& raw,
+    const std::unordered_set<std::string>& tip_names_to_remove)
+{
+    return detail::newick::prune_newick_tips(raw, tip_names_to_remove);
 }
 
 } // namespace parse

@@ -3,10 +3,13 @@
 #define CORE_LIKELIHOOD_CUH
 #include <cstddef>
 
-#define SCALE_FACTOR 18446744073709551616  /*  2**64 (exactly)  */
-#define SCALE_THRESHOLD 5.4210108624275221700372640043e-20
-#define LOG_SCALE_THRESHOLD -44.361419555836499
-#define SCALE_MAX_DIFF 32  // PLL_SCALE_RATE_MAXDIFF
+// Site/rate scaler counts are stored as raw bit shifts across the current
+// partial/root/derivative pipeline. Keep core likelihood on the same contract:
+// one scaler unit means a single power-of-two bit.
+#define SCALE_FACTOR 2.0
+#define SCALE_THRESHOLD 0.5
+#define LOG_SCALE_THRESHOLD -0.69314718055994530942
+#define SCALE_MAX_DIFF 1024
 #define MAX_STATES 64
 #define MAX_RATECATS 8
 
@@ -99,7 +102,7 @@ namespace core_likelihood {
         double* d_parent_clv;
         unsigned int* d_parent_scaler; // Can be sites or sites * rate_cats
         unsigned char* d_tipchars;
-        unsigned int* d_tipmap; // Maps char to state index, size 256
+        unsigned int* d_tipmap; // Maps encoded char to state bitmask
         double* d_p_matrix;
         double* d_frequencies; 
         double* d_rate_weights; 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace parse {
@@ -38,11 +39,18 @@ Alignment read_alignment_file(const std::string& path);
 struct RunInputs {
     RunConfig config;
     Alignment tree_alignment;
+    Alignment query_alignment;
     std::string tree;
 };
 
 // Normalize Newick text by resolving polytomies into a binary tree.
 // If parsing fails, returns the input unchanged.
 std::string normalize_newick(const std::string& raw);
+
+// Remove the named tip taxa from a Newick tree and suppress unary internal nodes.
+// If pruning fails, throws std::runtime_error.
+std::string prune_newick_tips(
+    const std::string& raw,
+    const std::unordered_set<std::string>& tip_names_to_remove);
 
 } // namespace parse

@@ -23,7 +23,18 @@ __global__ void LikelihoodDerivativePendantKernel(
     fp_t* new_branch_length,
     size_t sumtable_stride,
     const fp_t* prev_branch_lengths,
-    const int* active_ops);
+    const int* active_ops,
+    int debug_enabled,
+    int debug_all_iters,
+    int debug_limit,
+    int debug_target_id,
+    int debug_site_deriv,
+    int debug_site_deriv_offset,
+    int debug_site_deriv_limit,
+    int debug_site_deriv_iter,
+    int debug_sumtable,
+    int debug_sumtable_site,
+    int debug_sumtable_rate);
 
 // Proximal-side derivative kernel. It builds midpoint state and derivative
 // sumtable rows directly inside the kernel.
@@ -41,4 +52,15 @@ __global__ void LikelihoodDerivativeProximalKernel(
     fp_t* new_branch_length,
     size_t sumtable_stride,
     const fp_t* prev_branch_lengths,
-    const int* active_ops);
+    const int* active_ops,
+    int debug_enabled,
+    int debug_all_iters,
+    int debug_limit,
+    int debug_target_id,
+    int debug_site_deriv,
+    int debug_site_deriv_offset,
+    int debug_site_deriv_limit,
+    int debug_site_deriv_iter,
+    int debug_sumtable,
+    int debug_sumtable_site,
+    int debug_sumtable_rate);

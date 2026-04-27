@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-#include <cstdio>
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
@@ -9,6 +8,14 @@
 
 __device__ inline void scale_clv_pow2(fp_t &x, int shift) {
     fp_scale_pow2(x, shift);
+}
+
+__device__ __forceinline__ unsigned int threshold_scale_shift(fp_t max_val)
+{
+    const fp_t scale_threshold = fp_ldexp(fp_t(1), SCALE_THRESHOLD_EXPONENT);
+    return (max_val < scale_threshold)
+        ? static_cast<unsigned int>(-SCALE_THRESHOLD_EXPONENT)
+        : 0u;
 }
 
 __device__ __forceinline__ unsigned int scaler_slot(
@@ -94,15 +101,17 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
-        const unsigned int down_inherited =
-            read_scaler_shift(D, parent_scaler, r) +
-            read_scaler_shift(D, sibling_scaler, r);
-        const unsigned int mid_inherited =
-            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        const unsigned int parent_shift = read_scaler_shift(D, parent_scaler, r);
+        const unsigned int sibling_shift = read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int target_up_shift = read_scaler_shift(D, target_up_scaler, r);
+        const unsigned int down_inherited = parent_shift + sibling_shift;
+        const unsigned int mid_inherited = down_inherited + target_up_shift;
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
+        if (mid_base) write_scaler_shift(D, mid_base_scaler, r, down_inherited);
 
         const fp_t* Tmat = target_mat  + (size_t)r * states * states;
         const fp_t* Thalf= target_mat_half + (size_t)r * states * states;
@@ -132,11 +141,14 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
             if (acc > col_scale_max_val) col_scale_max_val = acc;
         }
 
+        double pbase_max_val = 0.0;
+        double pmid_max_val = 0.0;
         if (Pmid) {
             // Cache parent_down * sibling_up (after sibling branch matrix) per state.
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j) {
                     Pbase[j] = Ppar[j] * sib_to_parent[j];
+                    if (Pbase[j] > pbase_max_val) pbase_max_val = Pbase[j];
                 }
             }
             for (unsigned int i = 0; i < states; ++i) {
@@ -149,24 +161,32 @@ __device__ __forceinline__ void compute_downward_inner_inner_generic(
                 }
                 const double val = par_acc * tgt_acc;
                 Pmid[i] = val;
+                if (val > pmid_max_val) pmid_max_val = val;
             }
         }
 
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            const unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-            add_scaler_shift(D, down_scaler, r, shift);
-            add_scaler_shift(D, mid_scaler, r, shift);
+        {
+            const unsigned int down_shift_local = threshold_scale_shift(col_scale_max_val);
+            if (down_shift_local) {
+            add_scaler_shift(D, down_scaler, r, down_shift_local);
             for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pout[j], shift);
+                    scale_clv_pow2(Pout[j], down_shift_local);
+            }
+            const unsigned int base_shift_local = Pbase ? threshold_scale_shift(pbase_max_val) : 0u;
+            if (base_shift_local) {
+            add_scaler_shift(D, mid_base_scaler, r, base_shift_local);
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], base_shift_local);
             }
+            }
+            const unsigned int mid_shift_local = Pmid ? threshold_scale_shift(pmid_max_val) : 0u;
+            if (mid_shift_local) {
+            add_scaler_shift(D, mid_scaler, r, mid_shift_local);
             if (Pmid) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], mid_shift_local);
+            }
             }
         }
     }
@@ -204,6 +224,7 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)sibling_tip_idx * D.sites;
 
@@ -215,6 +236,7 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
             down_inherited + read_scaler_shift(D, target_up_scaler, r);
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
+        if (mid_base) write_scaler_shift(D, mid_base_scaler, r, down_inherited);
 
         const unsigned int mask = D.d_tipmap[tipchars[site]];
         const fp_t* Tmat = target_mat  + (size_t)r * states * states;
@@ -247,10 +269,13 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
             if (acc > col_scale_max_val) col_scale_max_val = acc;
         }
 
+        double pbase_max_val = 0.0;
+        double pmid_max_val = 0.0;
         if (Pmid) {
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j) {
                     Pbase[j] = Ppar[j] * sib_to_parent[j];
+                    if (Pbase[j] > pbase_max_val) pbase_max_val = Pbase[j];
                 }
             }
             for (unsigned int i = 0; i < states; ++i) {
@@ -262,24 +287,32 @@ __device__ __forceinline__ void compute_downward_inner_tip_generic(
                     tgt_acc += Throw[j] * Pup[j];
                 }
                 Pmid[i] = par_acc * tgt_acc;
+                if (Pmid[i] > pmid_max_val) pmid_max_val = Pmid[i];
             }
         }
 
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            const unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-            add_scaler_shift(D, down_scaler, r, shift);
-            add_scaler_shift(D, mid_scaler, r, shift);
+        {
+            const unsigned int down_shift_local = threshold_scale_shift(col_scale_max_val);
+            if (down_shift_local) {
+            add_scaler_shift(D, down_scaler, r, down_shift_local);
             for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pout[j], shift);
+                    scale_clv_pow2(Pout[j], down_shift_local);
+            }
+            const unsigned int base_shift_local = Pbase ? threshold_scale_shift(pbase_max_val) : 0u;
+            if (base_shift_local) {
+            add_scaler_shift(D, mid_base_scaler, r, base_shift_local);
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], base_shift_local);
             }
+            }
+            const unsigned int mid_shift_local = Pmid ? threshold_scale_shift(pmid_max_val) : 0u;
+            if (mid_shift_local) {
+            add_scaler_shift(D, mid_scaler, r, mid_shift_local);
             if (Pmid) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], mid_shift_local);
+            }
             }
         }
     }
@@ -319,6 +352,7 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
     const unsigned char* tipchars = D.d_tipchars + (size_t)sibling_tip_idx * D.sites;
 
     for (unsigned int r = 0; r < rate_cats; ++r) {
@@ -329,6 +363,7 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
             down_inherited + read_scaler_shift(D, target_up_scaler, r);
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
+        if (mid_base) write_scaler_shift(D, mid_base_scaler, r, down_inherited);
 
         const unsigned int mask = D.d_tipmap[tipchars[site]];
         const fp_t* Tmat = target_mat  + (size_t)r * states * states;
@@ -359,10 +394,13 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
             if (acc > col_scale_max_val) col_scale_max_val = acc;
         }
 
+        double pbase_max_val = 0.0;
+        double pmid_max_val = 0.0;
         if (Pmid) {
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j) {
                     Pbase[j] = Ppar[j] * sib_to_parent[j];
+                    if (Pbase[j] > pbase_max_val) pbase_max_val = Pbase[j];
                 }
             }
             for (unsigned int i = 0; i < states; ++i) {
@@ -374,24 +412,32 @@ __device__ __forceinline__ void compute_downward_tip_tip_generic(
                     tgt_acc += Throw[j] * Pup[j];
                 }
                 Pmid[i] = par_acc * tgt_acc;
+                if (Pmid[i] > pmid_max_val) pmid_max_val = Pmid[i];
             }
         }
 
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            const unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-            add_scaler_shift(D, down_scaler, r, shift);
-            add_scaler_shift(D, mid_scaler, r, shift);
+        {
+            const unsigned int down_shift_local = threshold_scale_shift(col_scale_max_val);
+            if (down_shift_local) {
+            add_scaler_shift(D, down_scaler, r, down_shift_local);
             for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pout[j], shift);
+                    scale_clv_pow2(Pout[j], down_shift_local);
+            }
+            const unsigned int base_shift_local = Pbase ? threshold_scale_shift(pbase_max_val) : 0u;
+            if (base_shift_local) {
+            add_scaler_shift(D, mid_base_scaler, r, base_shift_local);
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], base_shift_local);
             }
+            }
+            const unsigned int mid_shift_local = Pmid ? threshold_scale_shift(pmid_max_val) : 0u;
+            if (mid_shift_local) {
+            add_scaler_shift(D, mid_scaler, r, mid_shift_local);
             if (Pmid) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], mid_shift_local);
+            }
             }
         }
     }
@@ -436,6 +482,7 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)target_tip_idx * D.sites;
     const unsigned int tmask = D.d_tipmap[tipchars[site]];
@@ -448,6 +495,7 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
             down_inherited + read_scaler_shift(D, target_up_scaler, r);
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
+        if (mid_base) write_scaler_shift(D, mid_base_scaler, r, down_inherited);
 
         const fp_t* Tmat = target_mat  + (size_t)r * states * states;
         const fp_t* Thalf= target_mat_half + (size_t)r * states * states;
@@ -477,10 +525,13 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
             if (Pout[i] > col_scale_max_val) col_scale_max_val = Pout[i];
         }
 
+        double pbase_max_val = 0.0;
+        double pmid_max_val = 0.0;
         if (Pmid) {
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j) {
                     Pbase[j] = Ppar[j] * sib_to_parent[j];
+                    if (Pbase[j] > pbase_max_val) pbase_max_val = Pbase[j];
                 }
             }
             for (unsigned int i = 0; i < states; ++i) {
@@ -492,24 +543,32 @@ __device__ __forceinline__ void compute_downward_tip_inner_generic(
                     tgt_acc += Throw[j] * Pup[j];
                 }
                 Pmid[i] = (tmask & (1u << i)) ? (par_acc * tgt_acc) : 0.0;
+                if (Pmid[i] > pmid_max_val) pmid_max_val = Pmid[i];
             }
         }
 
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            const unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-            add_scaler_shift(D, down_scaler, r, shift);
-            add_scaler_shift(D, mid_scaler, r, shift);
+        {
+            const unsigned int down_shift_local = threshold_scale_shift(col_scale_max_val);
+            if (down_shift_local) {
+            add_scaler_shift(D, down_scaler, r, down_shift_local);
             for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pout[j], shift);
+                    scale_clv_pow2(Pout[j], down_shift_local);
+            }
+            const unsigned int base_shift_local = Pbase ? threshold_scale_shift(pbase_max_val) : 0u;
+            if (base_shift_local) {
+            add_scaler_shift(D, mid_base_scaler, r, base_shift_local);
             if (Pbase) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], base_shift_local);
             }
+            }
+            const unsigned int mid_shift_local = Pmid ? threshold_scale_shift(pmid_max_val) : 0u;
+            if (mid_shift_local) {
+            add_scaler_shift(D, mid_scaler, r, mid_shift_local);
             if (Pmid) {
                 for (unsigned int j = 0; j < states; ++j)
-                    scale_clv_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], mid_shift_local);
+            }
             }
         }
     }
@@ -551,16 +610,18 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
-        const unsigned int down_inherited =
-            read_scaler_shift(D, parent_scaler, r) +
-            read_scaler_shift(D, sibling_scaler, r);
-        const unsigned int mid_inherited =
-            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        const unsigned int parent_shift = read_scaler_shift(D, parent_scaler, r);
+        const unsigned int sibling_shift = read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int target_up_shift = read_scaler_shift(D, target_up_scaler, r);
+        const unsigned int down_inherited = parent_shift + sibling_shift;
+        const unsigned int mid_inherited = down_inherited + target_up_shift;
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
+        if (mid_base) write_scaler_shift(D, mid_base_scaler, r, down_inherited);
 
         const fp_t* Tmat = target_mat  + (size_t)r * 16;
         const fp_t* Thalf= target_mat_half + (size_t)r * 16;
@@ -579,6 +640,7 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
         const fp_t p1 = Ppar.y * sib1;
         const fp_t p2 = Ppar.z * sib2;
         const fp_t p3 = Ppar.w * sib3;
+
 
         Pout[0] = Tmat[0] * p0 + Tmat[4] * p1 + Tmat[8]  * p2 + Tmat[12] * p3;
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
@@ -610,29 +672,36 @@ __device__ __forceinline__ void compute_downward_inner_inner_ratecat(
             Pmid[3] = par3 * tgt3;
         }
 
-        fp_t col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-            add_scaler_shift(D, down_scaler, r, shift);
-            add_scaler_shift(D, mid_scaler, r, shift);
+        const fp_t down_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
+        const unsigned int down_shift_local = threshold_scale_shift(down_max_val);
+        if (down_shift_local) {
+            add_scaler_shift(D, down_scaler, r, down_shift_local);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                scale_clv_pow2(Pout[j], shift);
+                scale_clv_pow2(Pout[j], down_shift_local);
             }
-            if (mid_base) {
-                fp_t* Pbase = mid_base + (size_t)r * 4;
+        }
+        if (mid_base) {
+            fp_t* Pbase = mid_base + (size_t)r * 4;
+            const fp_t base_max_val = fp_hmax4(Pbase[0], Pbase[1], Pbase[2], Pbase[3]);
+            const unsigned int base_shift_local = threshold_scale_shift(base_max_val);
+            if (base_shift_local) {
+                add_scaler_shift(D, mid_base_scaler, r, base_shift_local);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], base_shift_local);
                 }
             }
-            if (target_mid) {
-                fp_t* Pmid = target_mid + (size_t)r * 4;
+        }
+        if (target_mid) {
+            fp_t* Pmid = target_mid + (size_t)r * 4;
+            const fp_t mid_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
+            const unsigned int mid_shift_local = threshold_scale_shift(mid_max_val);
+            if (mid_shift_local) {
+                add_scaler_shift(D, mid_scaler, r, mid_shift_local);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], mid_shift_local);
                 }
             }
         }
@@ -671,18 +740,20 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)sibling_tip_idx * D.sites;
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
-        const unsigned int down_inherited =
-            read_scaler_shift(D, parent_scaler, r) +
-            read_scaler_shift(D, sibling_scaler, r);
-        const unsigned int mid_inherited =
-            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        const unsigned int parent_shift = read_scaler_shift(D, parent_scaler, r);
+        const unsigned int sibling_shift = read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int target_up_shift = read_scaler_shift(D, target_up_scaler, r);
+        const unsigned int down_inherited = parent_shift + sibling_shift;
+        const unsigned int mid_inherited = down_inherited + target_up_shift;
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
+        if (mid_base) write_scaler_shift(D, mid_base_scaler, r, down_inherited);
 
         const unsigned int mask = D.d_tipmap[tipchars[site]];
         const fp_t* Tmat = target_mat  + (size_t)r * 16;
@@ -732,29 +803,36 @@ __device__ __forceinline__ void compute_downward_inner_tip_ratecat(
             Pmid[3] = par3 * tgt3;
         }
 
-        fp_t col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-            add_scaler_shift(D, down_scaler, r, shift);
-            add_scaler_shift(D, mid_scaler, r, shift);
+        const fp_t down_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
+        const unsigned int down_shift_local = threshold_scale_shift(down_max_val);
+        if (down_shift_local) {
+            add_scaler_shift(D, down_scaler, r, down_shift_local);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                scale_clv_pow2(Pout[j], shift);
+                scale_clv_pow2(Pout[j], down_shift_local);
             }
-            if (mid_base) {
-                fp_t* Pbase = mid_base + (size_t)r * 4;
+        }
+        if (mid_base) {
+            fp_t* Pbase = mid_base + (size_t)r * 4;
+            const fp_t base_max_val = fp_hmax4(Pbase[0], Pbase[1], Pbase[2], Pbase[3]);
+            const unsigned int base_shift_local = threshold_scale_shift(base_max_val);
+            if (base_shift_local) {
+                add_scaler_shift(D, mid_base_scaler, r, base_shift_local);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], base_shift_local);
                 }
             }
-            if (target_mid) {
-                fp_t* Pmid = target_mid + (size_t)r * 4;
+        }
+        if (target_mid) {
+            fp_t* Pmid = target_mid + (size_t)r * 4;
+            const fp_t mid_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
+            const unsigned int mid_shift_local = threshold_scale_shift(mid_max_val);
+            if (mid_shift_local) {
+                add_scaler_shift(D, mid_scaler, r, mid_shift_local);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], mid_shift_local);
                 }
             }
         }
@@ -795,19 +873,21 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)target_tip_idx * D.sites;
     const unsigned int tmask = D.d_tipmap[tipchars[site]];
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
-        const unsigned int down_inherited =
-            read_scaler_shift(D, parent_scaler, r) +
-            read_scaler_shift(D, sibling_scaler, r);
-        const unsigned int mid_inherited =
-            down_inherited + read_scaler_shift(D, target_up_scaler, r);
+        const unsigned int parent_shift = read_scaler_shift(D, parent_scaler, r);
+        const unsigned int sibling_shift = read_scaler_shift(D, sibling_scaler, r);
+        const unsigned int target_up_shift = read_scaler_shift(D, target_up_scaler, r);
+        const unsigned int down_inherited = parent_shift + sibling_shift;
+        const unsigned int mid_inherited = down_inherited + target_up_shift;
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
+        if (mid_base) write_scaler_shift(D, mid_base_scaler, r, down_inherited);
 
         const fp_t* Tmat  = target_mat  + (size_t)r * 16;
         const fp_t* Thalf = target_mat_half + (size_t)r * 16;
@@ -826,6 +906,7 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
         const fp_t p1 = Ppar.y * sib1;
         const fp_t p2 = Ppar.z * sib2;
         const fp_t p3 = Ppar.w * sib3;
+
 
         Pout[0] = Tmat[0] * p0 + Tmat[4] * p1 + Tmat[8]  * p2 + Tmat[12] * p3;
         Pout[1] = Tmat[1] * p0 + Tmat[5] * p1 + Tmat[9]  * p2 + Tmat[13] * p3;
@@ -866,29 +947,36 @@ __device__ __forceinline__ void compute_downward_tip_inner_ratecat(
             if (!(tmask & 8u)) Pmid[3] = 0.0;
         }
 
-        fp_t col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-            add_scaler_shift(D, down_scaler, r, shift);
-            add_scaler_shift(D, mid_scaler, r, shift);
+        const fp_t down_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
+        const unsigned int down_shift_local = threshold_scale_shift(down_max_val);
+        if (down_shift_local) {
+            add_scaler_shift(D, down_scaler, r, down_shift_local);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                scale_clv_pow2(Pout[j], shift);
+                scale_clv_pow2(Pout[j], down_shift_local);
             }
-            if (mid_base) {
-                fp_t* Pbase = mid_base + (size_t)r * 4;
+        }
+        if (mid_base) {
+            fp_t* Pbase = mid_base + (size_t)r * 4;
+            const fp_t base_max_val = fp_hmax4(Pbase[0], Pbase[1], Pbase[2], Pbase[3]);
+            const unsigned int base_shift_local = threshold_scale_shift(base_max_val);
+            if (base_shift_local) {
+                add_scaler_shift(D, mid_base_scaler, r, base_shift_local);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], base_shift_local);
                 }
             }
-            if (target_mid) {
-                fp_t* Pmid = target_mid + (size_t)r * 4;
+        }
+        if (target_mid) {
+            fp_t* Pmid = target_mid + (size_t)r * 4;
+            const fp_t mid_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
+            const unsigned int mid_shift_local = threshold_scale_shift(mid_max_val);
+            if (mid_shift_local) {
+                add_scaler_shift(D, mid_scaler, r, mid_shift_local);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], mid_shift_local);
                 }
             }
         }
@@ -929,6 +1017,7 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
     unsigned int* target_up_scaler = up_scaler_ptr(D, target_id, site);
     unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
 
     const unsigned char* tipchars = D.d_tipchars + (size_t)sibling_tip_idx * D.sites;
 
@@ -941,6 +1030,7 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
             down_inherited + read_scaler_shift(D, target_up_scaler, r);
         write_scaler_shift(D, down_scaler, r, down_inherited);
         write_scaler_shift(D, mid_scaler, r, mid_inherited);
+        if (mid_base) write_scaler_shift(D, mid_base_scaler, r, down_inherited);
 
         const unsigned int mask = D.d_tipmap[tipchars[site]];
         const fp_t* Tmat  = target_mat  + (size_t)r * 16;
@@ -991,29 +1081,36 @@ __device__ __forceinline__ void compute_downward_tip_tip_ratecat(
             Pmid[3] = par3 * tgt3;
         }
 
-        fp_t col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
-            add_scaler_shift(D, down_scaler, r, shift);
-            add_scaler_shift(D, mid_scaler, r, shift);
+        const fp_t down_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
+        const unsigned int down_shift_local = threshold_scale_shift(down_max_val);
+        if (down_shift_local) {
+            add_scaler_shift(D, down_scaler, r, down_shift_local);
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                scale_clv_pow2(Pout[j], shift);
+                scale_clv_pow2(Pout[j], down_shift_local);
             }
-            if (mid_base) {
-                fp_t* Pbase = mid_base + (size_t)r * 4;
+        }
+        if (mid_base) {
+            fp_t* Pbase = mid_base + (size_t)r * 4;
+            const fp_t base_max_val = fp_hmax4(Pbase[0], Pbase[1], Pbase[2], Pbase[3]);
+            const unsigned int base_shift_local = threshold_scale_shift(base_max_val);
+            if (base_shift_local) {
+                add_scaler_shift(D, mid_base_scaler, r, base_shift_local);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pbase[j], shift);
+                    scale_clv_pow2(Pbase[j], base_shift_local);
                 }
             }
-            if (target_mid) {
-                fp_t* Pmid = target_mid + (size_t)r * 4;
+        }
+        if (target_mid) {
+            fp_t* Pmid = target_mid + (size_t)r * 4;
+            const fp_t mid_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
+            const unsigned int mid_shift_local = threshold_scale_shift(mid_max_val);
+            if (mid_shift_local) {
+                add_scaler_shift(D, mid_scaler, r, mid_shift_local);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pmid[j], shift);
+                    scale_clv_pow2(Pmid[j], mid_shift_local);
                 }
             }
         }
@@ -1041,8 +1138,10 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
     const size_t site_off = (size_t)site * span;
     if (op.left_id >= 0 && D.d_clv_up) {
         fp_t* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
+        unsigned int* lscaler = up_scaler_ptr(D, op.left_id, site);
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
+            write_scaler_shift(D, lscaler, r, 0u);
             fp_t* out = lclv + site_off + (size_t)r * 4;
             out[0] = (lmask & 1u) ? fp_t(1) : fp_t(0);
             out[1] = (lmask & 2u) ? fp_t(1) : fp_t(0);
@@ -1052,8 +1151,10 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
     }
     if (op.right_id >= 0 && D.d_clv_up) {
         fp_t* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
+        unsigned int* rscaler = up_scaler_ptr(D, op.right_id, site);
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
+            write_scaler_shift(D, rscaler, r, 0u);
             fp_t* out = rclv + site_off + (size_t)r * 4;
             out[0] = (rmask & 1u) ? fp_t(1) : fp_t(0);
             out[1] = (rmask & 2u) ? fp_t(1) : fp_t(0);
@@ -1100,10 +1201,8 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
         }
 
         if (site_scaler_ptr) {
-            int expv;
-            frexp(maxv, &expv);
-            if (expv < SCALE_THRESHOLD_EXPONENT) {
-                unsigned int shift = SCALE_THRESHOLD_EXPONENT - expv;
+            unsigned int shift = threshold_scale_shift(maxv);
+            if (shift) {
                 add_scaler_shift(D, site_scaler_ptr, r, shift);
 
                 #pragma unroll
@@ -1112,6 +1211,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat(
                 }
             }
         }
+
     }
 }
 
@@ -1143,8 +1243,10 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
     const size_t site_off = (size_t)site * span;
     if (op.left_id >= 0 && D.d_clv_up) {
         fp_t* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
+        unsigned int* lscaler = up_scaler_ptr(D, op.left_id, site);
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
+            write_scaler_shift(D, lscaler, r, 0u);
             fp_t* out = lclv + site_off + (size_t)r * 4;
             unsigned int m = jmask_base;
             out[0] = (m & 1u) ? fp_t(1) : fp_t(0);
@@ -1155,8 +1257,10 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
     }
     if (op.right_id >= 0 && D.d_clv_up) {
         fp_t* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
+        unsigned int* rscaler = up_scaler_ptr(D, op.right_id, site);
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
+            write_scaler_shift(D, rscaler, r, 0u);
             fp_t* out = rclv + site_off + (size_t)r * 4;
             unsigned int m = kmask_base;
             out[0] = (m & 1u) ? fp_t(1) : fp_t(0);
@@ -1210,10 +1314,8 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
         if (site_scaler_ptr) {
             fp_t* pout = Pout;
             fp_t maxv = fp_hmax4(pout[0], pout[1], pout[2], pout[3]);
-            int expv;
-            frexp(maxv, &expv);
-            if (expv < SCALE_THRESHOLD_EXPONENT) {
-                unsigned int shift = SCALE_THRESHOLD_EXPONENT - expv;
+            unsigned int shift = threshold_scale_shift(maxv);
+            if (shift) {
                 add_scaler_shift(D, site_scaler_ptr, r, shift);
 
                 #pragma unroll
@@ -1221,6 +1323,7 @@ __device__ __forceinline__ void compute_tip_tip_site_ratecat_nolookup(
                     scale_clv_pow2(pout[s], shift);
             }
         }
+
     }
 }
 
@@ -1250,7 +1353,9 @@ __device__ __forceinline__ void compute_tip_tip_site_4_generic(
     const size_t site_off = (size_t)site * span;
     if (op.left_id >= 0 && D.d_clv_up) {
         fp_t* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
+        unsigned int* lscaler = up_scaler_ptr(D, op.left_id, site);
         for (int r = 0; r < D.rate_cats; ++r) {
+            write_scaler_shift(D, lscaler, r, 0u);
             fp_t* out = lclv + site_off + (size_t)r * 4;
             unsigned int m = jmask_base;
             out[0] = (m & 1u) ? fp_t(1) : fp_t(0);
@@ -1261,7 +1366,9 @@ __device__ __forceinline__ void compute_tip_tip_site_4_generic(
     }
     if (op.right_id >= 0 && D.d_clv_up) {
         fp_t* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
+        unsigned int* rscaler = up_scaler_ptr(D, op.right_id, site);
         for (int r = 0; r < D.rate_cats; ++r) {
+            write_scaler_shift(D, rscaler, r, 0u);
             fp_t* out = rclv + site_off + (size_t)r * 4;
             unsigned int m = kmask_base;
             out[0] = (m & 1u) ? fp_t(1) : fp_t(0);
@@ -1311,16 +1418,15 @@ __device__ __forceinline__ void compute_tip_tip_site_4_generic(
 
         if (site_scaler_ptr) {
             fp_t maxv = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
-            int expv;
-            frexp(maxv, &expv);
-            if (expv < SCALE_THRESHOLD_EXPONENT) {
-                unsigned int shift = SCALE_THRESHOLD_EXPONENT - expv;
+            unsigned int shift = threshold_scale_shift(maxv);
+            if (shift) {
                 site_scaler_ptr[r] += shift;
                 for (int s = 0; s < 4; ++s) {
                     scale_clv_pow2(Pout[s], shift);
                 }
             }
         }
+
     }
 }
 
@@ -1344,7 +1450,9 @@ __device__ __forceinline__ void compute_tip_tip_site_generic(
     const size_t site_off = (size_t)site * span;
     if (op.left_id >= 0 && D.d_clv_up) {
         fp_t* lclv = D.d_clv_up + (size_t)op.left_id * per_node;
+        unsigned int* lscaler = up_scaler_ptr(D, op.left_id, site);
         for (unsigned int r = 0; r < rate_cats; ++r) {
+            write_scaler_shift(D, lscaler, r, 0u);
             fp_t* out = lclv + site_off + (size_t)r * states;
             for (unsigned int s = 0; s < states; ++s) {
                 out[s] = (lmask & (1u << s)) ? fp_t(1) : fp_t(0);
@@ -1353,7 +1461,9 @@ __device__ __forceinline__ void compute_tip_tip_site_generic(
     }
     if (op.right_id >= 0 && D.d_clv_up) {
         fp_t* rclv = D.d_clv_up + (size_t)op.right_id * per_node;
+        unsigned int* rscaler = up_scaler_ptr(D, op.right_id, site);
         for (unsigned int r = 0; r < rate_cats; ++r) {
+            write_scaler_shift(D, rscaler, r, 0u);
             fp_t* out = rclv + site_off + (size_t)r * states;
             for (unsigned int s = 0; s < states; ++s) {
                 out[s] = (rmask & (1u << s)) ? fp_t(1) : fp_t(0);
@@ -1391,10 +1501,8 @@ __device__ __forceinline__ void compute_tip_tip_site_generic(
         }
 
         if (site_scaler_ptr) {
-            int expv;
-            frexp(maxv, &expv);
-            if (expv < SCALE_THRESHOLD_EXPONENT) {
-                unsigned int shift = SCALE_THRESHOLD_EXPONENT - expv;
+            unsigned int shift = threshold_scale_shift(maxv);
+            if (shift) {
                 site_scaler_ptr[r] += shift;
                 for (unsigned int s = 0; s < states; ++s) {
                     scale_clv_pow2(out_r[s], shift);
@@ -1432,8 +1540,10 @@ __device__ __forceinline__ void compute_tip_inner_site_ratecat(
     // Write tip CLV into UP pool for downstream use.
     if (D.d_clv_up && tip_node_id >= 0) {
         fp_t* tip_up = D.d_clv_up + (size_t)tip_node_id * per_node;
+        unsigned int* tip_scaler = up_scaler_ptr(D, tip_node_id, site);
         #pragma unroll
         for (int r = 0; r < RATE_CATS; ++r) {
+            write_scaler_shift(D, tip_scaler, r, 0u);
             fp_t* out = tip_up + site_off + (size_t)r * 4;
             out[0] = (tmask & 1u) ? fp_t(1) : fp_t(0);
             out[1] = (tmask & 2u) ? fp_t(1) : fp_t(0);
@@ -1478,16 +1588,16 @@ __device__ __forceinline__ void compute_tip_inner_site_ratecat(
         }
 
         if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                add_scaler_shift(D, site_scaler_ptr, r, SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+            unsigned int shift = threshold_scale_shift(col_scale_max_val);
+            if (shift) {
+                add_scaler_shift(D, site_scaler_ptr, r, shift);
                 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    scale_clv_pow2(Pout[i], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                    scale_clv_pow2(Pout[i], shift);
                 }
             }
         }
+
     }
 }
 
@@ -1520,7 +1630,9 @@ __device__ __forceinline__ void compute_tip_inner_site_generic(
     // Write tip CLV into UP pool for downstream use.
     if (D.d_clv_up && tip_node_id >= 0) {
         fp_t* tip_up = D.d_clv_up + (size_t)tip_node_id * per_node;
+        unsigned int* tip_scaler = up_scaler_ptr(D, tip_node_id, site);
         for (unsigned int r = 0; r < rate_cats; ++r) {
+            write_scaler_shift(D, tip_scaler, r, 0u);
             fp_t* out = tip_up + site_off + (size_t)r * states;
             for (unsigned int s = 0; s < states; ++s) {
                 out[s] = (tmask & (1u << s)) ? fp_t(1) : fp_t(0);
@@ -1536,7 +1648,6 @@ __device__ __forceinline__ void compute_tip_inner_site_generic(
     for (unsigned int r = 0; r < rate_cats; ++r) {
         write_scaler_shift(D, site_scaler_ptr, r, read_scaler_shift(D, inner_scaler, r));
         fp_t col_scale_max_val = fp_t(0);
-        int scaling_exponent;
         const fp_t* Lmat = d_Lmat + (size_t)r * states * states;
         const fp_t* Rmat = d_Rmat + (size_t)r * states * states;
         const fp_t* Rclv = d_right_clv + site_off + (size_t)r * states;
@@ -1558,11 +1669,11 @@ __device__ __forceinline__ void compute_tip_inner_site_generic(
             Rrow += states;
         }
         if (site_scaler_ptr) {
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            unsigned int shift = threshold_scale_shift(col_scale_max_val);
+            if (shift) {
+                site_scaler_ptr[r] += shift;
                 for (unsigned int i = 0; i < states; ++i) {
-                    scale_clv_pow2(Pout[i], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                    scale_clv_pow2(Pout[i], shift);
                 }
             }
         }
@@ -1639,17 +1750,16 @@ __device__ __forceinline__ void compute_inner_inner_site_ratecat(
         col_scale_max_val = fp_hmax4(Pout[0], Pout[1], Pout[2], Pout[3]);
 
         if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                add_scaler_shift(D, site_scaler_ptr, r, SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+            unsigned int shift = threshold_scale_shift(col_scale_max_val);
+            if (shift) {
+                add_scaler_shift(D, site_scaler_ptr, r, shift);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
-                    scale_clv_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                    scale_clv_pow2(Pout[j], shift);
                 }
             }
         }
-        
+
     }
     
 }
@@ -1730,12 +1840,12 @@ __device__ void compute_midpoint_inner_inner_ratecat(
     if (!active_thread) return;
 
     unsigned int* mid_scaler = mid_scaler_ptr(D, target_id, site);
-    unsigned int* down_scaler = down_scaler_ptr(D, target_id, site);
+    unsigned int* mid_base_scaler = mid_base_scaler_ptr(D, target_id, site);
     unsigned int* target_up_scaler = proximal_mode ? nullptr : up_scaler_ptr(D, target_id, site);
 
     #pragma unroll
     for (int r = 0; r < RATE_CATS; ++r) {
-        unsigned int inherited_shift = read_scaler_shift(D, down_scaler, r);
+        unsigned int inherited_shift = read_scaler_shift(D, mid_base_scaler, r);
         if (target_up_scaler) {
             inherited_shift += read_scaler_shift(D, target_up_scaler, r);
         }
@@ -1762,15 +1872,15 @@ __device__ void compute_midpoint_inner_inner_ratecat(
         Pmid[3] = p3;
         
         fp_t col_scale_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        {
+            unsigned int shift = threshold_scale_shift(col_scale_max_val);
+            if (shift) {
             add_scaler_shift(D, mid_scaler, r, shift);
             Pmid[0] = fp_ldexp(Pmid[0], shift);
             Pmid[1] = fp_ldexp(Pmid[1], shift);
             Pmid[2] = fp_ldexp(Pmid[2], shift);
             Pmid[3] = fp_ldexp(Pmid[3], shift);
+            }
         }
 
     }
@@ -1846,10 +1956,8 @@ __device__ __forceinline__ void combine_query_midpoint_ratecat(
         Pmid[3] *= t3;
 
         fp_t col_scale_max_val = fp_hmax4(Pmid[0], Pmid[1], Pmid[2], Pmid[3]);
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        unsigned int shift = threshold_scale_shift(col_scale_max_val);
+        if (shift) {
             add_scaler_shift(D, mid_scaler, r, shift);
             Pmid[0] = fp_ldexp(Pmid[0], shift);
             Pmid[1] = fp_ldexp(Pmid[1], shift);
@@ -1899,10 +2007,8 @@ __device__ __forceinline__ void combine_query_midpoint_generic(
             if (Pmid[i] > col_scale_max_val) col_scale_max_val = Pmid[i];
         }
 
-        int scaling_exponent;
-        frexp(col_scale_max_val, &scaling_exponent);
-        if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-            unsigned int shift = SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+        unsigned int shift = threshold_scale_shift(col_scale_max_val);
+        if (shift) {
             add_scaler_shift(D, mid_scaler, r, shift);
             for (unsigned int j = 0; j < states; ++j) {
                 Pmid[j] = fp_ldexp(Pmid[j], shift);
@@ -1995,12 +2101,11 @@ __device__ __forceinline__ void compute_inner_inner_site_generic(
         }
 
         if (site_scaler_ptr) {
-            int scaling_exponent;
-            frexp(col_scale_max_val, &scaling_exponent);
-            if (scaling_exponent < SCALE_THRESHOLD_EXPONENT) {
-                site_scaler_ptr[r] += SCALE_THRESHOLD_EXPONENT - scaling_exponent;
+            unsigned int shift = threshold_scale_shift(col_scale_max_val);
+            if (shift) {
+                site_scaler_ptr[r] += shift;
                 for (unsigned int j = 0; j < states; ++j) {
-                    scale_clv_pow2(Pout[j], SCALE_THRESHOLD_EXPONENT - scaling_exponent);
+                    scale_clv_pow2(Pout[j], shift);
                 }
             }
         }
