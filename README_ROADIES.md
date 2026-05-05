@@ -1,6 +1,6 @@
 # MLIPPER For ROADIES
 
-This document describes the current MLIPPER handoff interface for the ROADIES
+This document describes the current MLIPPER interface for the ROADIES
 per-gene tree stage.
 
 The intended use is simple:
@@ -22,9 +22,12 @@ The intended Docker image for that wrapper is:
 ROADIES does not need to call the `MLIPPER` binary directly unless you want to
 debug the wrapper.
 
+This setup is currently validated on `peregrine`, where MLIPPER uses its own
+bundled `libpll`. Please use this on `peregrine`.
+
 ## Architecture
 
-The current handoff architecture has four layers:
+The current architecture has four layers:
 
 1. `ROADIES`
    ROADIES prepares one gene’s files and decides which GPU to use.
@@ -37,6 +40,11 @@ The current handoff architecture has four layers:
 3. `wenchiehlo/mlipper-roadies:20260504`
    This image provides the runtime environment and the compiled `MLIPPER`
    binary.
+
+   It also bundles the vendored `lib/libpll-2_fp32` fork from this repo. For
+   the current ROADIES setup, that fork is the intended `libpll`
+   implementation; the image is not meant to swap in an upstream `libpll` at
+   runtime.
 
 4. `MLIPPER`
    The binary reads the reference MSA, query MSA, backbone tree, and bestModel
@@ -276,13 +284,6 @@ ROADIES should use the tree written to:
 - `GENE/mlipper_gene_tree.nwk`
 
 or whatever path was passed as `--out-tree`.
-
-## Concrete Smoke Test
-
-This repo includes a convenient smoke-test gene:
-
-- `data/iter_2_placement_legal_bundle_787_compat/gene_1/`
-
 Example:
 
 ```bash
@@ -310,5 +311,9 @@ Expected success criteria:
   path is explicitly revalidated
 - MLIPPER should currently be treated as one-visible-GPU per invocation; GPU
   scheduling must be done by ROADIES or the wrapper layer
+- the current ROADIES image depends on the vendored `libpll-2_fp32` fork in
+  this repo, not an upstream `libpll` release
+- the current ROADIES setup is validated on `peregrine`; if ROADIES is moved
+  to a different host environment, the image should be re-smoke-tested there
 - the ROADIES image and wrapper are intended for per-gene execution
-- the current handoff contract guarantees the committed output tree
+- the current interface guarantees the committed output tree

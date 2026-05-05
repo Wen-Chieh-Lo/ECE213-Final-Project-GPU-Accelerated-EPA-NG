@@ -39,8 +39,9 @@ RUN success=0; \
     done; \
     test "$success" = 1
 
-RUN git clone --depth 1 https://github.com/xflouris/libpll.git /tmp/libpll \
-    && cd /tmp/libpll \
+COPY lib/libpll-2_fp32 /tmp/libpll
+
+RUN cd /tmp/libpll \
     && if [[ -x ./autogen.sh ]]; then ./autogen.sh; else autoreconf -fi; fi \
     && ./configure --prefix=/usr/local \
     && make -j1 \

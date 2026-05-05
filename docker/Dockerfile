@@ -16,7 +16,10 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH}
 
 WORKDIR /workspace/MLIPPER
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN success=0; \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get update && \
+      apt-get install -y --no-install-recommends \
     autoconf \
     automake \
     build-essential \
@@ -33,8 +36,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     python3 \
     python3-pip \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+    wget; then \
+      rm -rf /var/lib/apt/lists/*; \
+      success=1; \
+      break; \
+      fi; \
+      echo "apt install failed on attempt ${attempt}, retrying..." >&2; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep 5; \
+    done; \
+    test "$success" = 1
 
 RUN wget -qO /tmp/miniconda.sh \
     https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
@@ -49,8 +60,9 @@ RUN wget -qO /tmp/miniconda.sh \
     && conda run -n base astral-pro3 --help >/dev/null \
     && conda clean -afy
 
-RUN git clone --depth 1 https://github.com/xflouris/libpll.git /tmp/libpll \
-    && cd /tmp/libpll \
+COPY lib/libpll-2_fp32 /tmp/libpll
+
+RUN cd /tmp/libpll \
     && if [[ -x ./autogen.sh ]]; then ./autogen.sh; else autoreconf -fi; fi \
     && ./configure --prefix=/usr/local \
     && make -j1 \
