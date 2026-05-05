@@ -3,6 +3,7 @@
 build
 bin
 output
+data
 MLIPPER
 tree.nwk
 *.o
@@ -12,3 +13,5 @@ tree.nwk
 *.ncu.log
 *.nsys-rep
 *.sqlite
+__pycache__
+scripts/__pycache__

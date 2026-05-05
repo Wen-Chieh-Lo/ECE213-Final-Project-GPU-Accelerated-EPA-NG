@@ -1,0 +1,93 @@
+FROM nvidia/cuda:12.3.2-devel-ubuntu22.04 AS builder
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV CONDA_PREFIX=/usr/local
+ENV PLL_INC_DIR=/usr/local/include
+ENV PLL_LIB_DIR=/usr/local/lib
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH}
+
+WORKDIR /workspace/MLIPPER
+
+RUN success=0; \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get update && \
+      apt-get install -y --no-install-recommends \
+    autoconf \
+    automake \
+    bison \
+    build-essential \
+    ca-certificates \
+    flex \
+    git \
+    libblas-dev \
+    liblapack-dev \
+    libtbb-dev \
+    libtool \
+    pkg-config \
+    python3 \
+    wget; then \
+      rm -rf /var/lib/apt/lists/*; \
+      success=1; \
+      break; \
+      fi; \
+      echo "apt install failed on attempt ${attempt}, retrying..." >&2; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep 5; \
+    done; \
+    test "$success" = 1
+
+RUN git clone --depth 1 https://github.com/xflouris/libpll.git /tmp/libpll \
+    && cd /tmp/libpll \
+    && if [[ -x ./autogen.sh ]]; then ./autogen.sh; else autoreconf -fi; fi \
+    && ./configure --prefix=/usr/local \
+    && make -j1 \
+    && make install \
+    && rm -rf /tmp/libpll \
+    && ldconfig
+
+COPY . /workspace/MLIPPER
+
+RUN make clean \
+    && make USE_DOUBLE=0 MLIPPER
+
+
+FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH}
+
+WORKDIR /workspace/MLIPPER
+
+RUN success=0; \
+    for attempt in 1 2 3 4 5; do \
+      if apt-get update && \
+      apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libblas3 \
+    libgfortran5 \
+    liblapack3 \
+    libquadmath0 \
+    libtbb12; then \
+      rm -rf /var/lib/apt/lists/*; \
+      success=1; \
+      break; \
+      fi; \
+      echo "apt install failed on attempt ${attempt}, retrying..." >&2; \
+      rm -rf /var/lib/apt/lists/*; \
+      sleep 5; \
+    done; \
+    test "$success" = 1
+
+COPY --from=builder /usr/local/lib/libpll.so* /usr/local/lib/
+COPY --from=builder /workspace/MLIPPER/MLIPPER /workspace/MLIPPER/MLIPPER
+
+RUN ldconfig
+
+ENTRYPOINT ["/workspace/MLIPPER/MLIPPER"]
+CMD ["--help"]

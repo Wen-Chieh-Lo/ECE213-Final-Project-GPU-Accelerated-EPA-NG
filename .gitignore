@@ -33,6 +33,11 @@ __pycache__/
 /*.tre
 /*.nwk
 /*.jplace
+*.tar.gz
 
 # Local datasets stay out of git by default.
 /data/*
+
+# Keep only the ROADIES-facing single-gene wrapper from scripts/.
+/scripts/*
+!/scripts/run_single_gene_MLIPPER.sh

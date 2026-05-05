@@ -1,181 +1,195 @@
 # MLIPPER
 
-- a self-contained GPU Docker build in [`Dockerfile`](Dockerfile)
-- the benchmark driver script in [`run.sh`](run.sh)
-- a compressed runtime dataset archive: `data/neotrop_runtime_dataset.tar.gz`
+`MLIPPER` is a GPU-backed phylogenetic placement and commit tool. In this repo
+the main practical workflow is:
 
-The expected workflow is:
+- read a reference MSA
+- read a query MSA
+- read a backbone tree
+- read per-gene model parameters
+- commit the query taxa back into the tree
+- optionally run local SPR refinement
 
-1. build the Docker image
-2. extract the runtime dataset archive if needed
-3. run `./run.sh`
+For ROADIES-specific integration notes, use
+[`README_ROADIES.md`](README_ROADIES.md).
 
-## Requirements
+## Repo Layout
 
-- Docker with NVIDIA GPU support
-- NVIDIA driver installed on the host
-- `nvidia-container-toolkit` configured so `docker run --gpus all ...` works
+Source code now lives under `src/`:
 
-## Docker Setup
+- `src/main.cpp`: CLI entrypoint
+- `src/tree/`: tree build and GPU upload path
+- `src/placement/`: placement and branch-length optimization
+- `src/spr/`: local SPR refinement
+- `src/likelihood/`: likelihood kernels
+- `src/pmatrix/`: eigendecomposition and PMAT construction
+- `src/io/`: Newick, jplace, parsing, and input validation helpers
+- `src/util/`: shared utility headers
+- `src/model_utils.*`: model parsing and frequency helpers
+- `src/msa_preprocess.*`: alignment preprocessing helpers
 
-Build the image from the repository root:
+Other important directories:
 
-```bash
-docker build -t ece213-mlipper:latest .
-```
+- `docker/`: Docker build definitions
+- `scripts/`: ROADIES helpers and wrapper scripts
+- `data/`: small tests plus bundle-style inputs
 
-This image is based on `nvidia/cuda:12.3.2-devel-ubuntu22.04` and installs all required dependencies inside the container, including:
+## Build
 
-- Miniconda
-- `epa-ng`
-- `libpll`
-- BLAS / LAPACK / TBB
-- the float `MLIPPER` binary built with `make float`
-
-Open an interactive container:
-
-```bash
-docker run --gpus all -it --rm \
-  -v "$PWD":/workspace/MLIPPER \
-  -w /workspace/MLIPPER \
-  ece213-mlipper:latest bash
-```
-
-You can also run the full benchmark directly without entering a shell:
+Local build:
 
 ```bash
-docker run --gpus all -it --rm \
-  -v "$PWD":/workspace/MLIPPER \
-  -w /workspace/MLIPPER \
-  ece213-mlipper:latest bash -lc './run.sh'
+make -j4 MLIPPER
+./MLIPPER --help
 ```
 
-## Runtime Dataset Archive
+Important current build identity:
 
-The benchmark only needs the following input files:
+- local `Makefile` default: double precision
+- main Docker image build: float precision
 
-- `data/neotrop/reference.fasta`
-- `data/neotrop/tree.newick`
-- `data/neotrop/query_1k.fasta`
-- `data/neotrop/query_2k.fasta`
-- `data/neotrop/query_5k.fasta`
+Do not assume the host binary and container binary are identical unless you
+verify that explicitly.
 
-These files are bundled in:
+## Main CLI
+
+The practical per-gene CLI contract is:
 
 ```bash
-data/neotrop_runtime_dataset.tar.gz
+MLIPPER \
+  --tree-alignment REF_MSA.fa \
+  --query-alignment QUERY_MSA.fa \
+  --tree BACKBONE_TREE.nwk \
+  --best-model GENE.raxml.bestModel \
+  --commit-to-tree OUT_TREE.nwk
 ```
 
-Manual extraction from the repository root:
+Common refinement flags:
 
 ```bash
-tar -xzf data/neotrop_runtime_dataset.tar.gz
+  --local-spr \
+  --batch-insert-size 5 \
+  --local-spr-radius 4 \
+  --local-spr-rounds 1
 ```
 
-The archive restores the files under `data/neotrop/`.
+You can also pass explicit model flags instead of `--best-model`, but in this
+repo the preferred path is direct `bestModel` ingestion.
 
-[`run.sh`](run.sh) also supports automatic extraction. If any required runtime dataset file is missing and `data/neotrop_runtime_dataset.tar.gz` is present, the script will extract the archive before starting the benchmark.
+## Docker Images
 
-## Running The Benchmark
+This repo currently keeps two image targets.
 
-From inside the container, run:
+### Full image
+
+Build:
 
 ```bash
-./run.sh
+docker build -f docker/Dockerfile -t wenchiehlo/mlipper:20260504 .
 ```
 
-If you want MLIPPER to estimate equilibrium base frequencies directly from the
-reference alignment instead of using manual `--freqs` or the uniform default,
-pass:
+Use this when you want:
+
+- a larger development image
+- the extra tooling bundled in the full container
+
+### ROADIES-focused image
+
+Build:
 
 ```bash
-./MLIPPER ... --empirical-freqs
+docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:20260504 .
 ```
 
-This computes empirical frequencies from `--tree-alignment` and ignores
-ambiguous DNA symbols by distributing them across their represented states
-(for example `N` or `-` contributes `0.25` to each of A/C/G/T in 4-state DNA).
+Use this when you want:
 
-When writing a committed Newick tree with `--commit-to-tree`, MLIPPER now
-collapses very short internal branches into output polytomies by default:
+- a smaller per-gene runtime image
+- direct `MLIPPER` execution
+- `scripts/run_single_gene_MLIPPER.sh`
+
+Pull:
 
 ```bash
-./MLIPPER ... --commit-to-tree final_tree.nwk
+docker pull wenchiehlo/mlipper-roadies:20260504
 ```
 
-The default threshold is `1e-6`. To change or disable it:
+## Scripts
+
+### Per-gene wrapper
+
+`scripts/run_single_gene_MLIPPER.sh` is the thin per-gene wrapper.
+
+Example:
 
 ```bash
-./MLIPPER ... --commit-to-tree final_tree.nwk \
-  --commit-collapse-internal-epsilon 1e-5
-
-./MLIPPER ... --commit-to-tree final_tree.nwk \
-  --commit-collapse-internal-epsilon -1
+scripts/run_single_gene_MLIPPER.sh \
+  --ref-msa data/iter_2_placement_legal_bundle_787_compat/gene_1/iter0_output_msa_from_ref.fa \
+  --query-msa data/iter_2_placement_legal_bundle_787_compat/gene_1/iter0_output_msa_from_query.fa \
+  --backbone-tree data/iter_2_placement_legal_bundle_787_compat/gene_1/gene_1_filtered.fa.aln.raxml.bestTree \
+  --best-model data/iter_2_placement_legal_bundle_787_compat/gene_1/gene_1_filtered.fa.aln.raxml.bestModel \
+  --out-tree output/wrapper_smoke/out.nwk \
+  --gpu-id 0
 ```
 
-This only changes the emitted `.nwk` output. Internal placement, commit, and
-reinsert passes continue to use the uncollapsed binary tree.
+## Model Handling
 
-For the EPA-ng benchmark, use:
+`--best-model` is supported and is the preferred interface for this repo’s
+per-gene model path.
 
-```bash
-python3 scripts/epa_ng_testing.py
-python3 scripts/epa_ng_testing.py --datasets 1k 2k 5k
-```
+Current supported helper path:
 
-The first command runs the default 1k benchmark. The second runs all three
-bundled query sets.
+- DNA only
+- 4 states only
+- `GTR` only
 
-The script performs the following steps automatically:
+Current `--best-model` behavior:
 
-1. extracts `data/neotrop_runtime_dataset.tar.gz` if the required dataset files are missing
-2. uses the prebuilt `MLIPPER` binary if present; otherwise builds it with `make float`
-3. checks that `epa-ng` is available in the configured conda environment
-4. generates missing EPA-ng truth placements for the selected query sets
-5. runs MLIPPER in `baseline` and `fast` modes
-6. compares each MLIPPER result against the EPA-ng truth inside [`scripts/epa_ng_testing.py`](scripts/epa_ng_testing.py)
-7. prints a CLI summary table with runtime, top-1 accuracy, top-5 accuracy, and speedup relative to EPA-ng
+- overwrites `--states`
+- overwrites `--subst-model`
+- overwrites `--ncat`
+- overwrites `--alpha`
+- overwrites `--rates`
+- overwrites `--freqs` / `--empirical-freqs`
 
-Example output format:
+It does not currently overwrite:
 
-```text
-dataset  epa_ng_s     base_s       base_t1      base_t5      base_spd     fast_s       fast_t1      fast_t5      fast_spd
-1k       ...          ...          ...          ...          ...          ...          ...          ...          ...
-2k       ...          ...          ...          ...          ...          ...          ...          ...          ...
-5k       ...          ...          ...          ...          ...          ...          ...          ...          ...
-```
+- `--pinv`
+- `--rate-weights`
+- placement / output flags
 
-Column definitions:
+Empirical frequencies are estimated from `--tree-alignment`.
 
-- `epa_ng_s`: EPA-ng wall-clock runtime in seconds
-- `base_s`: MLIPPER baseline runtime in seconds
-- `base_t1`: baseline top-1 exact edge match accuracy
-- `base_t5`: baseline top-5 truth coverage accuracy
-- `base_spd`: baseline speedup relative to EPA-ng
-- `fast_s`: MLIPPER fast runtime in seconds
-- `fast_t1`: fast top-1 exact edge match accuracy
-- `fast_t5`: fast top-5 truth coverage accuracy
-- `fast_spd`: fast speedup relative to EPA-ng
+Current implementation details:
 
-## Output Locations
+- partially informative ambiguity codes are distributed across represented
+  states
+- `N`, `-`, `.`, and `?` are ignored for empirical frequency estimation
+- a tiny positive floor is applied if a state would otherwise receive zero
+  empirical mass
 
-- EPA-ng truth outputs:
-  - `output/runtime_benchmarks/epa_ng_reference/query_1k/`
-  - `output/runtime_benchmarks/epa_ng_reference/query_2k/`
-  - `output/runtime_benchmarks/epa_ng_reference/query_5k/`
-- MLIPPER benchmark outputs:
-  - `output/run_sh_benchmarks/query_1k/`
-  - `output/run_sh_benchmarks/query_2k/`
-  - `output/run_sh_benchmarks/query_5k/`
+`pinv` note:
 
-Each benchmark directory contains:
+- keep `pinv = 0.0` unless you have explicitly revalidated the nonzero path
 
-- the MLIPPER run log
-- the predicted `.jplace` file
-- the comparison log against EPA-ng
+## Test Inputs
 
-## Notes
+Simple test inputs exist in:
 
-- The first run can take significantly longer because EPA-ng truth generation is performed when the truth `.jplace` files do not already exist.
-- If you want to rerun the EPA-ng truth generation from scratch, remove the corresponding directory under `output/runtime_benchmarks/epa_ng_reference/`.
-- The benchmark is intended to be run inside the provided Docker image so the TA does not need to install additional dependencies manually.
+- `data/test/`
+- `data/iter_2_placement_legal_bundle_787_compat/gene_1/`
+
+The second path is the most convenient smoke-test gene because it already
+contains:
+
+- reference MSA
+- query MSA
+- backbone tree
+- `bestModel`
+
+## Current Limitations
+
+- the helper path currently assumes split reference/query alignments
+- the helper path currently assumes DNA `GTR`
+- amino-acid and non-GTR models are not supported in the current helper path
+- `MLIPPER` should be treated as one-visible-GPU per invocation
+- the ROADIES-focused image and wrapper are intended for per-gene execution
