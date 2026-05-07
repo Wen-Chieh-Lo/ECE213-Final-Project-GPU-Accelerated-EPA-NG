@@ -212,6 +212,12 @@ int main(int argc, char** argv) {
         app.add_option("--local-spr-rounds", local_spr_rounds,
                        "Run up to N rounds of local SPR, rebuilding between accepted rounds")
             ->group("Placement");
+    auto* opt_local_spr_dynamic_validation_conflicts =
+        app.add_flag(
+               "--local-spr-dynamic-validation-conflicts",
+               local_spr_dynamic_validation_conflicts,
+               "Validate local SPR candidates with dynamic conflict resolution instead of one-per-unit filtering")
+            ->group("Placement");
     try {
         app.parse(argc, argv);
     } catch (const CLI::ParseError& e) {

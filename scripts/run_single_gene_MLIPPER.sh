@@ -2,7 +2,9 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-DEFAULT_DOCKER_IMAGE="${MLIPPER_DOCKER_IMAGE:-wenchiehlo/mlipper-roadies:20260504}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DEFAULT_DOCKER_IMAGE="${MLIPPER_DOCKER_IMAGE:-wenchiehlo/mlipper-roadies:latest}"
 DEFAULT_GPU_ID="${MLIPPER_GPU_ID:-0}"
 
 usage() {
@@ -24,11 +26,13 @@ Required:
   --out-tree PATH             Output committed Newick tree
 
 Optional:
-  --docker-image IMAGE        Docker image to run
+  --docker-image IMAGE        Docker image to run (docker mode only)
                               Default: $DEFAULT_DOCKER_IMAGE
   --gpu-id INT                GPU id used when --docker-gpus is not provided
                               Default: $DEFAULT_GPU_ID
   --docker-gpus SPEC          Raw Docker --gpus value (overrides --gpu-id)
+  --no-docker                 Run local MLIPPER binary instead of Docker
+  --local-mlipper PATH        Local MLIPPER binary path (defaults to REPO_ROOT/MLIPPER)
   --local-spr                 Enable local SPR refinement
                               Default: enabled
   --no-local-spr              Disable local SPR refinement
@@ -43,6 +47,7 @@ Optional:
 Notes:
   - This wrapper owns the Docker invocation.
   - ROADIES should decide which GPU to pass in.
+  - In non-docker mode, setup_host.sh is used to fetch/check libpll requirements.
   - MLIPPER itself reads the bestModel file via --best-model.
 EOF
 }
@@ -109,6 +114,63 @@ quote_cmd() {
   printf '\n'
 }
 
+detect_pll_lib_dir() {
+  local multiarch=""
+  if command -v gcc >/dev/null 2>&1; then
+    multiarch="$(gcc -print-multiarch 2>/dev/null || true)"
+  fi
+  if [[ -z "$multiarch" ]] && command -v dpkg-architecture >/dev/null 2>&1; then
+    multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+  fi
+  if [[ -n "$multiarch" && -d "/usr/lib/$multiarch" ]]; then
+    echo "/usr/lib/$multiarch"
+    return
+  fi
+  echo "/usr/lib/x86_64-linux-gnu"
+}
+
+ensure_host_libs_or_install() {
+  local setup_script="$REPO_ROOT/install/setup_host.sh"
+  local force_build="$1"
+  local pll_inc_dir="/usr/include"
+  local pll_lib_dir
+  local have_header=0
+  local have_lib=0
+  pll_lib_dir="$(detect_pll_lib_dir)"
+
+  if [[ -f "$pll_inc_dir/libpll/pll.h" ]]; then
+    have_header=1
+  fi
+  if [[ -e "$pll_lib_dir/libpll.so" || -e "$pll_lib_dir/libpll.a" || -e "$pll_lib_dir/libpll.so.0" ]]; then
+    have_lib=1
+  fi
+
+  if [[ "$have_header" -eq 1 && "$have_lib" -eq 1 && "$force_build" -eq 0 ]]; then
+    return
+  fi
+
+  if [[ "$force_build" -eq 1 && -x "$local_mlipper" ]]; then
+    return
+  fi
+
+  if [[ ! -x "$setup_script" ]]; then
+    die "missing or non-executable: $setup_script"
+  fi
+
+  echo "Auto-fixing host dependencies via setup_host.sh" >&2
+  if [[ "$force_build" -eq 1 ]]; then
+    bash "$setup_script"
+  else
+    bash "$setup_script" --skip-mlipper
+  fi
+}
+
+ensure_local_binary() {
+  if [[ ! -x "$local_mlipper" ]]; then
+    die "local MLIPPER binary missing or not executable: $local_mlipper"
+  fi
+}
+
 ref_msa=""
 query_msa=""
 backbone_tree=""
@@ -117,6 +179,8 @@ out_tree=""
 docker_image="$DEFAULT_DOCKER_IMAGE"
 gpu_id="$DEFAULT_GPU_ID"
 docker_gpus=""
+local_mlipper="$REPO_ROOT/MLIPPER"
+use_docker=1
 local_spr=1
 batch_size=5
 local_spr_radius=4
@@ -154,6 +218,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --docker-gpus)
       docker_gpus="${2:-}"
+      shift 2
+      ;;
+    --no-docker)
+      use_docker=0
+      shift
+      ;;
+    --local-mlipper)
+      local_mlipper="${2:-}"
       shift 2
       ;;
     --local-spr)
@@ -210,25 +282,45 @@ backbone_tree="$(abs_existing_path "$backbone_tree")"
 best_model="$(abs_existing_path "$best_model")"
 out_tree="$(abs_target_path "$out_tree")"
 
-common_root="$(common_root_for_paths "$ref_msa" "$query_msa" "$backbone_tree" "$best_model" "$out_tree")"
-ref_msa_in_container="$(containerize_path "$ref_msa" "$common_root")"
-query_msa_in_container="$(containerize_path "$query_msa" "$common_root")"
-backbone_tree_in_container="$(containerize_path "$backbone_tree" "$common_root")"
-best_model_in_container="$(containerize_path "$best_model" "$common_root")"
-out_tree_in_container="$(containerize_path "$out_tree" "$common_root")"
+if [[ "$use_docker" -eq 1 ]]; then
+  gpu_spec="$docker_gpus"
+  if [[ -z "$gpu_spec" ]]; then
+    gpu_spec="device=$gpu_id"
+  fi
 
-gpu_spec="$docker_gpus"
-if [[ -z "$gpu_spec" ]]; then
-  gpu_spec="device=$gpu_id"
+  common_root="$(common_root_for_paths "$ref_msa" "$query_msa" "$backbone_tree" "$best_model" "$out_tree")"
+  ref_msa_in_container="$(containerize_path "$ref_msa" "$common_root")"
+  query_msa_in_container="$(containerize_path "$query_msa" "$common_root")"
+  backbone_tree_in_container="$(containerize_path "$backbone_tree" "$common_root")"
+  best_model_in_container="$(containerize_path "$best_model" "$common_root")"
+  out_tree_in_container="$(containerize_path "$out_tree" "$common_root")"
+else
+  local_mlipper="$(abs_target_path "$local_mlipper")"
+  if [[ -x "$local_mlipper" ]]; then
+    ensure_host_libs_or_install 0
+  else
+    ensure_host_libs_or_install 1
+  fi
+  ensure_local_binary
 fi
 
-mlipper_args=(
-  --tree-alignment "$ref_msa_in_container"
-  --query-alignment "$query_msa_in_container"
-  --tree "$backbone_tree_in_container"
-  --best-model "$best_model_in_container"
-  --commit-to-tree "$out_tree_in_container"
-)
+if [[ "$use_docker" -eq 1 ]]; then
+  mlipper_args=(
+    --tree-alignment "$ref_msa_in_container"
+    --query-alignment "$query_msa_in_container"
+    --tree "$backbone_tree_in_container"
+    --best-model "$best_model_in_container"
+    --commit-to-tree "$out_tree_in_container"
+  )
+else
+  mlipper_args=(
+    --tree-alignment "$ref_msa"
+    --query-alignment "$query_msa"
+    --tree "$backbone_tree"
+    --best-model "$best_model"
+    --commit-to-tree "$out_tree"
+  )
+fi
 
 if [[ "$local_spr" -eq 1 ]]; then
   mlipper_args+=(
@@ -239,16 +331,26 @@ if [[ "$local_spr" -eq 1 ]]; then
   )
 fi
 
-docker_cmd=(
-  docker run --rm
-  --gpus "$gpu_spec"
-  --user "$(id -u):$(id -g)"
-  -v "$common_root:/workspace/job"
-  -w /workspace/job
-  --entrypoint /workspace/MLIPPER/MLIPPER
-  "$docker_image"
-)
-docker_cmd+=("${mlipper_args[@]}")
+if [[ "$use_docker" -eq 1 ]]; then
+  docker_cmd=(
+    docker run --rm
+    --gpus "$gpu_spec"
+    --user "$(id -u):$(id -g)"
+    -v "$common_root:/workspace/job"
+    -w /workspace/job
+    --entrypoint /workspace/MLIPPER/MLIPPER
+    "$docker_image"
+  )
+  docker_cmd+=("${mlipper_args[@]}")
+else
+  local_cmd=("$local_mlipper")
+  local_cmd+=("${mlipper_args[@]}")
+fi
 
-echo "CMD: $(quote_cmd "${docker_cmd[@]}")" >&2
-"${docker_cmd[@]}"
+if [[ "$use_docker" -eq 1 ]]; then
+  echo "CMD: $(quote_cmd "${docker_cmd[@]}")" >&2
+  "${docker_cmd[@]}"
+else
+  echo "CMD: $(quote_cmd "${local_cmd[@]}")" >&2
+  "${local_cmd[@]}"
+fi

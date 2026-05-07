@@ -36,6 +36,26 @@ Other important directories:
 
 ## Build
 
+Host setup helper:
+
+```bash
+install/setup_host.sh
+```
+
+What it does:
+
+- installs the same apt build dependencies used by `docker/Dockerfile.roadies`
+- installs distro package `libpll-dev`
+- builds `MLIPPER` locally with `USE_DOUBLE=1`
+
+Important:
+
+- this helper assumes an apt-based Linux host
+- this helper does not install CUDA for you
+- `nvcc` must already exist on the machine before running it
+- this helper is meant to mirror the ROADIES-focused build path, not the full Docker image
+- default build assumes distro `libpll-dev` headers under `/usr/include` and libraries under `/usr/lib/<multiarch>`
+
 Local build:
 
 ```bash
@@ -45,11 +65,19 @@ make -j4 MLIPPER
 
 Important current build identity:
 
-- local `Makefile` default: double precision
-- main Docker image build: float precision
+- standard builds use double precision
+- local `Makefile` default: `USE_DOUBLE=1`
+- `install/setup_host.sh` builds with `USE_DOUBLE=1`
 
-Do not assume the host binary and container binary are identical unless you
-verify that explicitly.
+For the ROADIES-oriented host workflow, always rebuild the host binary before
+running with `--no-docker`. Do not rely on an existing `MLIPPER` binary, because
+it may have been built from older source or with a different precision setting.
+Use a clean double build every time:
+
+```bash
+make clean
+make -j4 USE_DOUBLE=1 MLIPPER
+```
 
 ## Main CLI
 
@@ -88,6 +116,8 @@ Build:
 docker build -f docker/Dockerfile -t wenchiehlo/mlipper:20260504 .
 ```
 
+This Dockerfile now installs distro package `libpll-dev` during build.
+
 Use this when you want:
 
 - a larger development image
@@ -100,6 +130,8 @@ Build:
 ```bash
 docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:20260504 .
 ```
+
+This Dockerfile now installs distro packages `libpll-dev` and `libpll0`.
 
 Use this when you want:
 
@@ -119,6 +151,8 @@ docker pull wenchiehlo/mlipper-roadies:20260504
 
 `scripts/run_single_gene_MLIPPER.sh` is the thin per-gene wrapper.
 
+By default it runs MLIPPER inside Docker (`wenchiehlo/mlipper-roadies:latest`), but it also supports host execution.
+
 Example:
 
 ```bash
@@ -129,6 +163,30 @@ scripts/run_single_gene_MLIPPER.sh \
   --best-model data/iter_2_placement_legal_bundle_787_compat/gene_1/gene_1_filtered.fa.aln.raxml.bestModel \
   --out-tree output/wrapper_smoke/out.nwk \
   --gpu-id 0
+```
+
+Run on host (no Docker):
+
+```bash
+scripts/run_single_gene_MLIPPER.sh \
+  --no-docker \
+  --ref-msa data/iter_2_placement_legal_bundle_787_compat/gene_1/iter0_output_msa_from_ref.fa \
+  --query-msa data/iter_2_placement_legal_bundle_787_compat/gene_1/iter0_output_msa_from_query.fa \
+  --backbone-tree data/iter_2_placement_legal_bundle_787_compat/gene_1/gene_1_filtered.fa.aln.raxml.bestTree \
+  --best-model data/iter_2_placement_legal_bundle_787_compat/gene_1/gene_1_filtered.fa.aln.raxml.bestModel \
+  --out-tree output/wrapper_smoke/out.nwk
+```
+
+In host mode, the wrapper:
+
+- checks for required `libpll` headers/libraries
+- if missing, runs `install/setup_host.sh --skip-mlipper` to install dependencies
+- if the local MLIPPER binary is missing, runs `install/setup_host.sh` to build it
+
+Use a custom local binary path with:
+
+```bash
+scripts/run_single_gene_MLIPPER.sh --no-docker --local-mlipper /path/to/MLIPPER ...
 ```
 
 ## Model Handling

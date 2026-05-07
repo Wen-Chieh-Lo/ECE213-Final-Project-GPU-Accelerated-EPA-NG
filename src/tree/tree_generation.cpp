@@ -4,6 +4,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <type_traits>
 #include <stdexcept>
@@ -100,14 +101,254 @@ static void dump_eigendecomp_once(const std::vector<double>& q_rowmajor,
     dump_matrix_rows("MLIPPER-EIGEN", "Vinv", eigen.Vinv, states);
 }
 
-template <typename>
-struct pll_gamma_cats_traits;
+constexpr double kGammaAlphaMin = 0.02;
+constexpr double kGammaLn2 = 0.693147180559945309417232121458176568;
 
-template <typename Ret, typename Alpha, typename Count, typename OutputPtr, typename Mode>
-struct pll_gamma_cats_traits<Ret (*)(Alpha, Count, OutputPtr, Mode)> {
-    using alpha_type = Alpha;
-    using output_type = std::remove_pointer_t<OutputPtr>;
-};
+static bool incomplete_gamma_ratio_stable(
+    double x,
+    double alpha,
+    double ln_gamma_alpha,
+    double* result)
+{
+    if (result == nullptr) return false;
+    if (x == 0.0) {
+        *result = 0.0;
+        return true;
+    }
+    if (!(x >= 0.0) || !(alpha > 0.0)) return false;
+
+    constexpr double accurate = 1e-12;
+    constexpr double overflow = 1e100;
+    constexpr int max_iter = 100000;
+
+    const double factor = std::exp(alpha * std::log(x) - x - ln_gamma_alpha);
+    if (!std::isfinite(factor)) return false;
+
+    if (!(x > 1.0 && x >= alpha)) {
+        double gin = 1.0;
+        double term = 1.0;
+        double rn = alpha;
+        for (int iter = 0; iter < max_iter; ++iter) {
+            rn += 1.0;
+            term *= x / rn;
+            gin += term;
+            if (std::fabs(term) <= accurate) {
+                *result = gin * factor / alpha;
+                return std::isfinite(*result);
+            }
+        }
+        return false;
+    }
+
+    double a = 1.0 - alpha;
+    double b = a + x + 1.0;
+    double term = 0.0;
+    double pn[6] = {1.0, x, x + 1.0, x * b, 0.0, 0.0};
+    double gin = pn[2] / pn[3];
+    if (!std::isfinite(gin)) return false;
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        a += 1.0;
+        b += 2.0;
+        term += 1.0;
+        const double an = a * term;
+        pn[4] = b * pn[2] - an * pn[0];
+        pn[5] = b * pn[3] - an * pn[1];
+        if (pn[5] != 0.0) {
+            const double rn = pn[4] / pn[5];
+            const double dif = std::fabs(gin - rn);
+            gin = rn;
+            if (!std::isfinite(gin)) return false;
+            if (dif <= accurate * std::max(1.0, std::fabs(rn))) {
+                *result = 1.0 - factor * gin;
+                return std::isfinite(*result);
+            }
+        }
+
+        pn[0] = pn[2];
+        pn[1] = pn[3];
+        pn[2] = pn[4];
+        pn[3] = pn[5];
+
+        if (std::fabs(pn[4]) >= overflow) {
+            pn[0] /= overflow;
+            pn[1] /= overflow;
+            pn[2] /= overflow;
+            pn[3] /= overflow;
+        }
+    }
+
+    return false;
+}
+
+static bool point_normal_stable(double prob, double* result) {
+    if (result == nullptr) return false;
+    constexpr double a0 = -0.322232431088;
+    constexpr double a1 = -1.0;
+    constexpr double a2 = -0.342242088547;
+    constexpr double a3 = -0.0204231210245;
+    constexpr double a4 = -0.453642210148e-4;
+    constexpr double b0 = 0.0993484626060;
+    constexpr double b1 = 0.588581570495;
+    constexpr double b2 = 0.531103462366;
+    constexpr double b3 = 0.103537752850;
+    constexpr double b4 = 0.0038560700634;
+
+    const double p1 = (prob < 0.5 ? prob : 1.0 - prob);
+    if (!(p1 > 1e-20 && p1 < 1.0)) return false;
+
+    const double y = std::sqrt(std::log(1.0 / (p1 * p1)));
+    const double z =
+        y + ((((y * a4 + a3) * y + a2) * y + a1) * y + a0) /
+                ((((y * b4 + b3) * y + b2) * y + b1) * y + b0);
+    *result = (prob < 0.5 ? -z : z);
+    return std::isfinite(*result);
+}
+
+static bool point_chi2_stable(double prob, double v, double* result) {
+    if (result == nullptr) return false;
+    constexpr double e = 0.5e-6;
+    constexpr int max_iter = 100000;
+
+    if (!(prob >= 0.000002 && prob <= 0.999998) || !(v > 0.0)) {
+        return false;
+    }
+
+    const double xx = v / 2.0;
+    const double c = xx - 1.0;
+    const double g = std::lgamma(xx);
+    double ch = 0.0;
+
+    if (v < -1.24 * std::log(prob)) {
+        ch = std::pow(prob * xx * std::exp(g + xx * kGammaLn2), 1.0 / xx);
+        if (ch - e < 0.0) {
+            *result = ch;
+            return std::isfinite(*result);
+        }
+    } else if (v <= 0.32) {
+        ch = 0.4;
+        const double a = std::log(1.0 - prob);
+        bool converged = false;
+        for (int iter = 0; iter < max_iter; ++iter) {
+            const double q = ch;
+            const double p1 = 1.0 + ch * (4.67 + ch);
+            const double p2 = ch * (6.73 + ch * (6.66 + ch));
+            const double t =
+                -0.5 +
+                (4.67 + 2.0 * ch) / p1 -
+                (6.73 + ch * (13.32 + 3.0 * ch)) / p2;
+            ch -= (1.0 - std::exp(a + g + 0.5 * ch + c * kGammaLn2) * p2 / p1) / t;
+            if (!std::isfinite(ch) || ch <= 0.0) return false;
+            if (std::fabs(q / ch - 1.0) <= 0.01) {
+                converged = true;
+                break;
+            }
+        }
+        if (!converged) return false;
+    } else {
+        double x = 0.0;
+        if (!point_normal_stable(prob, &x)) return false;
+        const double p1 = 0.222222 / v;
+        ch = v * std::pow(x * std::sqrt(p1) + 1.0 - p1, 3.0);
+        if (ch > 2.2 * v + 6.0) {
+            ch = -2.0 * (std::log(1.0 - prob) - c * std::log(0.5 * ch) + g);
+        }
+    }
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        const double q = ch;
+        const double p1 = 0.5 * ch;
+        double t = 0.0;
+        if (!incomplete_gamma_ratio_stable(p1, xx, g, &t)) return false;
+        const double p2 = prob - t;
+        t = p2 * std::exp(xx * kGammaLn2 + g + p1 - c * std::log(ch));
+        const double b = t / ch;
+        const double a = 0.5 * t - b * c;
+
+        const double s1 =
+            (210.0 + a * (140.0 + a * (105.0 + a * (84.0 + a * (70.0 + 60.0 * a))))) /
+            420.0;
+        const double s2 =
+            (420.0 + a * (735.0 + a * (966.0 + a * (1141.0 + 1278.0 * a)))) /
+            2520.0;
+        const double s3 =
+            (210.0 + a * (462.0 + a * (707.0 + 932.0 * a))) / 2520.0;
+        const double s4 =
+            (252.0 + a * (672.0 + 1182.0 * a) + c * (294.0 + a * (889.0 + 1740.0 * a))) /
+            5040.0;
+        const double s5 =
+            (84.0 + 264.0 * a + c * (175.0 + 606.0 * a)) / 2520.0;
+        const double s6 =
+            (120.0 + c * (346.0 + 127.0 * c)) / 5040.0;
+
+        ch += t * (1.0 + 0.5 * t * s1 -
+                   b * c * (s1 - b * (s2 - b * (s3 - b * (s4 - b * (s5 - b * s6))))));
+        if (!std::isfinite(ch) || ch <= 0.0) return false;
+        if (std::fabs(q / ch - 1.0) <= e) {
+            *result = ch;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool compute_gamma_rate_categories_stable(
+    double alpha,
+    int rate_cats,
+    std::vector<double>* rates_out)
+{
+    if (rates_out == nullptr) return false;
+    if (rate_cats <= 0) {
+        rates_out->clear();
+        return true;
+    }
+    rates_out->assign((size_t)rate_cats, 1.0);
+    if (rate_cats == 1) return true;
+    if (!(alpha >= kGammaAlphaMin)) return false;
+
+    const double beta = alpha;
+    const double factor = static_cast<double>(rate_cats);
+    const double lnga1 = std::lgamma(alpha + 1.0);
+    std::vector<double> gamma_probs((size_t)rate_cats - 1, 0.0);
+
+    for (int idx = 0; idx < rate_cats - 1; ++idx) {
+        double chi2 = 0.0;
+        const double prob = static_cast<double>(idx + 1) / static_cast<double>(rate_cats);
+        if (!point_chi2_stable(prob, 2.0 * alpha, &chi2)) return false;
+        gamma_probs[(size_t)idx] = chi2 / (2.0 * beta);
+    }
+
+    for (int idx = 0; idx < rate_cats - 1; ++idx) {
+        double gamma_ratio = 0.0;
+        if (!incomplete_gamma_ratio_stable(
+                gamma_probs[(size_t)idx] * beta,
+                alpha + 1.0,
+                lnga1,
+                &gamma_ratio)) {
+            return false;
+        }
+        gamma_probs[(size_t)idx] = gamma_ratio;
+    }
+
+    (*rates_out)[0] = gamma_probs[0] * factor;
+    (*rates_out)[(size_t)rate_cats - 1] =
+        (1.0 - gamma_probs[(size_t)rate_cats - 2]) * factor;
+    for (int idx = 1; idx < rate_cats - 1; ++idx) {
+        (*rates_out)[(size_t)idx] =
+            (gamma_probs[(size_t)idx] - gamma_probs[(size_t)idx - 1]) * factor;
+    }
+
+    double sum = 0.0;
+    for (double rate : *rates_out) {
+        if (!std::isfinite(rate) || !(rate > 0.0)) return false;
+        sum += rate;
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) return false;
+    const double mean_scale = static_cast<double>(rate_cats) / sum;
+    for (double& rate : *rates_out) rate *= mean_scale;
+    return true;
+}
 
 std::vector<double> build_mixture_weights(const parse::ModelConfig& model, int rate_cats) {
     std::vector<double> weights;
@@ -135,23 +376,10 @@ std::vector<double> build_mixture_weights(const parse::ModelConfig& model, int r
 std::vector<double> build_gamma_rate_categories(double alpha, int rate_cats) {
     std::vector<double> rates(rate_cats, 1.0);
     if (rate_cats <= 1 || alpha <= 0.0) return rates;
-
-    using gamma_traits = pll_gamma_cats_traits<decltype(&pll_compute_gamma_cats)>;
-    using gamma_alpha_t = typename gamma_traits::alpha_type;
-    using gamma_output_t = typename gamma_traits::output_type;
-
-    std::vector<gamma_output_t> gamma_tmp(rate_cats);
-    const int status = pll_compute_gamma_cats(
-        static_cast<gamma_alpha_t>(alpha),
-        static_cast<unsigned int>(rate_cats),
-        gamma_tmp.data(),
-        PLL_GAMMA_RATES_MEAN);
-    if (status != PLL_SUCCESS) {
-        throw std::runtime_error("pll_compute_gamma_cats failed.");
-    }
-
-    for (int rate_idx = 0; rate_idx < rate_cats; ++rate_idx) {
-        rates[rate_idx] = gamma_tmp[rate_idx];
+    if (!compute_gamma_rate_categories_stable(alpha, rate_cats, &rates)) {
+        throw std::runtime_error(
+            "gamma rate-category computation failed to converge for alpha=" +
+            std::to_string(alpha));
     }
     return rates;
 }

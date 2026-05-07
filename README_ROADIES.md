@@ -22,12 +22,24 @@ The intended Docker image for that wrapper is:
 ROADIES does not need to call the `MLIPPER` binary directly unless you want to
 debug the wrapper.
 
-This setup is currently validated on `peregrine`, where MLIPPER uses its own
-bundled `libpll`. Please use this on `peregrine`.
+There are two supported execution modes:
+
+- Docker mode
+  This is the default. ROADIES runs `scripts/run_single_gene_MLIPPER.sh`, the
+  wrapper starts the Docker image, and the MLIPPER binary comes from inside the
+  image.
+
+- Host mode
+  ROADIES passes `--no-docker`. The wrapper runs a local `MLIPPER` binary from
+  the host and uses `install/setup_host.sh` to install/check host dependencies
+  when needed.
+
+This setup is currently validated on `peregrine`, where MLIPPER links against
+the distro-packaged `libpll`. Please use this on `peregrine`.
 
 ## Architecture
 
-The current architecture has four layers:
+The Docker-mode architecture has four layers:
 
 1. `ROADIES`
    ROADIES prepares one gene’s files and decides which GPU to use.
@@ -41,10 +53,8 @@ The current architecture has four layers:
    This image provides the runtime environment and the compiled `MLIPPER`
    binary.
 
-   It also bundles the vendored `lib/libpll-2_fp32` fork from this repo. For
-   the current ROADIES setup, that fork is the intended `libpll`
-   implementation; the image is not meant to swap in an upstream `libpll` at
-   runtime.
+   During the image build, it installs distro package `libpll-dev` and links
+   MLIPPER against that installed library.
 
 4. `MLIPPER`
    The binary reads the reference MSA, query MSA, backbone tree, and bestModel
@@ -56,6 +66,16 @@ In other words, ROADIES should think of MLIPPER as:
 - one per-gene output tree
 
 not as a larger batch orchestration system.
+
+The host-mode architecture replaces the Docker image layer with:
+
+- `install/setup_host.sh`
+  Installs host build/runtime dependencies and builds `MLIPPER` locally with
+  `USE_DOUBLE=1`.
+
+- host `MLIPPER`
+  The wrapper runs the local binary directly. By default this is
+  `REPO_ROOT/MLIPPER`, or the path passed via `--local-mlipper`.
 
 ## Input Contract
 
@@ -138,6 +158,8 @@ Optional wrapper arguments:
 - `--docker-image`
 - `--gpu-id`
 - `--docker-gpus`
+- `--no-docker`
+- `--local-mlipper`
 - `--local-spr`
 - `--no-local-spr`
 - `--batch-size`
@@ -156,6 +178,13 @@ Optional argument meanings:
 - `--docker-gpus`
   Raw Docker `--gpus` specification. This overrides `--gpu-id`.
 
+- `--no-docker`
+  Run host `MLIPPER` directly instead of Docker.
+
+- `--local-mlipper`
+  Override the local `MLIPPER` binary path used with `--no-docker`. The default
+  is `REPO_ROOT/MLIPPER`.
+
 - `--local-spr`
   Enable local SPR refinement after query commitment.
 
@@ -173,8 +202,27 @@ Optional argument meanings:
 
 ## What The Wrapper Actually Runs
 
-Internally, the wrapper runs Docker and then launches `MLIPPER` inside the
-container.
+In Docker mode, the wrapper runs Docker and launches image-internal `MLIPPER` at:
+
+- `/workspace/MLIPPER/MLIPPER`
+
+The wrapper mounts the input/output path root into `/workspace/job`. It does not
+mount the host repo over `/workspace/MLIPPER`, so the binary comes from the
+Docker image.
+
+In host mode, the wrapper runs the local binary directly:
+
+- default: `REPO_ROOT/MLIPPER`
+- override: `--local-mlipper PATH`
+
+Before host execution, the wrapper checks whether host `libpll` headers and
+libraries are available. If they are missing, it calls:
+
+- `install/setup_host.sh --skip-mlipper`
+
+If the local binary is missing, it calls:
+
+- `install/setup_host.sh`
 
 At minimum, it forwards these MLIPPER arguments:
 
@@ -191,7 +239,7 @@ If local SPR is enabled, it also forwards:
 - `--local-spr-radius`
 - `--local-spr-rounds`
 
-The wrapper also does two operational things for ROADIES:
+In Docker mode, the wrapper also does two operational things for ROADIES:
 
 - it converts host paths into container paths
 - it owns the Docker GPU selection
@@ -203,13 +251,16 @@ GPU ownership should stay outside the MLIPPER binary.
 The intended split is:
 
 - ROADIES decides which GPU to use
-- the wrapper translates that into Docker `--gpus`
-- MLIPPER runs inside that already-restricted container
+- in Docker mode, the wrapper translates that into Docker `--gpus`
+- in host mode, ROADIES should restrict visible GPUs before calling the wrapper,
+  for example with `CUDA_VISIBLE_DEVICES`
+- MLIPPER runs inside the already-restricted GPU environment
 
 Recommended usage:
 
 - one MLIPPER invocation sees one GPU
-- ROADIES passes either `--gpu-id N` or `--docker-gpus ...`
+- Docker mode: ROADIES passes either `--gpu-id N` or `--docker-gpus ...`
+- host mode: ROADIES sets `CUDA_VISIBLE_DEVICES=N` and passes `--no-docker`
 
 MLIPPER itself does not expose a public `--gpu-id` flag.
 
@@ -259,13 +310,35 @@ Current behavior:
 
 ## How To Use
 
-### 1. Pull the image
+### Docker mode
+
+This is the default mode. Use it when ROADIES should run the binary packaged in
+the Docker image.
+
+#### 1. Pull or build the image
 
 ```bash
 docker pull wenchiehlo/mlipper-roadies:20260504
 ```
 
-### 2. Run one gene
+Or build it from this repo:
+
+```bash
+docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:20260504 .
+```
+
+During image build, Docker does the setup work:
+
+- builder stage installs compile-time dependencies such as `build-essential`,
+  `libpll-dev`, `libblas-dev`, `liblapack-dev`, and `libtbb-dev`
+- builder stage runs `make clean && make USE_DOUBLE=1 MLIPPER`
+- runtime stage installs runtime libraries such as `libpll0`, `libblas3`,
+  `liblapack3`, and `libtbb12`
+- runtime stage copies the compiled binary into `/workspace/MLIPPER/MLIPPER`
+
+`install/setup_host.sh` is not used in Docker mode.
+
+#### 2. Run one gene
 
 ```bash
 scripts/run_single_gene_MLIPPER.sh \
@@ -277,23 +350,88 @@ scripts/run_single_gene_MLIPPER.sh \
   --gpu-id 0
 ```
 
-### 3. Consume the output
+#### 3. Consume the output
 
 ROADIES should use the tree written to:
 
 - `GENE/mlipper_gene_tree.nwk`
 
 or whatever path was passed as `--out-tree`.
-Example:
+
+Expected success criteria:
+
+- exit code `0`
+- non-empty output Newick tree
+
+### Host mode
+
+Use host mode when ROADIES should run a local host `MLIPPER` binary instead of a
+Docker image.
+
+#### 1. Prepare the host
+
+Recommended explicit setup:
+
+```bash
+install/setup_host.sh
+```
+
+What `setup_host.sh` does:
+
+- installs apt build dependencies used by the host build path
+- installs distro package `libpll-dev`
+- detects CUDA via `CUDA_HOME`, `nvcc`, or common CUDA install paths
+- detects the distro `libpll` library directory
+- runs `make clean`
+- builds `MLIPPER` with `USE_DOUBLE=1`
+
+What `setup_host.sh` does not do:
+
+- it does not install the CUDA toolkit
+- it does not schedule GPUs
+- it does not run a gene
+
+If only host dependencies are needed and the local binary should not be rebuilt:
+
+```bash
+install/setup_host.sh --skip-mlipper
+```
+
+#### 2. Run one gene without Docker
 
 ```bash
 scripts/run_single_gene_MLIPPER.sh \
+  --no-docker \
   --ref-msa GENE/ref.fa \
   --query-msa GENE/query.fa \
   --backbone-tree GENE/backbone.nwk \
   --best-model GENE/gene.raxml.bestModel \
-  --out-tree GENE/mlipper_gene_tree.nwk \
-  --gpu-id 0
+  --out-tree GENE/mlipper_gene_tree.nwk
+```
+
+With explicit GPU restriction:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 scripts/run_single_gene_MLIPPER.sh \
+  --no-docker \
+  --ref-msa GENE/ref.fa \
+  --query-msa GENE/query.fa \
+  --backbone-tree GENE/backbone.nwk \
+  --best-model GENE/gene.raxml.bestModel \
+  --out-tree GENE/mlipper_gene_tree.nwk
+```
+
+With a custom local binary:
+
+```bash
+scripts/run_single_gene_MLIPPER.sh \
+  --no-docker \
+  --local-mlipper /path/to/MLIPPER \
+  --ref-msa GENE/ref.fa \
+  --query-msa GENE/query.fa \
+  --backbone-tree GENE/backbone.nwk \
+  --best-model GENE/gene.raxml.bestModel \
+  --out-tree GENE/mlipper_gene_tree.nwk
 ```
 
 Expected success criteria:
@@ -311,8 +449,12 @@ Expected success criteria:
   path is explicitly revalidated
 - MLIPPER should currently be treated as one-visible-GPU per invocation; GPU
   scheduling must be done by ROADIES or the wrapper layer
-- the current ROADIES image depends on the vendored `libpll-2_fp32` fork in
-  this repo, not an upstream `libpll` release
+- the current ROADIES image depends on distro packages `libpll-dev` and
+  `libpll0`; if the host distribution or package version changes, the image
+  should be re-smoke-tested
+- host mode requires a working host CUDA toolkit with `nvcc`; `setup_host.sh`
+  does not install CUDA
+- host mode may need root or `sudo` privileges for apt dependency installation
 - the current ROADIES setup is validated on `peregrine`; if ROADIES is moved
   to a different host environment, the image should be re-smoke-tested there
 - the ROADIES image and wrapper are intended for per-gene execution

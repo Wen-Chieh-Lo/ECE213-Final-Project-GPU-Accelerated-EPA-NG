@@ -5,8 +5,8 @@ SHELL ["/bin/bash", "-lc"]
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDA_HOME=/usr/local/cuda
 ENV CONDA_PREFIX=/usr/local
-ENV PLL_INC_DIR=/usr/local/include
-ENV PLL_LIB_DIR=/usr/local/lib
+ENV PLL_INC_DIR=/usr/include
+ENV PLL_LIB_DIR=/usr/lib/x86_64-linux-gnu
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/lib:${LD_LIBRARY_PATH}
 
 WORKDIR /workspace/MLIPPER
@@ -15,20 +15,13 @@ RUN success=0; \
     for attempt in 1 2 3 4 5; do \
       if apt-get update && \
       apt-get install -y --no-install-recommends \
-    autoconf \
-    automake \
-    bison \
     build-essential \
     ca-certificates \
-    flex \
-    git \
     libblas-dev \
     liblapack-dev \
+    libpll-dev \
     libtbb-dev \
-    libtool \
-    pkg-config \
-    python3 \
-    wget; then \
+    python3; then \
       rm -rf /var/lib/apt/lists/*; \
       success=1; \
       break; \
@@ -39,20 +32,9 @@ RUN success=0; \
     done; \
     test "$success" = 1
 
-COPY lib/libpll-2_fp32 /tmp/libpll
-
-RUN cd /tmp/libpll \
-    && if [[ -x ./autogen.sh ]]; then ./autogen.sh; else autoreconf -fi; fi \
-    && ./configure --prefix=/usr/local \
-    && make -j1 \
-    && make install \
-    && rm -rf /tmp/libpll \
-    && ldconfig
-
 COPY . /workspace/MLIPPER
 
-RUN make clean \
-    && make USE_DOUBLE=0 MLIPPER
+RUN make clean && make USE_DOUBLE=1 MLIPPER
 
 
 FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
@@ -73,6 +55,7 @@ RUN success=0; \
     libblas3 \
     libgfortran5 \
     liblapack3 \
+    libpll0 \
     libquadmath0 \
     libtbb12; then \
       rm -rf /var/lib/apt/lists/*; \
@@ -85,10 +68,7 @@ RUN success=0; \
     done; \
     test "$success" = 1
 
-COPY --from=builder /usr/local/lib/libpll.so* /usr/local/lib/
 COPY --from=builder /workspace/MLIPPER/MLIPPER /workspace/MLIPPER/MLIPPER
-
-RUN ldconfig
 
 ENTRYPOINT ["/workspace/MLIPPER/MLIPPER"]
 CMD ["--help"]

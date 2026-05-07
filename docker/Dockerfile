@@ -7,8 +7,8 @@ ENV CUDA_HOME=/usr/local/cuda
 ENV CONDA_DIR=/opt/conda
 ENV CONDA_PREFIX=/opt/conda
 ENV PATH=/opt/conda/bin:/usr/local/cuda/bin:${PATH}
-ENV PLL_INC_DIR=/usr/local/include
-ENV PLL_LIB_DIR=/usr/local/lib
+ENV PLL_INC_DIR=/usr/include
+ENV PLL_LIB_DIR=/usr/lib/x86_64-linux-gnu
 ENV EPA_NG_ENV=base
 ENV RAXML_NG_ENV=base
 # Add CUDA and /usr/local shared libraries to the runtime search path.
@@ -31,6 +31,7 @@ RUN success=0; \
     git \
     libblas-dev \
     liblapack-dev \
+    libpll-dev \
     libtbb-dev \
     libtool \
     pkg-config \
@@ -60,18 +61,8 @@ RUN wget -qO /tmp/miniconda.sh \
     && conda run -n base astral-pro3 --help >/dev/null \
     && conda clean -afy
 
-COPY lib/libpll-2_fp32 /tmp/libpll
-
-RUN cd /tmp/libpll \
-    && if [[ -x ./autogen.sh ]]; then ./autogen.sh; else autoreconf -fi; fi \
-    && ./configure --prefix=/usr/local \
-    && make -j1 \
-    && make install \
-    && rm -rf /tmp/libpll \
-    && ldconfig
-
 COPY . /workspace/MLIPPER
 
-RUN make float
+RUN make USE_DOUBLE=1 MLIPPER
 
 CMD ["/bin/bash"]
