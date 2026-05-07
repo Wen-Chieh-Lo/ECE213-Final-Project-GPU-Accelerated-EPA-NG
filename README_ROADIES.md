@@ -17,7 +17,7 @@ For ROADIES, the intended entrypoint is:
 
 The intended Docker image for that wrapper is:
 
-- `wenchiehlo/mlipper-roadies:20260504`
+- `wenchiehlo/mlipper-roadies:20260507`
 
 ROADIES does not need to call the `MLIPPER` binary directly unless you want to
 debug the wrapper.
@@ -49,12 +49,9 @@ The Docker-mode architecture has four layers:
    container, sets Docker GPU options, and translates the per-gene contract
    into one MLIPPER invocation.
 
-3. `wenchiehlo/mlipper-roadies:20260504`
+3. `wenchiehlo/mlipper-roadies:20260507`
    This image provides the runtime environment and the compiled `MLIPPER`
    binary.
-
-   During the image build, it installs distro package `libpll-dev` and links
-   MLIPPER against that installed library.
 
 4. `MLIPPER`
    The binary reads the reference MSA, query MSA, backbone tree, and bestModel
@@ -70,8 +67,7 @@ not as a larger batch orchestration system.
 The host-mode architecture replaces the Docker image layer with:
 
 - `install/setup_host.sh`
-  Installs host build/runtime dependencies and builds `MLIPPER` locally with
-  `USE_DOUBLE=1`.
+  Installs host build/runtime dependencies and builds `MLIPPER` locally.
 
 - host `MLIPPER`
   The wrapper runs the local binary directly. By default this is
@@ -108,6 +104,13 @@ Important limitation:
 - MLIPPER expects split reference/query alignments.
 - If ROADIES only has one combined full alignment, ROADIES needs an adapter
   step to split it before calling MLIPPER.
+- In Docker mode, all per-gene input files and the output path should share a
+  reasonably small common parent directory. The wrapper mounts that common
+  parent into the container as `/workspace/job`.
+- Recommended layout: keep `ref.fa`, `query.fa`, the backbone tree, the
+  `bestModel`, and the output tree under the same per-gene or per-job directory.
+- Avoid spreading inputs and outputs across unrelated filesystem roots, because
+  that can force the wrapper to mount an overly broad parent such as `/`.
 
 ## Output Contract
 
@@ -170,7 +173,7 @@ Optional argument meanings:
 
 - `--docker-image`
   Override the Docker image tag. The wrapper default is
-  `wenchiehlo/mlipper-roadies:20260504`.
+  `wenchiehlo/mlipper-roadies:20260507`.
 
 - `--gpu-id`
   GPU id used when `--docker-gpus` is not provided.
@@ -315,16 +318,44 @@ Current behavior:
 This is the default mode. Use it when ROADIES should run the binary packaged in
 the Docker image.
 
+Example per-gene job layout:
+
+```text
+GENE/
+  ref.fa
+  query.fa
+  backbone.nwk
+  gene.raxml.bestModel
+  mlipper_gene_tree.nwk        # written by MLIPPER
+```
+
+With that layout, ROADIES calls:
+
+```bash
+scripts/run_single_gene_MLIPPER.sh \
+  --ref-msa GENE/ref.fa \
+  --query-msa GENE/query.fa \
+  --backbone-tree GENE/backbone.nwk \
+  --best-model GENE/gene.raxml.bestModel \
+  --out-tree GENE/mlipper_gene_tree.nwk \
+  --gpu-id 0
+```
+
+Internally, the wrapper mounts `GENE/` into the container under
+`/workspace/job/...` and rewrites the file paths for MLIPPER. ROADIES should
+only pass host paths like `GENE/ref.fa`; it should not pass `/workspace/job`
+paths directly.
+
 #### 1. Pull or build the image
 
 ```bash
-docker pull wenchiehlo/mlipper-roadies:20260504
+docker pull wenchiehlo/mlipper-roadies:20260507
 ```
 
 Or build it from this repo:
 
 ```bash
-docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:20260504 .
+docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:20260507 .
 ```
 
 During image build, Docker does the setup work:
