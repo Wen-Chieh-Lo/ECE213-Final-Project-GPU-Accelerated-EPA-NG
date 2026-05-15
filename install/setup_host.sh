@@ -118,6 +118,7 @@ install_apt_deps() {
     build-essential \
     ca-certificates \
     libblas-dev \
+    libboost-program-options-dev \
     liblapack-dev \
     libtbb-dev \
     python3
@@ -132,7 +133,7 @@ build_mlipper() {
   pushd "$REPO_ROOT" >/dev/null
   make clean
   make -j"$jobs" \
-    USE_DOUBLE="1" \
+    USE_DOUBLE="0" \
     CUDA_HOME="$cuda_home" \
     PLL_INC_DIR="$pll_inc_dir" \
     PLL_LIB_DIR="$pll_lib_dir" \
@@ -192,7 +193,7 @@ fi
 
 echo "REPO_ROOT=$REPO_ROOT"
 echo "CUDA_HOME=$cuda_home"
-echo "USE_DOUBLE=1"
+echo "USE_DOUBLE=0"
 echo "JOBS=$jobs"
 echo "PLL_INC_DIR=$pll_inc_dir"
 echo "PLL_LIB_DIR=$pll_lib_dir"

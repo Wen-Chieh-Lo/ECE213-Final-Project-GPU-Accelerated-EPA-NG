@@ -33,9 +33,8 @@ Optional:
   --docker-gpus SPEC          Raw Docker --gpus value (overrides --gpu-id)
   --no-docker                 Run local MLIPPER binary instead of Docker
   --local-mlipper PATH        Local MLIPPER binary path (defaults to REPO_ROOT/MLIPPER)
-  --local-spr                 Enable local SPR refinement
-                              Default: enabled
   --no-local-spr              Disable local SPR refinement
+                              Default: local SPR is enabled unless this flag is set
   --batch-size INT            Batch insert size
                               Default: 5
   --local-spr-radius INT      Local SPR radius
@@ -116,6 +115,17 @@ quote_cmd() {
 
 detect_pll_lib_dir() {
   local multiarch=""
+  local candidate=""
+  if [[ -n "${PLL_LIB_DIR:-}" ]]; then
+    echo "$PLL_LIB_DIR"
+    return
+  fi
+  for candidate in /usr/local/lib /usr/local/lib64; do
+    if [[ -e "$candidate/libpll.so" || -e "$candidate/libpll.a" || -e "$candidate/libpll.so.0" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done
   if command -v gcc >/dev/null 2>&1; then
     multiarch="$(gcc -print-multiarch 2>/dev/null || true)"
   fi
@@ -129,13 +139,29 @@ detect_pll_lib_dir() {
   echo "/usr/lib/x86_64-linux-gnu"
 }
 
+detect_pll_inc_dir() {
+  local candidate=""
+  if [[ -n "${PLL_INC_DIR:-}" ]]; then
+    echo "$PLL_INC_DIR"
+    return
+  fi
+  for candidate in /usr/local/include /usr/include; do
+    if [[ -f "$candidate/libpll/pll.h" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  echo "/usr/include"
+}
+
 ensure_host_libs_or_install() {
   local setup_script="$REPO_ROOT/install/setup_host.sh"
   local force_build="$1"
-  local pll_inc_dir="/usr/include"
+  local pll_inc_dir
   local pll_lib_dir
   local have_header=0
   local have_lib=0
+  pll_inc_dir="$(detect_pll_inc_dir)"
   pll_lib_dir="$(detect_pll_lib_dir)"
 
   if [[ -f "$pll_inc_dir/libpll/pll.h" ]]; then
@@ -181,7 +207,9 @@ gpu_id="$DEFAULT_GPU_ID"
 docker_gpus=""
 local_mlipper="$REPO_ROOT/MLIPPER"
 use_docker=1
-local_spr=1
+# Keep local SPR enabled by default in this wrapper even though the
+# underlying MLIPPER binary defaults it to disabled unless --local-spr is set.
+local_spr_enabled=1
 batch_size=5
 local_spr_radius=4
 local_spr_rounds=1
@@ -228,12 +256,8 @@ while [[ $# -gt 0 ]]; do
       local_mlipper="${2:-}"
       shift 2
       ;;
-    --local-spr)
-      local_spr=1
-      shift
-      ;;
     --no-local-spr)
-      local_spr=0
+      local_spr_enabled=0
       shift
       ;;
     --batch-size)
@@ -320,9 +344,12 @@ else
     --best-model "$best_model"
     --commit-to-tree "$out_tree"
   )
+  mlipper_args+=(
+    --gpu-id "$gpu_id"
+  )
 fi
 
-if [[ "$local_spr" -eq 1 ]]; then
+if [[ "$local_spr_enabled" -eq 1 ]]; then
   mlipper_args+=(
     --local-spr
     --batch-insert-size "$batch_size"

@@ -17,7 +17,7 @@ For ROADIES, the intended entrypoint is:
 
 The intended Docker image for that wrapper is:
 
-- `wenchiehlo/mlipper-roadies:20260507`
+- `wenchiehlo/mlipper-roadies:latest`
 
 ROADIES does not need to call the `MLIPPER` binary directly unless you want to
 debug the wrapper.
@@ -49,7 +49,7 @@ The Docker-mode architecture has four layers:
    container, sets Docker GPU options, and translates the per-gene contract
    into one MLIPPER invocation.
 
-3. `wenchiehlo/mlipper-roadies:20260507`
+3. `wenchiehlo/mlipper-roadies:latest`
    This image provides the runtime environment and the compiled `MLIPPER`
    binary.
 
@@ -163,7 +163,6 @@ Optional wrapper arguments:
 - `--docker-gpus`
 - `--no-docker`
 - `--local-mlipper`
-- `--local-spr`
 - `--no-local-spr`
 - `--batch-size`
 - `--local-spr-radius`
@@ -173,7 +172,7 @@ Optional argument meanings:
 
 - `--docker-image`
   Override the Docker image tag. The wrapper default is
-  `wenchiehlo/mlipper-roadies:20260507`.
+  `wenchiehlo/mlipper-roadies:latest`.
 
 - `--gpu-id`
   GPU id used when `--docker-gpus` is not provided.
@@ -188,11 +187,8 @@ Optional argument meanings:
   Override the local `MLIPPER` binary path used with `--no-docker`. The default
   is `REPO_ROOT/MLIPPER`.
 
-- `--local-spr`
-  Enable local SPR refinement after query commitment.
-
 - `--no-local-spr`
-  Disable local SPR refinement.
+  Disable local SPR refinement. The wrapper enables it by default.
 
 - `--batch-size`
   Batch insert size passed to MLIPPER when local SPR is enabled.
@@ -255,17 +251,32 @@ The intended split is:
 
 - ROADIES decides which GPU to use
 - in Docker mode, the wrapper translates that into Docker `--gpus`
-- in host mode, ROADIES should restrict visible GPUs before calling the wrapper,
-  for example with `CUDA_VISIBLE_DEVICES`
-- MLIPPER runs inside the already-restricted GPU environment
+- in host mode, the wrapper can pass `--gpu-id` directly to the local MLIPPER
+  binary
+- MLIPPER runs inside the GPU visibility / reservation policy chosen by the
+  caller
 
 Recommended usage:
 
 - one MLIPPER invocation sees one GPU
 - Docker mode: ROADIES passes either `--gpu-id N` or `--docker-gpus ...`
-- host mode: ROADIES sets `CUDA_VISIBLE_DEVICES=N` and passes `--no-docker`
+  to the wrapper, and the wrapper turns that into Docker `--gpus`
+- host mode: ROADIES can either restrict visible GPUs itself, for example with
+  `CUDA_VISIBLE_DEVICES`, or call the wrapper with `--gpu-id N --no-docker`
 
-MLIPPER itself does not expose a public `--gpu-id` flag.
+MLIPPER itself now exposes:
+
+- `--gpu-id N`
+  selects a CUDA device ordinal within the currently visible GPU set
+- `--gpu-auto`
+  acquires an MLIPPER reservation lock on the first visible GPU whose lock is
+  free, then waits/retries if all visible GPUs are already reserved
+
+Current wrapper note:
+
+- `run_single_gene_MLIPPER.sh` does not currently expose a wrapper-level
+  `--gpu-auto` flag; in Docker mode it schedules GPUs through Docker `--gpus`,
+  and in host mode it passes `--gpu-id`
 
 ## Model Handling
 
@@ -307,7 +318,8 @@ Current behavior:
 
 - partially informative ambiguity symbols are distributed across represented
   states
-- fully uninformative symbols such as `N`, `-`, `.`, and `?` are ignored
+- fully ambiguous symbols such as `N`, `-`, `.`, and `?` are distributed
+  evenly across all represented states
 - if any state would otherwise receive zero mass, MLIPPER applies a tiny
   positive floor before renormalization
 
@@ -349,24 +361,27 @@ paths directly.
 #### 1. Pull or build the image
 
 ```bash
-docker pull wenchiehlo/mlipper-roadies:20260507
+docker pull wenchiehlo/mlipper-roadies:latest
 ```
 
 Or build it from this repo:
 
 ```bash
-docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:20260507 .
+docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:latest .
 ```
 
 During image build, Docker does the setup work:
 
 - builder stage installs compile-time dependencies such as `build-essential`,
   `libpll-dev`, `libblas-dev`, `liblapack-dev`, and `libtbb-dev`
-- builder stage runs `make clean && make USE_DOUBLE=1 MLIPPER`
+- builder stage runs `make clean && make USE_DOUBLE=0 MLIPPER`
 - runtime stage installs runtime libraries such as `libpll0`, `libblas3`,
   `liblapack3`, and `libtbb12`
 - runtime stage copies the compiled binary into `/workspace/MLIPPER/MLIPPER`
 
+This published ROADIES image is intentionally a float build. If you need a
+double build for a local experiment, rebuild from source with `USE_DOUBLE=1`
+instead of using the published `latest` image. 
 `install/setup_host.sh` is not used in Docker mode.
 
 #### 2. Run one gene
@@ -414,7 +429,14 @@ What `setup_host.sh` does:
 - detects CUDA via `CUDA_HOME`, `nvcc`, or common CUDA install paths
 - detects the distro `libpll` library directory
 - runs `make clean`
-- builds `MLIPPER` with `USE_DOUBLE=1`
+- builds `MLIPPER` with `USE_DOUBLE=0`
+
+If you specifically want a local host double build instead, run:
+
+```bash
+make clean
+make -j4 USE_DOUBLE=1 MLIPPER
+```
 
 What `setup_host.sh` does not do:
 

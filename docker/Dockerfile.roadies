@@ -18,6 +18,7 @@ RUN success=0; \
     build-essential \
     ca-certificates \
     libblas-dev \
+    libboost-program-options-dev \
     liblapack-dev \
     libpll-dev \
     libtbb-dev \
@@ -34,7 +35,7 @@ RUN success=0; \
 
 COPY . /workspace/MLIPPER
 
-RUN make clean && make USE_DOUBLE=1 MLIPPER
+RUN make clean && make USE_DOUBLE=0 MLIPPER
 
 
 FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
@@ -53,6 +54,7 @@ RUN success=0; \
       apt-get install -y --no-install-recommends \
     ca-certificates \
     libblas3 \
+    libboost-program-options-dev \
     libgfortran5 \
     liblapack3 \
     libpll0 \

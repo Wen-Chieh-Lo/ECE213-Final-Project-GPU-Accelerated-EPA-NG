@@ -30,6 +30,7 @@ RUN success=0; \
     flex \
     git \
     libblas-dev \
+    libboost-program-options-dev \
     liblapack-dev \
     libpll-dev \
     libtbb-dev \
@@ -63,6 +64,6 @@ RUN wget -qO /tmp/miniconda.sh \
 
 COPY . /workspace/MLIPPER
 
-RUN make USE_DOUBLE=1 MLIPPER
+RUN make USE_DOUBLE=0 MLIPPER
 
 CMD ["/bin/bash"]

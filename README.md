@@ -46,7 +46,7 @@ What it does:
 
 - installs the same apt build dependencies used by `docker/Dockerfile.roadies`
 - installs distro package `libpll-dev`
-- builds `MLIPPER` locally with `USE_DOUBLE=1`
+- builds `MLIPPER` locally with `USE_DOUBLE=0`
 
 Important:
 
@@ -65,20 +65,26 @@ make -j4 MLIPPER
 
 Important current build identity:
 
-- standard builds use double precision
-- local `Makefile` default: `USE_DOUBLE=1`
-- `install/setup_host.sh` builds with `USE_DOUBLE=1`
+- published defaults use single precision
+- local `Makefile` default: `USE_DOUBLE=0`
+- `install/setup_host.sh` builds with `USE_DOUBLE=0`
 
 For the ROADIES-oriented host workflow, always rebuild the host binary before
 running with `--no-docker`. Do not rely on an existing `MLIPPER` binary, because
 it may have been built from older source or with a different precision setting.
-Use a clean double build every time:
+Use a clean float build every time for the default validated path:
+
+```bash
+make clean
+make -j4 USE_DOUBLE=0 MLIPPER
+```
+
+If you specifically want a double build, the source path is still available:
 
 ```bash
 make clean
 make -j4 USE_DOUBLE=1 MLIPPER
 ```
-
 ## Main CLI
 
 The practical per-gene CLI contract is:
@@ -101,6 +107,43 @@ Common refinement flags:
   --local-spr-rounds 1
 ```
 
+Runtime GPU selection:
+
+```bash
+  --gpu-id 1
+```
+
+or let `MLIPPER` auto-pick an unreserved GPU from the currently visible set:
+
+```bash
+  --gpu-auto
+```
+
+`--gpu-id` and `--gpu-auto` both operate on the CUDA devices that are visible to
+the current process. That means the numbering follows the current
+`CUDA_VISIBLE_DEVICES` / Docker `--gpus` view, not the host-global GPU ordinal.
+
+`--gpu-auto` uses a cooperative MLIPPER reservation lock. It scans the
+currently visible GPUs in ordinal order, reserves the first GPU whose lock is
+not already held by another MLIPPER process, and then calls `cudaSetDevice()`
+on that visible ordinal. If every visible GPU is already reserved, it waits and
+retries.
+
+Current `--gpu-auto` notes:
+
+- it only looks at the MLIPPER reservation lock; it does not inspect unrelated
+  GPU workloads
+- the default lock directory is `/tmp/mlipper_gpu_locks`
+- set `MLIPPER_GPU_LOCK_DIR` to move the lock directory
+- set `MLIPPER_GPU_AUTO_POLL_MS` to control the retry interval while waiting
+
+In practice this means:
+
+- if you want one MLIPPER process per Docker-visible GPU, `--gpu-auto` can
+  coordinate those processes directly
+- if you want strict external scheduling, pass `--gpu-id` explicitly or keep
+  each container restricted to one visible GPU
+
 You can also pass explicit model flags instead of `--best-model`, but in this
 repo the preferred path is direct `bestModel` ingestion.
 
@@ -113,10 +156,14 @@ This repo currently keeps two image targets.
 Build:
 
 ```bash
-docker build -f docker/Dockerfile -t wenchiehlo/mlipper:20260504 .
+docker build -f docker/Dockerfile -t wenchiehlo/mlipper:latest .
 ```
 
 This Dockerfile now installs distro package `libpll-dev` during build.
+
+Published default image:
+
+- `wenchiehlo/mlipper:latest`
 
 Use this when you want:
 
@@ -128,10 +175,14 @@ Use this when you want:
 Build:
 
 ```bash
-docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:20260504 .
+docker build -f docker/Dockerfile.roadies -t wenchiehlo/mlipper-roadies:latest .
 ```
 
 This Dockerfile now installs distro packages `libpll-dev` and `libpll0`.
+
+Published default image:
+
+- `wenchiehlo/mlipper-roadies:latest`
 
 Use this when you want:
 
@@ -142,7 +193,7 @@ Use this when you want:
 Pull:
 
 ```bash
-docker pull wenchiehlo/mlipper-roadies:20260504
+docker pull wenchiehlo/mlipper-roadies:latest
 ```
 
 ## Scripts
@@ -221,7 +272,8 @@ Current implementation details:
 
 - partially informative ambiguity codes are distributed across represented
   states
-- `N`, `-`, `.`, and `?` are ignored for empirical frequency estimation
+- `N`, `-`, `.`, and `?` are treated as fully ambiguous and are distributed
+  evenly across all represented states
 - a tiny positive floor is applied if a state would otherwise receive zero
   empirical mass
 
